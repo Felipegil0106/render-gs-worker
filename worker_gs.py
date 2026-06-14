@@ -27,7 +27,11 @@ CALLBACK_SECRET = os.environ.get("CALLBACK_SECRET", "")    # para firmar HMAC
 QUALITY         = os.environ.get("QUALITY", "fast")
 
 # Iteraciones de 2DGS según calidad (rápido para la primera prueba).
-ITERS = {"fast": 7000, "balanced": 30000, "quality": 30000}.get(QUALITY, 7000)
+# 2DGS aplica el regularizador de "normales" (el que une superficies) A PARTIR
+# de la iteración 7000. Con 7000 justas, NUNCA actúa (por eso normal=0.00000 y
+# la malla salía mal). Subimos fast a 15000 para que ese regularizador trabaje
+# ~8000 iteraciones y la geometría quede sólida y conectada.
+ITERS = {"fast": 15000, "balanced": 30000, "quality": 30000}.get(QUALITY, 15000)
 
 WORK = Path("/workspace/job")
 WORK.mkdir(parents=True, exist_ok=True)
@@ -192,31 +196,57 @@ def main():
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
-        # --lambda_dist 100: ESTE es el parámetro clave. Es el regularizador de
-        # "distortion" que une las superficies en vez de dejar gaussianas flotando
-        # dispersas. Por defecto viene en 0 (por eso la malla salió en pedazos).
-        # Los autores de 2DGS lo recomiendan en 100 para escenas de interior.
+        # NOTA: probamos --lambda_dist 100 y dejó la malla VACÍA (demasiado
+        # agresivo). Lo quitamos. Ahora la unión de superficies la logra el
+        # regularizador de NORMALES, que sí actúa gracias a las 15000 iteraciones.
         run(["python", "/opt/2dgs/train.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--iterations", str(ITERS),
-             "--lambda_dist", "100",
              "--quiet"])
         log("   2DGS entrenado")
 
         # ── PASO 4: extraer malla por TSDF ──
         fase(0.80, "PASO 4/5 — Extrayendo malla (TSDF)")
-        run(["python", "/opt/2dgs/render.py",
+        # --num_cluster 1: se queda con el pedazo conectado MÁS GRANDE (el cuarto)
+        # y descarta trozos flotantes sueltos. Además evita el crash que daba el
+        # valor por defecto (50) cuando la malla tiene menos de 50 pedazos.
+        # Lo corremos de forma TOLERANTE: si el post-proceso fallara pero ya se
+        # generó una malla en disco, la usamos igual (no abortamos el trabajo).
+        log("$ python /opt/2dgs/render.py ... --num_cluster 1")
+        r_mesh = subprocess.run(
+            ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
-             "--skip_train", "--skip_test", "--mesh_res", "1024"])
+             "--skip_train", "--skip_test", "--mesh_res", "1024",
+             "--num_cluster", "1"],
+            capture_output=True, text=True)
+        cola = (r_mesh.stdout or "")[-1200:] + (r_mesh.stderr or "")[-1200:]
+        if cola.strip():
+            for linea in cola.strip().splitlines()[-12:]:
+                log(f"   | {linea}")
+        # Buscar la malla generada (preferimos la post-procesada; si no, la cruda).
         candidatos = list(dgs_out.rglob("*.ply"))
+        def _es_no_vacia(p):
+            try:
+                return p.stat().st_size > 1000   # >1KB = tiene geometría real
+            except Exception:
+                return False
         malla = None
-        for c in candidatos:
-            if "fuse" in c.name.lower() or "mesh" in c.name.lower():
-                malla = c; break
-        if malla is None and candidatos:
-            malla = max(candidatos, key=lambda p: p.stat().st_size)
+        # 1º: fuse_post.ply (limpia). 2º: fuse.ply (cruda). 3º: la más grande.
+        for clave in ("fuse_post", "fuse", "mesh"):
+            for c in candidatos:
+                if clave in c.name.lower() and _es_no_vacia(c):
+                    malla = c; break
+            if malla:
+                break
         if malla is None:
-            raise RuntimeError("No se encontró malla .ply de salida")
+            no_vacias = [c for c in candidatos if _es_no_vacia(c)]
+            if no_vacias:
+                malla = max(no_vacias, key=lambda p: p.stat().st_size)
+        if malla is None:
+            # No hubo malla con geometría → ahí sí es error real.
+            raise RuntimeError(
+                f"La malla salió vacía. Código render={r_mesh.returncode}. "
+                f"Posible: pocas iteraciones o poses débiles.")
         ply_mb = malla.stat().st_size / 1e6
         log(f"   malla: {malla.name} ({ply_mb:.1f} MB)")
 
