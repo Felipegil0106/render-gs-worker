@@ -118,10 +118,22 @@ def main():
         sparse = colmap_dir / "sparse"; sparse.mkdir(exist_ok=True)
         run(["colmap", "feature_extractor",
              "--database_path", str(db), "--image_path", str(images_dir),
-             "--ImageReader.single_camera", "1", "--SiftExtraction.use_gpu", "0"])
+             "--ImageReader.single_camera", "1",
+             "--SiftExtraction.use_gpu", "0",
+             # Limitar tamaño de imagen evita picos de RAM; 1600px es de sobra
+             # para fotos de 1440x1920 sin perder calidad de poses.
+             "--SiftExtraction.max_image_size", "1600",
+             "--SiftExtraction.max_num_features", "8192",
+             # CLAVE del error -9 (OOM): COLMAP-CPU abre 1 hilo por núcleo y
+             # cada uno carga una foto en RAM. En máquinas con muchos vCPU
+             # (como la A6000) eso revienta la memoria. Con 4 hilos, máximo
+             # 4 fotos en RAM a la vez → estable en cualquier GPU.
+             "--SiftExtraction.num_threads", "4"])
         fase(0.25, "PASO 2/5 — COLMAP emparejando fotos")
         run(["colmap", "exhaustive_matcher",
-             "--database_path", str(db), "--SiftMatching.use_gpu", "0"])
+             "--database_path", str(db), "--SiftMatching.use_gpu", "0",
+             # Mismo motivo que arriba: limitar hilos evita el OOM (-9).
+             "--SiftMatching.num_threads", "4"])
         fase(0.35, "PASO 2/5 — COLMAP reconstruyendo (mapper)")
         # Mapper en ajustes por defecto: en la prueba anterior ya registró 108
         # de 127 fotos (85%), así que COLMAP no era el problema. No bajamos
