@@ -74,7 +74,14 @@ def fase(p, msg):
 
 def run(cmd, cwd=None):
     log(f"$ {' '.join(str(c) for c in cmd)}")
-    r = subprocess.run(cmd, cwd=cwd)
+    # Capturamos salida para que, si falla, el log muestre el motivo real
+    # (antes solo decía el código de error, sin el mensaje de COLMAP).
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    # Mostrar las últimas líneas de salida (útiles para diagnóstico).
+    cola = (r.stdout or "")[-1500:] + (r.stderr or "")[-1500:]
+    if cola.strip():
+        for linea in cola.strip().splitlines()[-15:]:
+            log(f"   | {linea}")
     if r.returncode != 0:
         raise RuntimeError(f"Falló (código {r.returncode}): {cmd[0]} {cmd[1] if len(cmd)>1 else ''}")
 
@@ -111,10 +118,10 @@ def main():
         sparse = colmap_dir / "sparse"; sparse.mkdir(exist_ok=True)
         run(["colmap", "feature_extractor",
              "--database_path", str(db), "--image_path", str(images_dir),
-             "--ImageReader.single_camera", "1", "--SiftExtraction.use_gpu", "1"])
+             "--ImageReader.single_camera", "1", "--SiftExtraction.use_gpu", "0"])
         fase(0.25, "PASO 2/5 — COLMAP emparejando fotos")
         run(["colmap", "exhaustive_matcher",
-             "--database_path", str(db), "--SiftMatching.use_gpu", "1"])
+             "--database_path", str(db), "--SiftMatching.use_gpu", "0"])
         fase(0.35, "PASO 2/5 — COLMAP reconstruyendo (mapper)")
         run(["colmap", "mapper",
              "--database_path", str(db), "--image_path", str(images_dir),
