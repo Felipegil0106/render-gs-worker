@@ -14,7 +14,7 @@
 # Si algo falla, manda "error" con el log para poder revisarlo en la página.
 # ════════════════════════════════════════════════════════════════════════
 
-import os, sys, zipfile, subprocess, shutil, time, json, hmac, hashlib, threading
+import os, sys, zipfile, subprocess, shutil, time, json, hmac, hashlib, threading, struct
 from pathlib import Path
 import urllib.request
 
@@ -123,13 +123,34 @@ def main():
         run(["colmap", "exhaustive_matcher",
              "--database_path", str(db), "--SiftMatching.use_gpu", "0"])
         fase(0.35, "PASO 2/5 — COLMAP reconstruyendo (mapper)")
+        # Mapper en ajustes por defecto: en la prueba anterior ya registró 108
+        # de 127 fotos (85%), así que COLMAP no era el problema. No bajamos
+        # umbrales para no degradar la calidad de las poses.
         run(["colmap", "mapper",
              "--database_path", str(db), "--image_path", str(images_dir),
              "--output_path", str(sparse)])
-        modelo = sparse / "0"
-        if not modelo.exists():
-            raise RuntimeError("COLMAP no produjo reconstrucción (sparse/0). "
-                               "Posible: fotos con poco solape o borrosas.")
+        # COLMAP puede crear VARIOS modelos (sparse/0, sparse/1, ...). El worker
+        # antes tomaba siempre sparse/0, que podía ser un fragmento pequeño.
+        # Ahora elegimos el modelo con MÁS fotos registradas (el más completo).
+        modelos = [d for d in sparse.iterdir()
+                   if d.is_dir() and (d / "images.bin").exists()]
+        if not modelos:
+            raise RuntimeError("COLMAP no produjo reconstrucción. "
+                               "Revisa que las fotos tengan solape suficiente.")
+        def _num_imgs_registradas(model_dir):
+            # Las primeras 8 bytes de images.bin = nº de imágenes registradas.
+            try:
+                with open(model_dir / "images.bin", "rb") as f:
+                    return struct.unpack("<Q", f.read(8))[0]
+            except Exception:
+                return 0
+        modelo = max(modelos, key=_num_imgs_registradas)
+        registradas = _num_imgs_registradas(modelo)
+        log(f"   COLMAP produjo {len(modelos)} modelo(s). Uso el más completo "
+            f"({modelo.name}): {registradas} de {n_fotos} fotos registradas")
+        if registradas < n_fotos * 0.5:
+            log(f"   ⚠ OJO: solo se registró {registradas}/{n_fotos} fotos. "
+                f"La malla puede salir incompleta (poco solape entre fotos).")
         log("   COLMAP OK")
 
         # ── Quitar distorsión y convertir a PINHOLE (lo que 2DGS exige) ──
@@ -159,9 +180,15 @@ def main():
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
+        # --lambda_dist 100: ESTE es el parámetro clave. Es el regularizador de
+        # "distortion" que une las superficies en vez de dejar gaussianas flotando
+        # dispersas. Por defecto viene en 0 (por eso la malla salió en pedazos).
+        # Los autores de 2DGS lo recomiendan en 100 para escenas de interior.
         run(["python", "/opt/2dgs/train.py",
              "-s", str(dataset), "-m", str(dgs_out),
-             "--iterations", str(ITERS), "--quiet"])
+             "--iterations", str(ITERS),
+             "--lambda_dist", "100",
+             "--quiet"])
         log("   2DGS entrenado")
 
         # ── PASO 4: extraer malla por TSDF ──
