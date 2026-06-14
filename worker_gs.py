@@ -132,13 +132,29 @@ def main():
                                "Posible: fotos con poco solape o borrosas.")
         log("   COLMAP OK")
 
-        # Estructura que 2DGS espera: dataset/images + dataset/sparse/0
-        dataset = WORK / "dataset"; dataset.mkdir(exist_ok=True)
-        for sub in ("images", "sparse"):
-            if (dataset / sub).exists():
-                shutil.rmtree(dataset / sub)
-        shutil.copytree(images_dir, dataset / "images")
-        shutil.copytree(sparse, dataset / "sparse")
+        # ── Quitar distorsión y convertir a PINHOLE (lo que 2DGS exige) ──
+        # COLMAP usa por defecto SIMPLE_RADIAL (con distorsión de lente), pero
+        # 2DGS solo acepta PINHOLE. 'image_undistorter' corrige las fotos y
+        # convierte el modelo a PINHOLE. Es el paso estándar de Gaussian Splatting.
+        fase(0.40, "PASO 2/5 — Quitando distorsión (undistort → PINHOLE)")
+        dataset = WORK / "dataset"
+        if dataset.exists():
+            shutil.rmtree(dataset)
+        dataset.mkdir(exist_ok=True)
+        run(["colmap", "image_undistorter",
+             "--image_path", str(images_dir),
+             "--input_path", str(modelo),          # sparse/0 con SIMPLE_RADIAL
+             "--output_path", str(dataset),         # genera images/ + sparse/ PINHOLE
+             "--output_type", "COLMAP"])
+        # image_undistorter deja sparse/*.bin sueltos; 2DGS los quiere en sparse/0/.
+        sparse_out = dataset / "sparse"
+        sparse_0 = sparse_out / "0"
+        if not sparse_0.exists():
+            sparse_0.mkdir(parents=True, exist_ok=True)
+            for f in list(sparse_out.iterdir()):
+                if f.is_file():
+                    shutil.move(str(f), str(sparse_0 / f.name))
+        log("   undistort OK (cámaras PINHOLE, fotos corregidas)")
 
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
