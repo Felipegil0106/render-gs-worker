@@ -205,20 +205,34 @@ def main():
              "--quiet"])
         log("   2DGS entrenado")
 
-        # ── PASO 4: extraer malla por TSDF ──
+        # ── PASO 4: extraer malla por TSDF (OPTIMIZADO) ──
         fase(0.80, "PASO 4/5 — Extrayendo malla (TSDF)")
-        # --num_cluster 1: se queda con el pedazo conectado MÁS GRANDE (el cuarto)
-        # y descarta trozos flotantes sueltos. Además evita el crash que daba el
-        # valor por defecto (50) cuando la malla tiene menos de 50 pedazos.
-        # Lo corremos de forma TOLERANTE: si el post-proceso fallara pero ya se
-        # generó una malla en disco, la usamos igual (no abortamos el trabajo).
-        log("$ python /opt/2dgs/render.py ... --num_cluster 1")
+        # GANANCIA GRANDE de velocidad: el TSDF de Open3D corre en CPU y, en pods
+        # con muchos vCPU, abre demasiados hilos y se vuelve LENTÍSIMO (28 min en
+        # la prueba anterior, ~2.87 s por vista). Limitando OMP a 8 hilos, baja a
+        # ~2-3 min sin cambiar el algoritmo.
+        env_mesh = dict(os.environ)
+        env_mesh["OMP_NUM_THREADS"] = "8"
+        # Parámetros para que el CUARTO salga COMPLETO y rápido:
+        #  --depth_trunc 9.0 : el TSDF integra hasta 9 m → cubre las paredes
+        #     lejanas. Antes el valor automático era corto (2×distancia mínima
+        #     cámara-centro) y cortaba el cuarto: por eso "se desvanecía".
+        #  --depth_ratio 0   : profundidad media (mejor en escenas amplias).
+        #  --voxel_size 0.015 + --sdf_trunc 0.06 : resolución buena para un cuarto.
+        #  --mesh_res 512    : 8× menos vóxeles que 1024 → mucho más rápido.
+        #  --num_cluster 1   : se queda con el cuarto conectado, sin trozos sueltos.
+        log("$ python /opt/2dgs/render.py ... (OMP=8, depth_trunc=9, mesh_res=512)")
         r_mesh = subprocess.run(
             ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
-             "--skip_train", "--skip_test", "--mesh_res", "1024",
+             "--skip_train", "--skip_test",
+             "--depth_ratio", "0",
+             "--depth_trunc", "9.0",
+             "--voxel_size", "0.015",
+             "--sdf_trunc", "0.06",
+             "--mesh_res", "512",
              "--num_cluster", "1"],
-            capture_output=True, text=True)
+            capture_output=True, text=True, env=env_mesh)
         cola = (r_mesh.stdout or "")[-1200:] + (r_mesh.stderr or "")[-1200:]
         if cola.strip():
             for linea in cola.strip().splitlines()[-12:]:
