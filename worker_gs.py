@@ -64,7 +64,9 @@ def callback(tipo, **datos):
 
 def progreso(p, msg):
     """Reporta avance + el log hasta ahora (heartbeat para el watchdog)."""
-    callback("progress", progress=p, message=msg, log="\n".join(_LOG))
+    # Enviamos solo las últimas 150 líneas para que el payload no crezca de más
+    # ahora que transmitimos el progreso en vivo.
+    callback("progress", progress=p, message=msg, log="\n".join(_LOG[-150:]))
 
 # ── Heartbeat en hilo aparte: late aunque COLMAP/2DGS bloqueen el proceso ──
 _estado = {"p": 0.0, "msg": "iniciando", "vivo": True}
@@ -76,18 +78,48 @@ def fase(p, msg):
     _estado["p"] = p; _estado["msg"] = msg
     log(msg)
 
-def run(cmd, cwd=None):
+def run(cmd, cwd=None, env=None, fase_label=None, check=True):
+    """Ejecuta un comando enviando su salida a un ARCHIVO (no a un pipe).
+    Esto evita el deadlock que colgaba el proceso (con la GPU en 0%) cuando la
+    salida llenaba el buffer del pipe y nadie lo leía hasta el final.
+    Mientras corre, actualiza el mensaje del heartbeat con los minutos que lleva,
+    para que la página NO se vea congelada. Devuelve (codigo, salida)."""
     log(f"$ {' '.join(str(c) for c in cmd)}")
-    # Capturamos salida para que, si falla, el log muestre el motivo real
-    # (antes solo decía el código de error, sin el mensaje de COLMAP).
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    # Mostrar las últimas líneas de salida (útiles para diagnóstico).
-    cola = (r.stdout or "")[-1500:] + (r.stderr or "")[-1500:]
-    if cola.strip():
-        for linea in cola.strip().splitlines()[-15:]:
-            log(f"   | {linea}")
-    if r.returncode != 0:
-        raise RuntimeError(f"Falló (código {r.returncode}): {cmd[0]} {cmd[1] if len(cmd)>1 else ''}")
+    out_path = WORK / "_cmd_out.txt"
+    with open(out_path, "w") as outf:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env,
+                                stdout=outf, stderr=subprocess.STDOUT, text=True)
+        t0 = time.time()
+        ultima = ""
+        while proc.poll() is None:
+            time.sleep(10)
+            if fase_label:
+                mins = int((time.time() - t0) / 60)
+                _estado["msg"] = f"{fase_label} · {mins} min trabajando…"
+            # Leer la ÚLTIMA línea del archivo de salida y mandarla EN VIVO.
+            # Así, si un paso (p.ej. el entrenamiento) se cuelga, queda registrado
+            # DÓNDE se quedó, y la página lo muestra gracias al heartbeat. Antes
+            # la salida solo se veía al terminar el paso (por eso parecía congelado).
+            try:
+                with open(out_path, errors="ignore") as f:
+                    lineas = [l.rstrip() for l in f if l.strip()]
+                if lineas and lineas[-1] != ultima:
+                    ultima = lineas[-1]
+                    log(f"   · {ultima}")
+            except Exception:
+                pass
+    try:
+        salida = open(out_path, errors="ignore").read()
+    except Exception:
+        salida = ""
+    # Mostrar las últimas líneas en nuestro log (diagnóstico).
+    cola = salida.strip().splitlines()[-15:] if salida.strip() else []
+    for linea in cola:
+        log(f"   | {linea}")
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"Falló (código {proc.returncode}): {cmd[0]} "
+                           f"{cmd[1] if len(cmd) > 1 else ''}")
+    return proc.returncode, salida
 
 
 def main():
@@ -199,10 +231,12 @@ def main():
         # NOTA: probamos --lambda_dist 100 y dejó la malla VACÍA (demasiado
         # agresivo). Lo quitamos. Ahora la unión de superficies la logra el
         # regularizador de NORMALES, que sí actúa gracias a las 15000 iteraciones.
+        # Sin --quiet: así la consola del pod muestra el avance iteración a
+        # iteración (antes --quiet lo ocultaba y no se veía nada).
         run(["python", "/opt/2dgs/train.py",
              "-s", str(dataset), "-m", str(dgs_out),
-             "--iterations", str(ITERS),
-             "--quiet"])
+             "--iterations", str(ITERS)],
+            fase_label="PASO 3/5 — Entrenando 2DGS")
         log("   2DGS entrenado")
 
         # ── PASO 4: extraer malla por TSDF (OPTIMIZADO) ──
@@ -222,7 +256,7 @@ def main():
         #  --mesh_res 512    : 8× menos vóxeles que 1024 → mucho más rápido.
         #  --num_cluster 1   : se queda con el cuarto conectado, sin trozos sueltos.
         log("$ python /opt/2dgs/render.py ... (OMP=8, depth_trunc=9, mesh_res=512)")
-        r_mesh = subprocess.run(
+        rc_mesh, _salida_mesh = run(
             ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--skip_train", "--skip_test",
@@ -232,11 +266,7 @@ def main():
              "--sdf_trunc", "0.06",
              "--mesh_res", "512",
              "--num_cluster", "1"],
-            capture_output=True, text=True, env=env_mesh)
-        cola = (r_mesh.stdout or "")[-1200:] + (r_mesh.stderr or "")[-1200:]
-        if cola.strip():
-            for linea in cola.strip().splitlines()[-12:]:
-                log(f"   | {linea}")
+            env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
         # Buscar la malla generada (preferimos la post-procesada; si no, la cruda).
         candidatos = list(dgs_out.rglob("*.ply"))
         def _es_no_vacia(p):
