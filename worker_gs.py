@@ -267,7 +267,10 @@ def main():
              "--mesh_res", "512",
              "--num_cluster", "1"],
             env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
-        # Buscar la malla generada (preferimos la post-procesada; si no, la cruda).
+        # Buscar la malla generada. Preferimos la CRUDA (fuse.ply), que contiene
+        # TODO lo que el TSDF reconstruyó, sin recortar. La post-procesada
+        # (fuse_post.ply) aplica num_cluster y RECORTA trozos: puede ser la razón
+        # de que el cuarto se vea incompleto ("un pedazo y el resto vacío").
         candidatos = list(dgs_out.rglob("*.ply"))
         def _es_no_vacia(p):
             try:
@@ -275,13 +278,17 @@ def main():
             except Exception:
                 return False
         malla = None
-        # 1º: fuse_post.ply (limpia). 2º: fuse.ply (cruda). 3º: la más grande.
-        for clave in ("fuse_post", "fuse", "mesh"):
+        # 1º: fuse.ply EXACTO (cruda, completa). 2º: fuse_post.ply. 3º: la más grande.
+        for nombre in ("fuse.ply", "fuse_post.ply"):
             for c in candidatos:
-                if clave in c.name.lower() and _es_no_vacia(c):
+                if c.name.lower() == nombre and _es_no_vacia(c):
                     malla = c; break
             if malla:
                 break
+        if malla is None:
+            for c in candidatos:
+                if "mesh" in c.name.lower() and _es_no_vacia(c):
+                    malla = c; break
         if malla is None:
             no_vacias = [c for c in candidatos if _es_no_vacia(c)]
             if no_vacias:
