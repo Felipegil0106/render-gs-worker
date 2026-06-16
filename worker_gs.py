@@ -275,7 +275,7 @@ def main():
                     Cz = -(R[0][2]*tx + R[1][2]*ty + R[2][2]*tz)
                     centros.append((Cx, Cy, Cz))
             return centros
-        depth_trunc = "12.0"   # fallback generoso si no se puede medir
+        depth_trunc = "8.0"   # fallback sensato si no se puede medir
         try:
             import math
             cps = _centros_camara(dataset / "sparse" / "0" / "images.bin")
@@ -283,21 +283,30 @@ def main():
                 cx = sum(p[0] for p in cps) / len(cps)
                 cy = sum(p[1] for p in cps) / len(cps)
                 cz = sum(p[2] for p in cps) / len(cps)
-                dmax = max(math.sqrt((p[0]-cx)**2 + (p[1]-cy)**2 + (p[2]-cz)**2)
-                           for p in cps)
-                dt = max(dmax * 3.0, 4.0)   # generoso: cubre las paredes lejanas
+                dists = sorted(math.sqrt((p[0]-cx)**2 + (p[1]-cy)**2 + (p[2]-cz)**2)
+                               for p in cps)
+                # CLAVE: antes usaba la distancia MÁXIMA ×3 = 40.99 → integraba
+                # ruido MUY detrás de las paredes → 50 millones de triángulos y
+                # pedazos flotando lejos. Ahora usamos el percentil 85 (robusto a
+                # cámaras atípicas) ×1.8 y lo acotamos a un rango sensato. Así
+                # cubre las paredes SIN integrar ruido lejano.
+                radio = dists[int(len(dists) * 0.85)]
+                dt = radio * 1.8
+                dt = max(4.0, min(dt, 15.0))   # acotado: ni corta ni mete ruido
                 depth_trunc = f"{dt:.2f}"
-                log(f"   escala COLMAP: alcance cámaras={dmax:.2f} → depth_trunc={depth_trunc}")
+                log(f"   escala COLMAP: radio(p85)={radio:.2f} → depth_trunc={depth_trunc} "
+                    f"(antes daba {max(dists)*3.0:.1f}, demasiado)")
         except Exception as e:
             log(f"   (depth_trunc fijo {depth_trunc}; no se midió escala: {e})")
 
-        # Parámetros para CUARTO COMPLETO:
-        #  --num_cluster 50 : conserva TODAS las paredes/zonas. ANTES con 1 se
-        #     borraban las paredes que quedaban DESCONECTADAS del pedazo grande
-        #     → por eso el cuarto salía incompleto ("un pedazo, resto vacío").
-        #  --depth_trunc adaptativo : cubre todo el cuarto sin cortar.
+        # Parámetros para CUARTO COMPLETO y LIMPIO:
+        #  --num_cluster 1  : se queda con la estructura conectada principal del
+        #     cuarto y BORRA los pedazos flotantes sueltos (que el usuario veía
+        #     "separados del cuarto"). Ahora que depth_trunc ya no mete ruido
+        #     lejano, esos floaters son pocos y desconectados → num_cluster 1 los limpia.
+        #  --depth_trunc acotado : cubre el cuarto sin ruido lejano.
         #  --depth_ratio 0 / --voxel_size 0.015 / --sdf_trunc 0.06 / --mesh_res 512.
-        log(f"$ python /opt/2dgs/render.py ... (OMP=8, depth_trunc={depth_trunc}, num_cluster=50)")
+        log(f"$ python /opt/2dgs/render.py ... (OMP=8, depth_trunc={depth_trunc}, num_cluster=1)")
         rc_mesh, _salida_mesh = run(
             ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
@@ -307,7 +316,7 @@ def main():
              "--voxel_size", "0.015",
              "--sdf_trunc", "0.06",
              "--mesh_res", "512",
-             "--num_cluster", "50"],
+             "--num_cluster", "1"],
             env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
         # Buscar la malla generada. Ahora con num_cluster=50, la post-procesada
         # (fuse_post.ply) ya conserva TODAS las paredes (no recorta como con 1),
@@ -353,12 +362,17 @@ def main():
             "import open3d as o3d\n"
             f"m = o3d.io.read_triangle_mesh(r'{malla}')\n"
             "n0 = len(m.triangles)\n"
-            "target = 1000000\n"
+            # 500k triángulos: de sobra para navegar un cuarto y más liviano.
+            "target = 500000\n"
             "if n0 > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             "m.remove_unreferenced_vertices()\n"
             "m.remove_degenerate_triangles()\n"
             "m.remove_duplicated_vertices()\n"
+            # Calcular normales: necesario para el efecto Polycam (paredes que
+            # se transparentan desde afuera). El visor 3D usará estas normales.
+            "m.compute_vertex_normals()\n"
+            "m.compute_triangle_normals()\n"
             f"o3d.io.write_triangle_mesh(r'{decimada}', m)\n"
             "print('DECIMATE triangulos', n0, '->', len(m.triangles))\n"
         )
