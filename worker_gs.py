@@ -247,30 +247,72 @@ def main():
         # ~2-3 min sin cambiar el algoritmo.
         env_mesh = dict(os.environ)
         env_mesh["OMP_NUM_THREADS"] = "8"
-        # Parámetros para que el CUARTO salga COMPLETO y rápido:
-        #  --depth_trunc 9.0 : el TSDF integra hasta 9 m → cubre las paredes
-        #     lejanas. Antes el valor automático era corto (2×distancia mínima
-        #     cámara-centro) y cortaba el cuarto: por eso "se desvanecía".
-        #  --depth_ratio 0   : profundidad media (mejor en escenas amplias).
-        #  --voxel_size 0.015 + --sdf_trunc 0.06 : resolución buena para un cuarto.
-        #  --mesh_res 512    : 8× menos vóxeles que 1024 → mucho más rápido.
-        #  --num_cluster 1   : se queda con el cuarto conectado, sin trozos sueltos.
-        log("$ python /opt/2dgs/render.py ... (OMP=8, depth_trunc=9, mesh_res=512)")
+
+        # depth_trunc ADAPTATIVO: COLMAP usa una escala ARBITRARIA (no metros),
+        # así que un valor fijo (9.0) puede cortar el cuarto en una escena y
+        # sobrar en otra. Medimos la escala real con las posiciones de las
+        # cámaras y ponemos un depth_trunc generoso para que NUNCA corte las
+        # paredes (los floaters lejanos los limpia num_cluster).
+        def _centros_camara(images_bin):
+            centros = []
+            with open(images_bin, "rb") as f:
+                num = struct.unpack("<Q", f.read(8))[0]
+                for _ in range(num):
+                    f.read(4)                                  # image_id
+                    qw, qx, qy, qz = struct.unpack("<4d", f.read(32))
+                    tx, ty, tz = struct.unpack("<3d", f.read(24))
+                    f.read(4)                                  # camera_id
+                    while f.read(1) not in (b"\x00", b""):     # nombre (termina en \0)
+                        pass
+                    npts = struct.unpack("<Q", f.read(8))[0]
+                    f.read(npts * 24)                          # saltar puntos 2D
+                    # centro de cámara C = -R^T t (R desde el cuaternión COLMAP)
+                    R = [[1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw),   2*(qx*qz+qy*qw)],
+                         [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+                         [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)]]
+                    Cx = -(R[0][0]*tx + R[1][0]*ty + R[2][0]*tz)
+                    Cy = -(R[0][1]*tx + R[1][1]*ty + R[2][1]*tz)
+                    Cz = -(R[0][2]*tx + R[1][2]*ty + R[2][2]*tz)
+                    centros.append((Cx, Cy, Cz))
+            return centros
+        depth_trunc = "12.0"   # fallback generoso si no se puede medir
+        try:
+            import math
+            cps = _centros_camara(dataset / "sparse" / "0" / "images.bin")
+            if len(cps) >= 2:
+                cx = sum(p[0] for p in cps) / len(cps)
+                cy = sum(p[1] for p in cps) / len(cps)
+                cz = sum(p[2] for p in cps) / len(cps)
+                dmax = max(math.sqrt((p[0]-cx)**2 + (p[1]-cy)**2 + (p[2]-cz)**2)
+                           for p in cps)
+                dt = max(dmax * 3.0, 4.0)   # generoso: cubre las paredes lejanas
+                depth_trunc = f"{dt:.2f}"
+                log(f"   escala COLMAP: alcance cámaras={dmax:.2f} → depth_trunc={depth_trunc}")
+        except Exception as e:
+            log(f"   (depth_trunc fijo {depth_trunc}; no se midió escala: {e})")
+
+        # Parámetros para CUARTO COMPLETO:
+        #  --num_cluster 50 : conserva TODAS las paredes/zonas. ANTES con 1 se
+        #     borraban las paredes que quedaban DESCONECTADAS del pedazo grande
+        #     → por eso el cuarto salía incompleto ("un pedazo, resto vacío").
+        #  --depth_trunc adaptativo : cubre todo el cuarto sin cortar.
+        #  --depth_ratio 0 / --voxel_size 0.015 / --sdf_trunc 0.06 / --mesh_res 512.
+        log(f"$ python /opt/2dgs/render.py ... (OMP=8, depth_trunc={depth_trunc}, num_cluster=50)")
         rc_mesh, _salida_mesh = run(
             ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--skip_train", "--skip_test",
              "--depth_ratio", "0",
-             "--depth_trunc", "9.0",
+             "--depth_trunc", depth_trunc,
              "--voxel_size", "0.015",
              "--sdf_trunc", "0.06",
              "--mesh_res", "512",
-             "--num_cluster", "1"],
+             "--num_cluster", "50"],
             env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
-        # Buscar la malla generada. Preferimos la CRUDA (fuse.ply), que contiene
-        # TODO lo que el TSDF reconstruyó, sin recortar. La post-procesada
-        # (fuse_post.ply) aplica num_cluster y RECORTA trozos: puede ser la razón
-        # de que el cuarto se vea incompleto ("un pedazo y el resto vacío").
+        # Buscar la malla generada. Ahora con num_cluster=50, la post-procesada
+        # (fuse_post.ply) ya conserva TODAS las paredes (no recorta como con 1),
+        # y además quita floaters minúsculos → la preferimos. Si el post-proceso
+        # fallara, usamos la cruda (fuse.ply), que también tiene todo.
         candidatos = list(dgs_out.rglob("*.ply"))
         def _es_no_vacia(p):
             try:
@@ -278,8 +320,8 @@ def main():
             except Exception:
                 return False
         malla = None
-        # 1º: fuse.ply EXACTO (cruda, completa). 2º: fuse_post.ply. 3º: la más grande.
-        for nombre in ("fuse.ply", "fuse_post.ply"):
+        # 1º: fuse_post.ply (limpia+completa). 2º: fuse.ply (cruda). 3º: la más grande.
+        for nombre in ("fuse_post.ply", "fuse.ply"):
             for c in candidatos:
                 if c.name.lower() == nombre and _es_no_vacia(c):
                     malla = c; break
@@ -296,10 +338,39 @@ def main():
         if malla is None:
             # No hubo malla con geometría → ahí sí es error real.
             raise RuntimeError(
-                f"La malla salió vacía. Código render={r_mesh.returncode}. "
+                f"La malla salió vacía. Código render={rc_mesh}. "
                 f"Posible: pocas iteraciones o poses débiles.")
         ply_mb = malla.stat().st_size / 1e6
         log(f"   malla: {malla.name} ({ply_mb:.1f} MB)")
+
+        # ── Simplificar la malla (de cientos de MB a algo liviano) ──
+        # La malla TSDF trae MILLONES de triángulos con color por vértice (por
+        # eso pesaba 355 MB). La decimamos a ~1 millón de triángulos manteniendo
+        # la forma y el color. Usamos open3d (ya instalado para el TSDF de 2DGS).
+        fase(0.90, "PASO 4/5 — Simplificando malla")
+        decimada = WORK / "mesh_lite.ply"
+        script_dec = (
+            "import open3d as o3d\n"
+            f"m = o3d.io.read_triangle_mesh(r'{malla}')\n"
+            "n0 = len(m.triangles)\n"
+            "target = 1000000\n"
+            "if n0 > target:\n"
+            "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
+            "m.remove_unreferenced_vertices()\n"
+            "m.remove_degenerate_triangles()\n"
+            "m.remove_duplicated_vertices()\n"
+            f"o3d.io.write_triangle_mesh(r'{decimada}', m)\n"
+            "print('DECIMATE triangulos', n0, '->', len(m.triangles))\n"
+        )
+        rc_dec, _ = run(["python", "-c", script_dec],
+                        fase_label="PASO 4/5 — Simplificando malla", check=False)
+        if decimada.exists() and decimada.stat().st_size > 1000:
+            nuevo_mb = decimada.stat().st_size / 1e6
+            log(f"   malla simplificada: {nuevo_mb:.1f} MB (antes {ply_mb:.1f} MB)")
+            malla = decimada
+            ply_mb = nuevo_mb
+        else:
+            log("   (no se pudo simplificar; subo la malla original)")
 
         # ── PASO 5: subir el .ply ──
         fase(0.92, "PASO 5/5 — Subiendo malla")
