@@ -299,14 +299,17 @@ def main():
         except Exception as e:
             log(f"   (depth_trunc fijo {depth_trunc}; no se midió escala: {e})")
 
-        # Parámetros para CUARTO COMPLETO y LIMPIO:
-        #  --num_cluster 1  : se queda con la estructura conectada principal del
-        #     cuarto y BORRA los pedazos flotantes sueltos (que el usuario veía
-        #     "separados del cuarto"). Ahora que depth_trunc ya no mete ruido
-        #     lejano, esos floaters son pocos y desconectados → num_cluster 1 los limpia.
+        # Parámetros para CUARTO COMPLETO:
+        #  --num_cluster 100 : conserva los 100 pedazos conectados MÁS GRANDES.
+        #     La investigación confirmó que ESTA era la causa #1 del ~30%
+        #     faltante: con num_cluster=1 se quedaba con UN solo pedazo y BORRABA
+        #     todas las paredes/zonas que quedaban DESCONECTADAS (el log mostró
+        #     591222 pedazos y borró 4 millones de vértices). El filtro interno
+        #     de 2DGS igual quita el ruido <50 triángulos, y como depth_trunc ya
+        #     está acotado (no mete ruido lejano), los floaters grandes NO regresan.
         #  --depth_trunc acotado : cubre el cuarto sin ruido lejano.
         #  --depth_ratio 0 / --voxel_size 0.015 / --sdf_trunc 0.06 / --mesh_res 512.
-        log(f"$ python /opt/2dgs/render.py ... (OMP=8, depth_trunc={depth_trunc}, num_cluster=1)")
+        log(f"$ python /opt/2dgs/render.py ... (OMP=8, depth_trunc={depth_trunc}, num_cluster=100)")
         rc_mesh, _salida_mesh = run(
             ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
@@ -316,12 +319,11 @@ def main():
              "--voxel_size", "0.015",
              "--sdf_trunc", "0.06",
              "--mesh_res", "512",
-             "--num_cluster", "1"],
+             "--num_cluster", "100"],
             env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
-        # Buscar la malla generada. Ahora con num_cluster=50, la post-procesada
-        # (fuse_post.ply) ya conserva TODAS las paredes (no recorta como con 1),
-        # y además quita floaters minúsculos → la preferimos. Si el post-proceso
-        # fallara, usamos la cruda (fuse.ply), que también tiene todo.
+        # Buscar la malla generada. Con num_cluster=100, la post-procesada
+        # (fuse_post.ply) conserva las paredes desconectadas y quita el ruido
+        # minúsculo → la preferimos. Si el post-proceso fallara, usamos la cruda.
         candidatos = list(dgs_out.rglob("*.ply"))
         def _es_no_vacia(p):
             try:
