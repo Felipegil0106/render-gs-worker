@@ -160,6 +160,13 @@ def main():
              # para fotos de 1440x1920 sin perder calidad de poses.
              "--SiftExtraction.max_image_size", "1600",
              "--SiftExtraction.max_num_features", "8192",
+             # DSP-SIFT: forma afín + domain-size pooling. Recomendación OFICIAL
+             # de COLMAP para registrar MÁS fotos en zonas difíciles (paredes
+             # lisas, poca textura). Features mucho más discriminativos → engancha
+             # donde el SIFT normal fallaba (las 16 fotos que no se registraban).
+             # Es más lento (CPU) pero es la causa #1 del cuarto incompleto.
+             "--SiftExtraction.estimate_affine_shape", "1",
+             "--SiftExtraction.domain_size_pooling", "1",
              # CLAVE del error -9 (OOM): COLMAP-CPU abre 1 hilo por núcleo y
              # cada uno carga una foto en RAM. En máquinas con muchos vCPU
              # (como la A6000) eso revienta la memoria. Con 4 hilos, máximo
@@ -168,15 +175,26 @@ def main():
         fase(0.25, "PASO 2/5 — COLMAP emparejando fotos")
         run(["colmap", "exhaustive_matcher",
              "--database_path", str(db), "--SiftMatching.use_gpu", "0",
+             # Emparejamiento guiado: usa la geometría para encontrar MÁS
+             # correspondencias (ayuda a registrar las fotos difíciles).
+             "--SiftMatching.guided_matching", "1",
              # Mismo motivo que arriba: limitar hilos evita el OOM (-9).
              "--SiftMatching.num_threads", "4"])
         fase(0.35, "PASO 2/5 — COLMAP reconstruyendo (mapper)")
-        # Mapper en ajustes por defecto: en la prueba anterior ya registró 108
-        # de 127 fotos (85%), así que COLMAP no era el problema. No bajamos
-        # umbrales para no degradar la calidad de las poses.
+        # Mapper TOLERANTE: relaja los umbrales de registro para que entren las
+        # ~16 fotos difíciles (paredes lisas/ventanas) que antes quedaban fuera
+        # (siempre 111/127). Esa era la causa #1 del cuarto incompleto: esas
+        # vistas no se registraban → 2DGS no las usaba → esa zona no se construía.
+        # IMPORTANTE: dejamos filter_max_reproj_error en su valor estricto (4)
+        # para NO meter poses de mala calidad; solo relajamos el registro inicial.
         run(["colmap", "mapper",
              "--database_path", str(db), "--image_path", str(images_dir),
-             "--output_path", str(sparse)])
+             "--output_path", str(sparse),
+             "--Mapper.init_min_num_inliers", "30",       # def 100
+             "--Mapper.abs_pose_min_num_inliers", "15",   # def 30
+             "--Mapper.abs_pose_min_inlier_ratio", "0.1", # def 0.25
+             "--Mapper.min_num_matches", "8",             # def 15
+             "--Mapper.init_min_tri_angle", "4"])         # def 16
         # COLMAP puede crear VARIOS modelos (sparse/0, sparse/1, ...). El worker
         # antes tomaba siempre sparse/0, que podía ser un fragmento pequeño.
         # Ahora elegimos el modelo con MÁS fotos registradas (el más completo).
@@ -196,6 +214,39 @@ def main():
         registradas = _num_imgs_registradas(modelo)
         log(f"   COLMAP produjo {len(modelos)} modelo(s). Uso el más completo "
             f"({modelo.name}): {registradas} de {n_fotos} fotos registradas")
+        # DIAGNÓSTICO: ¿CUÁLES fotos quedaron sin registrar? (las que cubren las
+        # zonas faltantes del cuarto). Leemos los nombres del modelo y los
+        # comparamos con las fotos en disco. No es crítico: si falla, seguimos.
+        try:
+            def _nombres_registrados(images_bin):
+                nombres = set()
+                with open(images_bin, "rb") as f:
+                    num = struct.unpack("<Q", f.read(8))[0]
+                    for _ in range(num):
+                        f.read(4)                              # image_id
+                        f.read(32); f.read(24); f.read(4)      # qvec, tvec, camera_id
+                        bs = bytearray()
+                        while True:                            # nombre (termina en \0)
+                            c = f.read(1)
+                            if c in (b"\x00", b""):
+                                break
+                            bs += c
+                        nombres.add(bs.decode("utf-8", "ignore"))
+                        npts = struct.unpack("<Q", f.read(8))[0]
+                        f.read(npts * 24)                      # saltar puntos 2D
+                return nombres
+            reg = _nombres_registrados(modelo / "images.bin")
+            todas = {p.name for p in images_dir.iterdir()
+                     if p.suffix.lower() in (".jpg", ".jpeg", ".png")}
+            faltan = sorted(todas - reg)
+            if faltan:
+                muestra = ", ".join(faltan[:20]) + (" ..." if len(faltan) > 20 else "")
+                log(f"   FOTOS SIN REGISTRAR ({len(faltan)}): {muestra}")
+                log("   (esas fotos son las zonas que faltan; míralas para ver qué cubren)")
+            else:
+                log("   ✓ TODAS las fotos se registraron")
+        except Exception as e:
+            log(f"   (no se pudo listar fotos sin registrar: {e})")
         if registradas < n_fotos * 0.5:
             log(f"   ⚠ OJO: solo se registró {registradas}/{n_fotos} fotos. "
                 f"La malla puede salir incompleta (poco solape entre fotos).")
