@@ -26,12 +26,16 @@ CALLBACK_URL    = os.environ.get("CALLBACK_URL", "")       # a dónde reportar
 CALLBACK_SECRET = os.environ.get("CALLBACK_SECRET", "")    # para firmar HMAC
 QUALITY         = os.environ.get("QUALITY", "fast")
 
-# Iteraciones de 2DGS según calidad (rápido para la primera prueba).
-# 2DGS aplica el regularizador de "normales" (el que une superficies) A PARTIR
-# de la iteración 7000. Con 7000 justas, NUNCA actúa (por eso normal=0.00000 y
-# la malla salía mal). Subimos fast a 15000 para que ese regularizador trabaje
-# ~8000 iteraciones y la geometría quede sólida y conectada.
-ITERS = {"fast": 15000, "balanced": 30000, "quality": 30000}.get(QUALITY, 15000)
+# Iteraciones de 2DGS según calidad.
+# 2DGS aplica el regularizador de "normales" (une superficies) a partir de la
+# iteración 7000, y el de "distorsión" (aplana paredes) a partir de la 3000. La
+# DENSIFICACIÓN (la que crea gaussianas nuevas para cerrar superficies) corre
+# hasta la iteración 15000. Con solo 15000, la geometría NO converge: termina
+# justo cuando deja de densificar. La investigación confirmó que 15000 es
+# insuficiente para interiores. Subimos a 30000 → la geometría converge,
+# las superficies se cierran y se aplanan. Duplica el tiempo (~60 min) pero
+# es necesario para que el cuarto no salga a medias.
+ITERS = {"fast": 30000, "balanced": 30000, "quality": 30000}.get(QUALITY, 30000)
 
 WORK = Path("/workspace/job")
 WORK.mkdir(parents=True, exist_ok=True)
@@ -181,20 +185,18 @@ def main():
              # Mismo motivo que arriba: limitar hilos evita el OOM (-9).
              "--SiftMatching.num_threads", "4"])
         fase(0.35, "PASO 2/5 — COLMAP reconstruyendo (mapper)")
-        # Mapper TOLERANTE: relaja los umbrales de registro para que entren las
-        # ~16 fotos difíciles (paredes lisas/ventanas) que antes quedaban fuera
-        # (siempre 111/127). Esa era la causa #1 del cuarto incompleto: esas
-        # vistas no se registraban → 2DGS no las usaba → esa zona no se construía.
-        # IMPORTANTE: dejamos filter_max_reproj_error en su valor estricto (4)
-        # para NO meter poses de mala calidad; solo relajamos el registro inicial.
+        # Mapper ESTRICTO (umbrales por defecto): la investigación demostró que
+        # el mapper TOLERANTE de la ronda pasada (que subió el registro de 111 a
+        # 118 fotos) metió poses de BAJA CALIDAD. Y las poses imprecisas ROMPEN la
+        # fusión del TSDF → paredes onduladas y huecos. CALIDAD de poses > cantidad
+        # de fotos. Volvemos a estricto: menos fotos, pero poses consistentes.
+        # ba_refine_focal_length: refina la cámara durante el bundle adjustment
+        # (mejor precisión de poses → TSDF fusiona mejor las superficies).
         run(["colmap", "mapper",
              "--database_path", str(db), "--image_path", str(images_dir),
              "--output_path", str(sparse),
-             "--Mapper.init_min_num_inliers", "30",       # def 100
-             "--Mapper.abs_pose_min_num_inliers", "15",   # def 30
-             "--Mapper.abs_pose_min_inlier_ratio", "0.1", # def 0.25
-             "--Mapper.min_num_matches", "8",             # def 15
-             "--Mapper.init_min_tri_angle", "4"])         # def 16
+             "--Mapper.ba_refine_focal_length", "1",
+             "--Mapper.ba_refine_principal_point", "0"])
         # COLMAP puede crear VARIOS modelos (sparse/0, sparse/1, ...). El worker
         # antes tomaba siempre sparse/0, que podía ser un fragmento pequeño.
         # Ahora elegimos el modelo con MÁS fotos registradas (el más completo).
@@ -250,6 +252,22 @@ def main():
         if registradas < n_fotos * 0.5:
             log(f"   ⚠ OJO: solo se registró {registradas}/{n_fotos} fotos. "
                 f"La malla puede salir incompleta (poco solape entre fotos).")
+        # DIAGNÓSTICO DE CALIDAD DE POSES: error de reproyección y longitud de
+        # tracks. Poses sanas = error < ~1px y tracks largos. Si el error es alto,
+        # las poses son imprecisas y el TSDF no fusionará bien (paredes onduladas).
+        # No es crítico: si falla, seguimos.
+        try:
+            import subprocess as _sp
+            r = _sp.run(["colmap", "model_analyzer", "--path", str(modelo)],
+                        capture_output=True, text=True, timeout=120)
+            for linea in (r.stdout + r.stderr).splitlines():
+                l = linea.strip()
+                if any(k in l for k in ("Cameras:", "Images:", "Points:",
+                                        "reprojection error", "Mean track",
+                                        "Mean observations")):
+                    log(f"   [poses] {l}")
+        except Exception as e:
+            log(f"   (model_analyzer no disponible: {e})")
         log("   COLMAP OK")
 
         # ── Quitar distorsión y convertir a PINHOLE (lo que 2DGS exige) ──
@@ -279,14 +297,19 @@ def main():
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
-        # NOTA: probamos --lambda_dist 100 y dejó la malla VACÍA (demasiado
-        # agresivo). Lo quitamos. Ahora la unión de superficies la logra el
-        # regularizador de NORMALES, que sí actúa gracias a las 15000 iteraciones.
-        # Sin --quiet: así la consola del pod muestra el avance iteración a
-        # iteración (antes --quiet lo ocultaba y no se veía nada).
+        # --lambda_dist 100 : ACTIVA el regularizador de DISTORSIÓN de profundidad.
+        # Hasta ahora estaba en 0 (el log mostraba "distort=0.00000" siempre) y por
+        # eso las PAREDES SALÍAN ONDULADAS y había floaters: sin este término, las
+        # gaussianas no colapsan sobre una superficie fina y plana. El paper de 2DGS
+        # lo confirma. Valor 100 (el paper usa 100 para escenas 360°/grandes).
+        # ANTES vació la malla porque se probó con solo 7000 iteraciones; ahora con
+        # 30000 y depth_ratio=0 (por defecto) es seguro. 2DGS lo activa desde la
+        # iteración 3000, así que el log debe mostrar "distort=" CON VALOR (no 0).
+        # Sin --quiet: la consola del pod muestra el avance iteración a iteración.
         run(["python", "/opt/2dgs/train.py",
              "-s", str(dataset), "-m", str(dgs_out),
-             "--iterations", str(ITERS)],
+             "--iterations", str(ITERS),
+             "--lambda_dist", "100"],
             fase_label="PASO 3/5 — Entrenando 2DGS")
         log("   2DGS entrenado")
 
