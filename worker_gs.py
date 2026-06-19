@@ -365,39 +365,35 @@ def main():
                 # cámaras atípicas) ×1.8 y lo acotamos a un rango sensato. Así
                 # cubre las paredes SIN integrar ruido lejano.
                 radio = dists[int(len(dists) * 0.85)]
-                dt = radio * 1.8
-                dt = max(4.0, min(dt, 15.0))   # acotado: ni corta ni mete ruido
-                depth_trunc = f"{dt:.2f}"
-                log(f"   escala COLMAP: radio(p85)={radio:.2f} → depth_trunc={depth_trunc} "
-                    f"(antes daba {max(dists)*3.0:.1f}, demasiado)")
+                depth_trunc = "(no se usa en unbounded)"
+                log(f"   escala COLMAP (informativa): radio(p85)={radio:.2f} unidades. "
+                    f"Modo unbounded → sin recorte de profundidad.")
         except Exception as e:
             log(f"   (depth_trunc fijo {depth_trunc}; no se midió escala: {e})")
 
-        # Parámetros para CUARTO COMPLETO:
-        #  --num_cluster 100 : conserva los 100 pedazos conectados MÁS GRANDES.
-        #     La investigación confirmó que ESTA era la causa #1 del ~30%
-        #     faltante: con num_cluster=1 se quedaba con UN solo pedazo y BORRABA
-        #     todas las paredes/zonas que quedaban DESCONECTADAS (el log mostró
-        #     591222 pedazos y borró 4 millones de vértices). El filtro interno
-        #     de 2DGS igual quita el ruido <50 triángulos, y como depth_trunc ya
-        #     está acotado (no mete ruido lejano), los floaters grandes NO regresan.
-        #  --depth_trunc acotado : cubre el cuarto sin ruido lejano.
-        #  --depth_ratio 0 / --voxel_size 0.015 / --sdf_trunc 0.06 / --mesh_res 512.
-        log(f"$ python /opt/2dgs/render.py ... (OMP=8, depth_trunc={depth_trunc}, num_cluster=100)")
+        # ── EXTRACCIÓN EN MODO UNBOUNDED (sin recorte) ──
+        # CAMBIO CLAVE (investigación): el modo BOUNDED del TSDF descarta toda la
+        # profundidad más lejana que depth_trunc. En un cuarto fotografiado desde
+        # adentro, eso RECORTABA paredes lejanas, techo y piso → "cuarto a medias".
+        # El modo --unbounded usa contracción de espacio (como Mip-NeRF360): NO
+        # recorta nada. Probamos si ESTE era el motivo de las zonas faltantes.
+        # En unbounded NO se usan depth_trunc/voxel_size/sdf_trunc (los ignora);
+        # solo manda --mesh_res (resolución). num_cluster=100 conserva los 100
+        # pedazos conectados más grandes (los diagnósticos de abajo nos dirán
+        # cuántos pedazos hay y dónde está la "ventana flotante").
+        log(f"$ python /opt/2dgs/render.py --unbounded --mesh_res 1024 --num_cluster 100  (OMP=8)")
         rc_mesh, _salida_mesh = run(
             ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--skip_train", "--skip_test",
              "--depth_ratio", "0",
-             "--depth_trunc", depth_trunc,
-             "--voxel_size", "0.015",
-             "--sdf_trunc", "0.06",
-             "--mesh_res", "512",
+             "--unbounded",
+             "--mesh_res", "1024",
              "--num_cluster", "100"],
             env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
-        # Buscar la malla generada. Con num_cluster=100, la post-procesada
-        # (fuse_post.ply) conserva las paredes desconectadas y quita el ruido
-        # minúsculo → la preferimos. Si el post-proceso fallara, usamos la cruda.
+        # Buscar la malla generada. En modo unbounded los nombres son
+        # fuse_unbounded.ply (cruda) y fuse_unbounded_post.ply (limpia). Preferimos
+        # la limpia. Dejamos los nombres bounded como respaldo por si acaso.
         candidatos = list(dgs_out.rglob("*.ply"))
         def _es_no_vacia(p):
             try:
@@ -405,8 +401,8 @@ def main():
             except Exception:
                 return False
         malla = None
-        # 1º: fuse_post.ply (limpia+completa). 2º: fuse.ply (cruda). 3º: la más grande.
-        for nombre in ("fuse_post.ply", "fuse.ply"):
+        for nombre in ("fuse_unbounded_post.ply", "fuse_unbounded.ply",
+                       "fuse_post.ply", "fuse.ply"):
             for c in candidatos:
                 if c.name.lower() == nombre and _es_no_vacia(c):
                     malla = c; break
@@ -436,17 +432,38 @@ def main():
         decimada = WORK / "mesh_lite.ply"
         script_dec = (
             "import open3d as o3d\n"
+            "import numpy as np\n"
             f"m = o3d.io.read_triangle_mesh(r'{malla}')\n"
             "n0 = len(m.triangles)\n"
-            # 500k triángulos: de sobra para navegar un cuarto y más liviano.
+            "print('DIAG vertices', len(m.vertices), 'triangulos', n0)\n"
+            # --- DIAGNÓSTICOS (envueltos: si fallan, NO rompen la malla) ---
+            # Nos dicen: tamaño del cuarto (bbox), cuántos pedazos sueltos hay, y
+            # de cada pedazo grande su tamaño y QUÉ TAN LEJOS está del centro.
+            # La "ventana flotante" = un pedazo pequeño MUY lejos del centro.
+            "try:\n"
+            "    aabb = m.get_axis_aligned_bounding_box()\n"
+            "    ext = aabb.get_extent(); cg = aabb.get_center()\n"
+            "    print('DIAG bbox_global X=%.2f Y=%.2f Z=%.2f (unidades COLMAP)' % (ext[0], ext[1], ext[2]))\n"
+            "    cl = m.cluster_connected_triangles()\n"
+            "    lab = np.asarray(cl[0]); ntri = np.asarray(cl[1])\n"
+            "    print('DIAG componentes_conexas', len(ntri))\n"
+            "    V = np.asarray(m.vertices); T = np.asarray(m.triangles)\n"
+            "    order = np.argsort(ntri)[::-1]\n"
+            "    for k, i in enumerate(order[:8]):\n"
+            "        mask = lab == i\n"
+            "        vidx = np.unique(T[mask].reshape(-1)); vv = V[vidx]\n"
+            "        cmin = vv.min(0); cmax = vv.max(0); c = (cmin+cmax)/2; sz = cmax-cmin\n"
+            "        d = float(np.linalg.norm(c - cg)); pct = 100.0*ntri[i]/max(n0,1)\n"
+            "        print('DIAG comp%d: %d tri (%.1f%%) tamano(%.2f,%.2f,%.2f) dist_al_centro=%.2f' % (k, int(ntri[i]), pct, sz[0], sz[1], sz[2], d))\n"
+            "except Exception as e:\n"
+            "    print('DIAG (fallo diagnostico, sigo):', e)\n"
+            # --- DECIMACIÓN ---
             "target = 500000\n"
             "if n0 > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             "m.remove_unreferenced_vertices()\n"
             "m.remove_degenerate_triangles()\n"
             "m.remove_duplicated_vertices()\n"
-            # Calcular normales: necesario para el efecto Polycam (paredes que
-            # se transparentan desde afuera). El visor 3D usará estas normales.
             "m.compute_vertex_normals()\n"
             "m.compute_triangle_normals()\n"
             f"o3d.io.write_triangle_mesh(r'{decimada}', m)\n"
