@@ -40,6 +40,129 @@ ITERS = {"fast": 30000, "balanced": 30000, "quality": 30000}.get(QUALITY, 30000)
 WORK = Path("/workspace/job")
 WORK.mkdir(parents=True, exist_ok=True)
 
+# ════════════════════════════════════════════════════════════════════════
+# Script que corre MASt3R-SfM y escribe las poses en formato COLMAP (texto)
+# que 2DGS lee. Se escribe a disco y se ejecuta como proceso aparte para
+# aislar la memoria del modelo de IA. (raw string: el \n de adentro queda
+# literal y Python lo interpreta al ejecutar el script.)
+# ════════════════════════════════════════════════════════════════════════
+MAST3R_SCRIPT = r'''
+import sys, os
+sys.path.insert(0, "/opt/mast3r")
+sys.path.insert(0, "/opt/mast3r/dust3r")
+import numpy as np
+import torch
+from PIL import Image
+from scipy.spatial.transform import Rotation
+
+IMAGES_DIR = sys.argv[1]
+OUT_DIR = sys.argv[2]
+
+from mast3r.model import AsymmetricMASt3R
+from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
+from mast3r.image_pairs import make_pairs
+from mast3r.retrieval.processor import Retriever
+import mast3r.utils.path_to_dust3r  # noqa
+from dust3r.utils.image import load_images
+from dust3r.utils.device import to_numpy
+
+CKPT = "/opt/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+RETR = "/opt/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth"
+device = "cuda"
+
+exts = (".jpg", ".jpeg", ".png")
+filelist = sorted([os.path.join(IMAGES_DIR, f) for f in os.listdir(IMAGES_DIR)
+                   if os.path.splitext(f)[1].lower() in exts])
+print("MAST3R: %d fotos" % len(filelist), flush=True)
+
+model = AsymmetricMASt3R.from_pretrained(CKPT).to(device)
+print("MAST3R: modelo cargado", flush=True)
+
+imgs = load_images(filelist, size=512, verbose=False)
+
+# retrieval -> matriz de similitud para elegir que pares de fotos comparar
+retriever = Retriever(RETR, backbone=model, device=device)
+with torch.no_grad():
+    sim_matrix = retriever(filelist)
+del retriever
+torch.cuda.empty_cache()
+print("MAST3R: retrieval OK", flush=True)
+
+# retrieval-Na-k : Na anclas (FPS) + k vecinos mas similares por foto
+pairs = make_pairs(imgs, scene_graph="retrieval-20-10", prefilter=None,
+                   symmetrize=True, sim_mat=sim_matrix)
+print("MAST3R: %d pares" % len(pairs), flush=True)
+
+cache_dir = os.path.join(OUT_DIR, "mast3r_cache")
+os.makedirs(cache_dir, exist_ok=True)
+scene = sparse_global_alignment(filelist, pairs, cache_dir, model,
+                                lr1=0.07, niter1=300, lr2=0.014, niter2=300,
+                                device=device, opt_depth=True,
+                                shared_intrinsics=True, matching_conf_thr=5.0)
+print("MAST3R: alineamiento global OK", flush=True)
+
+cams2world = to_numpy(scene.get_im_poses())
+intrinsics = [to_numpy(K) for K in scene.intrinsics]
+rgbimgs = scene.imgs
+N = len(rgbimgs)
+print("MAST3R: %d camaras registradas" % N, flush=True)
+
+img_out = os.path.join(OUT_DIR, "images")
+sparse_out = os.path.join(OUT_DIR, "sparse", "0")
+os.makedirs(img_out, exist_ok=True)
+os.makedirs(sparse_out, exist_ok=True)
+
+fcam = open(os.path.join(sparse_out, "cameras.txt"), "w")
+fimg = open(os.path.join(sparse_out, "images.txt"), "w")
+fcam.write("# Camera list\n")
+fimg.write("# Image list\n")
+for i in range(N):
+    im = rgbimgs[i]
+    H, W = im.shape[:2]
+    name = "img_%04d.png" % i
+    Image.fromarray((np.clip(im, 0, 1) * 255).astype(np.uint8)).save(os.path.join(img_out, name))
+    K = intrinsics[i]
+    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+    cam_id = i + 1
+    fcam.write("%d PINHOLE %d %d %.6f %.6f %.6f %.6f\n" % (cam_id, W, H, fx, fy, cx, cy))
+    # COLMAP guarda world->cam = inversa de cam->world
+    w2c = np.linalg.inv(cams2world[i])
+    q = Rotation.from_matrix(w2c[:3, :3]).as_quat()   # [x,y,z,w]
+    t = w2c[:3, 3]
+    fimg.write("%d %.9f %.9f %.9f %.9f %.9f %.9f %.9f %d %s\n" %
+               (cam_id, float(q[3]), float(q[0]), float(q[1]), float(q[2]),
+                float(t[0]), float(t[1]), float(t[2]), cam_id, name))
+    fimg.write("\n")   # linea de puntos 2D (vacia)
+fcam.close()
+fimg.close()
+print("MAST3R: poses escritas", flush=True)
+
+# nube de puntos densa con color, para inicializar 2DGS
+pts3d, _, confs = scene.get_dense_pts3d(clean_depth=True)
+pts3d = to_numpy(pts3d)
+confs = to_numpy(confs)
+masks = [c > 1.5 for c in confs]
+pts = np.concatenate([p[m.ravel()] for p, m in zip(pts3d, masks)]).reshape(-1, 3)
+col = np.concatenate([im[m] for im, m in zip(rgbimgs, masks)]).reshape(-1, 3)
+valid = np.isfinite(pts.sum(axis=1))
+pts = pts[valid]
+col = (np.clip(col[valid], 0, 1) * 255).astype(np.uint8)
+if len(pts) > 200000:
+    idx = np.random.choice(len(pts), 200000, replace=False)
+    pts = pts[idx]; col = col[idx]
+print("MAST3R: %d puntos 3D para init" % len(pts), flush=True)
+
+fp = open(os.path.join(sparse_out, "points3D.txt"), "w")
+fp.write("# 3D point list\n")
+for j in range(len(pts)):
+    x, y, z = pts[j]
+    r, g, b = col[j]
+    fp.write("%d %.6f %.6f %.6f %d %d %d 0\n" % (j + 1, x, y, z, int(r), int(g), int(b)))
+fp.close()
+print("MAST3R: points3D.txt escrito. LISTO.", flush=True)
+'''
+
+
 # Buffer del log completo (se manda al backend en cada heartbeat y al final).
 _LOG = []
 def log(msg):
@@ -151,151 +274,40 @@ def main():
         n_fotos = len(imgs)
         log(f"   {n_fotos} fotos listas")
 
-        # ── PASO 2: COLMAP (poses) ──
-        fase(0.15, "PASO 2/5 — COLMAP (poses de cámara)")
-        colmap_dir = WORK / "colmap"; colmap_dir.mkdir(exist_ok=True)
-        db = colmap_dir / "database.db"
-        sparse = colmap_dir / "sparse"; sparse.mkdir(exist_ok=True)
-        run(["colmap", "feature_extractor",
-             "--database_path", str(db), "--image_path", str(images_dir),
-             "--ImageReader.single_camera", "1",
-             "--SiftExtraction.use_gpu", "0",
-             # Limitar tamaño de imagen evita picos de RAM; 1600px es de sobra
-             # para fotos de 1440x1920 sin perder calidad de poses.
-             "--SiftExtraction.max_image_size", "1600",
-             "--SiftExtraction.max_num_features", "8192",
-             # DSP-SIFT: forma afín + domain-size pooling. Recomendación OFICIAL
-             # de COLMAP para registrar MÁS fotos en zonas difíciles (paredes
-             # lisas, poca textura). Features mucho más discriminativos → engancha
-             # donde el SIFT normal fallaba (las 16 fotos que no se registraban).
-             # Es más lento (CPU) pero es la causa #1 del cuarto incompleto.
-             "--SiftExtraction.estimate_affine_shape", "1",
-             "--SiftExtraction.domain_size_pooling", "1",
-             # CLAVE del error -9 (OOM): COLMAP-CPU abre 1 hilo por núcleo y
-             # cada uno carga una foto en RAM. En máquinas con muchos vCPU
-             # (como la A6000) eso revienta la memoria. Con 4 hilos, máximo
-             # 4 fotos en RAM a la vez → estable en cualquier GPU.
-             "--SiftExtraction.num_threads", "4"])
-        fase(0.25, "PASO 2/5 — COLMAP emparejando fotos")
-        run(["colmap", "exhaustive_matcher",
-             "--database_path", str(db), "--SiftMatching.use_gpu", "0",
-             # Emparejamiento guiado: usa la geometría para encontrar MÁS
-             # correspondencias (ayuda a registrar las fotos difíciles).
-             "--SiftMatching.guided_matching", "1",
-             # Mismo motivo que arriba: limitar hilos evita el OOM (-9).
-             "--SiftMatching.num_threads", "4"])
-        fase(0.35, "PASO 2/5 — GLOMAP reconstruyendo (mapper GLOBAL)")
-        # ── MAPPER GLOBAL CON GLOMAP (cambio clave de la solución definitiva) ──
-        # ANTES: 'colmap mapper' es INCREMENTAL (añade una foto a la vez). En
-        # interiores con poco solape y paredes lisas se PARTÍA en 2 modelos y solo
-        # registraba 76/127 fotos → el cuarto salía DOBLE/fantasma (lo confirmaron
-        # los diagnósticos DIAG: comp0 52% y comp1 46%, dos mitades superpuestas).
-        # AHORA: 'glomap mapper' es GLOBAL: resuelve TODAS las poses a la vez
-        # considerando todas las coincidencias juntas → un solo modelo, mucho más
-        # robusto, no se fragmenta. Lee la MISMA base de datos (las features SIFT y
-        # el matching que ya hicimos), así que es un cambio quirúrgico: solo cambia
-        # este paso; extracción, matching, undistort, 2DGS y malla NO cambian.
-        # Usamos opciones por defecto (GLOMAP ya refina intrínsecos internamente).
-        run(["glomap", "mapper",
-             "--database_path", str(db),
-             "--image_path", str(images_dir),
-             "--output_path", str(sparse)])
-        # GLOMAP escribe el modelo en sparse/0/ (mismo formato .bin que COLMAP).
-        # Igual que antes, elegimos el modelo con MÁS fotos registradas por si
-        # produjera más de uno (normalmente GLOMAP produce uno solo).
-        modelos = [d for d in sparse.iterdir()
-                   if d.is_dir() and (d / "images.bin").exists()]
-        if not modelos:
-            raise RuntimeError("GLOMAP no produjo reconstrucción. "
-                               "Revisa que las fotos tengan solape suficiente.")
-        def _num_imgs_registradas(model_dir):
-            # Las primeras 8 bytes de images.bin = nº de imágenes registradas.
-            try:
-                with open(model_dir / "images.bin", "rb") as f:
-                    return struct.unpack("<Q", f.read(8))[0]
-            except Exception:
-                return 0
-        modelo = max(modelos, key=_num_imgs_registradas)
-        registradas = _num_imgs_registradas(modelo)
-        log(f"   COLMAP produjo {len(modelos)} modelo(s). Uso el más completo "
-            f"({modelo.name}): {registradas} de {n_fotos} fotos registradas")
-        # DIAGNÓSTICO: ¿CUÁLES fotos quedaron sin registrar? (las que cubren las
-        # zonas faltantes del cuarto). Leemos los nombres del modelo y los
-        # comparamos con las fotos en disco. No es crítico: si falla, seguimos.
-        try:
-            def _nombres_registrados(images_bin):
-                nombres = set()
-                with open(images_bin, "rb") as f:
-                    num = struct.unpack("<Q", f.read(8))[0]
-                    for _ in range(num):
-                        f.read(4)                              # image_id
-                        f.read(32); f.read(24); f.read(4)      # qvec, tvec, camera_id
-                        bs = bytearray()
-                        while True:                            # nombre (termina en \0)
-                            c = f.read(1)
-                            if c in (b"\x00", b""):
-                                break
-                            bs += c
-                        nombres.add(bs.decode("utf-8", "ignore"))
-                        npts = struct.unpack("<Q", f.read(8))[0]
-                        f.read(npts * 24)                      # saltar puntos 2D
-                return nombres
-            reg = _nombres_registrados(modelo / "images.bin")
-            todas = {p.name for p in images_dir.iterdir()
-                     if p.suffix.lower() in (".jpg", ".jpeg", ".png")}
-            faltan = sorted(todas - reg)
-            if faltan:
-                muestra = ", ".join(faltan[:20]) + (" ..." if len(faltan) > 20 else "")
-                log(f"   FOTOS SIN REGISTRAR ({len(faltan)}): {muestra}")
-                log("   (esas fotos son las zonas que faltan; míralas para ver qué cubren)")
-            else:
-                log("   ✓ TODAS las fotos se registraron")
-        except Exception as e:
-            log(f"   (no se pudo listar fotos sin registrar: {e})")
-        if registradas < n_fotos * 0.5:
-            log(f"   ⚠ OJO: solo se registró {registradas}/{n_fotos} fotos. "
-                f"La malla puede salir incompleta (poco solape entre fotos).")
-        # DIAGNÓSTICO DE CALIDAD DE POSES: error de reproyección y longitud de
-        # tracks. Poses sanas = error < ~1px y tracks largos. Si el error es alto,
-        # las poses son imprecisas y el TSDF no fusionará bien (paredes onduladas).
-        # No es crítico: si falla, seguimos.
-        try:
-            import subprocess as _sp
-            r = _sp.run(["colmap", "model_analyzer", "--path", str(modelo)],
-                        capture_output=True, text=True, timeout=120)
-            for linea in (r.stdout + r.stderr).splitlines():
-                l = linea.strip()
-                if any(k in l for k in ("Cameras:", "Images:", "Points:",
-                                        "reprojection error", "Mean track",
-                                        "Mean observations")):
-                    log(f"   [poses] {l}")
-        except Exception as e:
-            log(f"   (model_analyzer no disponible: {e})")
-        log("   GLOMAP OK")
-
-        # ── Quitar distorsión y convertir a PINHOLE (lo que 2DGS exige) ──
-        # COLMAP usa por defecto SIMPLE_RADIAL (con distorsión de lente), pero
-        # 2DGS solo acepta PINHOLE. 'image_undistorter' corrige las fotos y
-        # convierte el modelo a PINHOLE. Es el paso estándar de Gaussian Splatting.
-        fase(0.40, "PASO 2/5 — Quitando distorsión (undistort → PINHOLE)")
+        # ── PASO 2: POSES CON MASt3R (reemplaza COLMAP+SIFT+GLOMAP) ──
+        # MASt3R es un modelo de IA feed-forward que estima la geometria de cada
+        # foto SIN detectar "features" (puntos tipo SIFT). Por eso registra casi
+        # todas las camaras incluso en paredes blancas lisas, donde SIFT fallaba
+        # (solo 55/127, cuarto fantasma doble). Produce camaras PINHOLE
+        # directamente, asi que NO hace falta el paso de undistort.
+        fase(0.15, "PASO 2/5 — MASt3R (poses con IA)")
         dataset = WORK / "dataset"
         if dataset.exists():
             shutil.rmtree(dataset)
         dataset.mkdir(exist_ok=True)
-        run(["colmap", "image_undistorter",
-             "--image_path", str(images_dir),
-             "--input_path", str(modelo),          # sparse/0 con SIMPLE_RADIAL
-             "--output_path", str(dataset),         # genera images/ + sparse/ PINHOLE
-             "--output_type", "COLMAP"])
-        # image_undistorter deja sparse/*.bin sueltos; 2DGS los quiere en sparse/0/.
-        sparse_out = dataset / "sparse"
-        sparse_0 = sparse_out / "0"
-        if not sparse_0.exists():
-            sparse_0.mkdir(parents=True, exist_ok=True)
-            for f in list(sparse_out.iterdir()):
-                if f.is_file():
-                    shutil.move(str(f), str(sparse_0 / f.name))
-        log("   undistort OK (cámaras PINHOLE, fotos corregidas)")
+        # Escribir el script de MASt3R a disco y ejecutarlo como proceso aparte
+        # (aisla la memoria del modelo de IA del resto del worker).
+        mast3r_py = WORK / "mast3r_sfm.py"
+        mast3r_py.write_text(MAST3R_SCRIPT)
+        run(["python", str(mast3r_py), str(images_dir), str(dataset)],
+            fase_label="PASO 2/5 — MASt3R calculando poses")
+        # MASt3R escribe dataset/images/ + dataset/sparse/0/ (cameras/images/points3D.txt).
+        sparse_0 = dataset / "sparse" / "0"
+        if not (sparse_0 / "images.txt").exists():
+            raise RuntimeError("MASt3R no produjo poses (sparse/0/images.txt). "
+                               "Revisa el log de MASt3R arriba.")
+        # Contar cuantas camaras registro (lineas de imagen en images.txt).
+        try:
+            lineas = (sparse_0 / "images.txt").read_text().splitlines()
+            n_reg = sum(1 for ln in lineas
+                        if ln and not ln.startswith("#") and len(ln.split()) >= 10)
+            log(f"   MASt3R registró {n_reg} de {n_fotos} fotos")
+            if n_reg < n_fotos * 0.8:
+                log(f"   ⚠ OJO: {n_reg}/{n_fotos} registradas. Si es bajo, "
+                    f"puede ser la captura (poco solape entre fotos).")
+        except Exception as e:
+            log(f"   (no se pudo contar cámaras: {e})")
+        log("   MASt3R OK (cámaras PINHOLE, sin necesidad de undistort)")
 
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
@@ -330,32 +342,31 @@ def main():
         # sobrar en otra. Medimos la escala real con las posiciones de las
         # cámaras y ponemos un depth_trunc generoso para que NUNCA corte las
         # paredes (los floaters lejanos los limpia num_cluster).
-        def _centros_camara(images_bin):
+        def _centros_camara(images_txt):
             centros = []
-            with open(images_bin, "rb") as f:
-                num = struct.unpack("<Q", f.read(8))[0]
-                for _ in range(num):
-                    f.read(4)                                  # image_id
-                    qw, qx, qy, qz = struct.unpack("<4d", f.read(32))
-                    tx, ty, tz = struct.unpack("<3d", f.read(24))
-                    f.read(4)                                  # camera_id
-                    while f.read(1) not in (b"\x00", b""):     # nombre (termina en \0)
-                        pass
-                    npts = struct.unpack("<Q", f.read(8))[0]
-                    f.read(npts * 24)                          # saltar puntos 2D
-                    # centro de cámara C = -R^T t (R desde el cuaternión COLMAP)
-                    R = [[1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw),   2*(qx*qz+qy*qw)],
-                         [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
-                         [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)]]
-                    Cx = -(R[0][0]*tx + R[1][0]*ty + R[2][0]*tz)
-                    Cy = -(R[0][1]*tx + R[1][1]*ty + R[2][1]*tz)
-                    Cz = -(R[0][2]*tx + R[1][2]*ty + R[2][2]*tz)
-                    centros.append((Cx, Cy, Cz))
+            with open(images_txt, "r") as f:
+                lineas = [l for l in f if l.strip() and not l.startswith("#")]
+            # En images.txt cada cámara son 2 líneas; la de pose tiene >=10
+            # columnas (la 2ª, de puntos 2D, va vacía en nuestro caso).
+            for l in lineas:
+                p = l.split()
+                if len(p) < 10:
+                    continue
+                qw, qx, qy, qz = float(p[1]), float(p[2]), float(p[3]), float(p[4])
+                tx, ty, tz = float(p[5]), float(p[6]), float(p[7])
+                # centro de cámara C = -R^T t (R desde el cuaternión COLMAP)
+                R = [[1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw),   2*(qx*qz+qy*qw)],
+                     [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+                     [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)]]
+                Cx = -(R[0][0]*tx + R[1][0]*ty + R[2][0]*tz)
+                Cy = -(R[0][1]*tx + R[1][1]*ty + R[2][1]*tz)
+                Cz = -(R[0][2]*tx + R[1][2]*ty + R[2][2]*tz)
+                centros.append((Cx, Cy, Cz))
             return centros
         depth_trunc = "8.0"   # fallback sensato si no se puede medir
         try:
             import math
-            cps = _centros_camara(dataset / "sparse" / "0" / "images.bin")
+            cps = _centros_camara(dataset / "sparse" / "0" / "images.txt")
             if len(cps) >= 2:
                 cx = sum(p[0] for p in cps) / len(cps)
                 cy = sum(p[1] for p in cps) / len(cps)
