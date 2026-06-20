@@ -381,14 +381,17 @@ def main():
         # solo manda --mesh_res (resolución). num_cluster=100 conserva los 100
         # pedazos conectados más grandes (los diagnósticos de abajo nos dirán
         # cuántos pedazos hay y dónde está la "ventana flotante").
-        log(f"$ python /opt/2dgs/render.py --unbounded --mesh_res 1024 --num_cluster 100  (OMP=8)")
+        # mesh_res=512 (NO 1024): con 1024 la malla salía GIGANTESCA y el paso de
+        # simplificación se quedaba sin memoria (se colgó en "90%"). 512 sigue
+        # siendo unbounded (sin recorte) pero produce una malla manejable.
+        log(f"$ python /opt/2dgs/render.py --unbounded --mesh_res 512 --num_cluster 100  (OMP=8)")
         rc_mesh, _salida_mesh = run(
             ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--skip_train", "--skip_test",
              "--depth_ratio", "0",
              "--unbounded",
-             "--mesh_res", "1024",
+             "--mesh_res", "512",
              "--num_cluster", "100"],
             env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
         # Buscar la malla generada. En modo unbounded los nombres son
@@ -435,31 +438,18 @@ def main():
             "import numpy as np\n"
             f"m = o3d.io.read_triangle_mesh(r'{malla}')\n"
             "n0 = len(m.triangles)\n"
-            "print('DIAG vertices', len(m.vertices), 'triangulos', n0)\n"
-            # --- DIAGNÓSTICOS (envueltos: si fallan, NO rompen la malla) ---
-            # Nos dicen: tamaño del cuarto (bbox), cuántos pedazos sueltos hay, y
-            # de cada pedazo grande su tamaño y QUÉ TAN LEJOS está del centro.
-            # La "ventana flotante" = un pedazo pequeño MUY lejos del centro.
-            "try:\n"
-            "    aabb = m.get_axis_aligned_bounding_box()\n"
-            "    ext = aabb.get_extent(); cg = aabb.get_center()\n"
-            "    print('DIAG bbox_global X=%.2f Y=%.2f Z=%.2f (unidades COLMAP)' % (ext[0], ext[1], ext[2]))\n"
-            "    cl = m.cluster_connected_triangles()\n"
-            "    lab = np.asarray(cl[0]); ntri = np.asarray(cl[1])\n"
-            "    print('DIAG componentes_conexas', len(ntri))\n"
-            "    V = np.asarray(m.vertices); T = np.asarray(m.triangles)\n"
-            "    order = np.argsort(ntri)[::-1]\n"
-            "    for k, i in enumerate(order[:8]):\n"
-            "        mask = lab == i\n"
-            "        vidx = np.unique(T[mask].reshape(-1)); vv = V[vidx]\n"
-            "        cmin = vv.min(0); cmax = vv.max(0); c = (cmin+cmax)/2; sz = cmax-cmin\n"
-            "        d = float(np.linalg.norm(c - cg)); pct = 100.0*ntri[i]/max(n0,1)\n"
-            "        print('DIAG comp%d: %d tri (%.1f%%) tamano(%.2f,%.2f,%.2f) dist_al_centro=%.2f' % (k, int(ntri[i]), pct, sz[0], sz[1], sz[2], d))\n"
-            "except Exception as e:\n"
-            "    print('DIAG (fallo diagnostico, sigo):', e)\n"
-            # --- DECIMACIÓN ---
+            "print('DIAG vertices', len(m.vertices), 'triangulos', n0, flush=True)\n"
+            # --- DECIMAR PRIMERO (sobre la malla grande) ---
+            # ANTES los diagnósticos corrían sobre la malla GIGANTE y se quedaban
+            # sin memoria (se colgó en 90%). Ahora decimamos primero y los
+            # diagnósticos van después, sobre algo liviano. Si la malla viene
+            # enorme (>4M triángulos), decimamos en 2 pasos para no reventar RAM.
             "target = 500000\n"
-            "if n0 > target:\n"
+            "if n0 > 4000000:\n"
+            "    print('DECIMATE malla muy grande (%d), simplifico en 2 pasos...' % n0, flush=True)\n"
+            "    m = m.simplify_quadric_decimation(target_number_of_triangles=1500000)\n"
+            "    print('DECIMATE paso 1 ok:', len(m.triangles), flush=True)\n"
+            "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             "m.remove_unreferenced_vertices()\n"
             "m.remove_degenerate_triangles()\n"
@@ -467,7 +457,29 @@ def main():
             "m.compute_vertex_normals()\n"
             "m.compute_triangle_normals()\n"
             f"o3d.io.write_triangle_mesh(r'{decimada}', m)\n"
-            "print('DECIMATE triangulos', n0, '->', len(m.triangles))\n"
+            "print('DECIMATE triangulos', n0, '->', len(m.triangles), flush=True)\n"
+            # --- DIAGNÓSTICOS (sobre la malla YA decimada = liviana y segura) ---
+            # Nos dicen: tamaño del cuarto (bbox), cuántos pedazos sueltos hay, y
+            # de cada pedazo su tamaño y QUÉ TAN LEJOS está del centro.
+            # La "ventana flotante" = un pedazo pequeño MUY lejos del centro.
+            "try:\n"
+            "    aabb = m.get_axis_aligned_bounding_box()\n"
+            "    ext = aabb.get_extent(); cg = aabb.get_center()\n"
+            "    nt = len(m.triangles)\n"
+            "    print('DIAG bbox_global X=%.2f Y=%.2f Z=%.2f (unidades COLMAP)' % (ext[0], ext[1], ext[2]), flush=True)\n"
+            "    cl = m.cluster_connected_triangles()\n"
+            "    lab = np.asarray(cl[0]); ntri = np.asarray(cl[1])\n"
+            "    print('DIAG componentes_conexas', len(ntri), flush=True)\n"
+            "    V = np.asarray(m.vertices); T = np.asarray(m.triangles)\n"
+            "    order = np.argsort(ntri)[::-1]\n"
+            "    for k, i in enumerate(order[:8]):\n"
+            "        mask = lab == i\n"
+            "        vidx = np.unique(T[mask].reshape(-1)); vv = V[vidx]\n"
+            "        cmin = vv.min(0); cmax = vv.max(0); c = (cmin+cmax)/2; sz = cmax-cmin\n"
+            "        d = float(np.linalg.norm(c - cg)); pct = 100.0*ntri[i]/max(nt,1)\n"
+            "        print('DIAG comp%d: %d tri (%.1f%%) tamano(%.2f,%.2f,%.2f) dist_al_centro=%.2f' % (k, int(ntri[i]), pct, sz[0], sz[1], sz[2], d), flush=True)\n"
+            "except Exception as e:\n"
+            "    print('DIAG (fallo diagnostico, sigo):', e, flush=True)\n"
         )
         rc_dec, _ = run(["python", "-c", script_dec],
                         fase_label="PASO 4/5 — Simplificando malla", check=False)
