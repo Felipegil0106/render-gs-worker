@@ -287,9 +287,18 @@ def main():
         dataset.mkdir(exist_ok=True)
         # Escribir el script de MASt3R a disco y ejecutarlo como proceso aparte
         # (aisla la memoria del modelo de IA del resto del worker).
+        # CLAVE: lo corremos DESDE /opt/mast3r (cwd) y con PYTHONPATH explícito.
+        # En el build, MASt3R se importaba bien porque la carpeta de trabajo era
+        # /opt/mast3r; al correr el script desde /workspace/job, el sys.path.insert
+        # del script no bastaba (MASt3R reconfigura rutas de forma especial).
+        # Replicar cwd=/opt/mast3r + PYTHONPATH garantiza que encuentre el paquete.
         mast3r_py = WORK / "mast3r_sfm.py"
         mast3r_py.write_text(MAST3R_SCRIPT)
+        env_mast3r = dict(os.environ)
+        env_mast3r["PYTHONPATH"] = "/opt/mast3r:/opt/mast3r/dust3r:/opt/2dgs"
         run(["python", str(mast3r_py), str(images_dir), str(dataset)],
+            cwd="/opt/mast3r",
+            env=env_mast3r,
             fase_label="PASO 2/5 — MASt3R calculando poses")
         # MASt3R escribe dataset/images/ + dataset/sparse/0/ (cameras/images/points3D.txt).
         sparse_0 = dataset / "sparse" / "0"
