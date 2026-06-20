@@ -184,26 +184,29 @@ def main():
              "--SiftMatching.guided_matching", "1",
              # Mismo motivo que arriba: limitar hilos evita el OOM (-9).
              "--SiftMatching.num_threads", "4"])
-        fase(0.35, "PASO 2/5 — COLMAP reconstruyendo (mapper)")
-        # Mapper ESTRICTO (umbrales por defecto): la investigación demostró que
-        # el mapper TOLERANTE de la ronda pasada (que subió el registro de 111 a
-        # 118 fotos) metió poses de BAJA CALIDAD. Y las poses imprecisas ROMPEN la
-        # fusión del TSDF → paredes onduladas y huecos. CALIDAD de poses > cantidad
-        # de fotos. Volvemos a estricto: menos fotos, pero poses consistentes.
-        # ba_refine_focal_length: refina la cámara durante el bundle adjustment
-        # (mejor precisión de poses → TSDF fusiona mejor las superficies).
-        run(["colmap", "mapper",
-             "--database_path", str(db), "--image_path", str(images_dir),
-             "--output_path", str(sparse),
-             "--Mapper.ba_refine_focal_length", "1",
-             "--Mapper.ba_refine_principal_point", "0"])
-        # COLMAP puede crear VARIOS modelos (sparse/0, sparse/1, ...). El worker
-        # antes tomaba siempre sparse/0, que podía ser un fragmento pequeño.
-        # Ahora elegimos el modelo con MÁS fotos registradas (el más completo).
+        fase(0.35, "PASO 2/5 — GLOMAP reconstruyendo (mapper GLOBAL)")
+        # ── MAPPER GLOBAL CON GLOMAP (cambio clave de la solución definitiva) ──
+        # ANTES: 'colmap mapper' es INCREMENTAL (añade una foto a la vez). En
+        # interiores con poco solape y paredes lisas se PARTÍA en 2 modelos y solo
+        # registraba 76/127 fotos → el cuarto salía DOBLE/fantasma (lo confirmaron
+        # los diagnósticos DIAG: comp0 52% y comp1 46%, dos mitades superpuestas).
+        # AHORA: 'glomap mapper' es GLOBAL: resuelve TODAS las poses a la vez
+        # considerando todas las coincidencias juntas → un solo modelo, mucho más
+        # robusto, no se fragmenta. Lee la MISMA base de datos (las features SIFT y
+        # el matching que ya hicimos), así que es un cambio quirúrgico: solo cambia
+        # este paso; extracción, matching, undistort, 2DGS y malla NO cambian.
+        # Usamos opciones por defecto (GLOMAP ya refina intrínsecos internamente).
+        run(["glomap", "mapper",
+             "--database_path", str(db),
+             "--image_path", str(images_dir),
+             "--output_path", str(sparse)])
+        # GLOMAP escribe el modelo en sparse/0/ (mismo formato .bin que COLMAP).
+        # Igual que antes, elegimos el modelo con MÁS fotos registradas por si
+        # produjera más de uno (normalmente GLOMAP produce uno solo).
         modelos = [d for d in sparse.iterdir()
                    if d.is_dir() and (d / "images.bin").exists()]
         if not modelos:
-            raise RuntimeError("COLMAP no produjo reconstrucción. "
+            raise RuntimeError("GLOMAP no produjo reconstrucción. "
                                "Revisa que las fotos tengan solape suficiente.")
         def _num_imgs_registradas(model_dir):
             # Las primeras 8 bytes de images.bin = nº de imágenes registradas.
@@ -268,7 +271,7 @@ def main():
                     log(f"   [poses] {l}")
         except Exception as e:
             log(f"   (model_analyzer no disponible: {e})")
-        log("   COLMAP OK")
+        log("   GLOMAP OK")
 
         # ── Quitar distorsión y convertir a PINHOLE (lo que 2DGS exige) ──
         # COLMAP usa por defecto SIMPLE_RADIAL (con distorsión de lente), pero
