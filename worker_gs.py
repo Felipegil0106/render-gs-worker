@@ -342,19 +342,21 @@ def main():
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
-        # --lambda_dist 100 : ACTIVA el regularizador de DISTORSIÓN de profundidad.
-        # Hasta ahora estaba en 0 (el log mostraba "distort=0.00000" siempre) y por
-        # eso las PAREDES SALÍAN ONDULADAS y había floaters: sin este término, las
-        # gaussianas no colapsan sobre una superficie fina y plana. El paper de 2DGS
-        # lo confirma. Valor 100 (el paper usa 100 para escenas 360°/grandes).
-        # ANTES vació la malla porque se probó con solo 7000 iteraciones; ahora con
-        # 30000 y depth_ratio=0 (por defecto) es seguro. 2DGS lo activa desde la
-        # iteración 3000, así que el log debe mostrar "distort=" CON VALOR (no 0).
-        # Sin --quiet: la consola del pod muestra el avance iteración a iteración.
+        # --lambda_dist 100 : regularizador de DISTORSIÓN de profundidad (concentra
+        # las gaussianas sobre una superficie fina → menos floaters/doble capa).
+        # --lambda_normal 0.2 : regularizador de CONSISTENCIA DE NORMALES. CLAVE
+        # para el "papel arrugado": por defecto 2DGS lo deja en 0.05 (muy débil) y
+        # solo lo activa desde la iteración 7000, así que las paredes blancas (sin
+        # textura) quedaban con micro-relieve facetado. Subirlo a 0.2 (4× el
+        # default) APLANA paredes, techo y piso sin borrar el detalle de muebles.
+        # La investigación confirma 0.1-0.2 como rango bueno para interiores; no
+        # pasar de ~0.5 (redondea las esquinas de 90°). lambda_dist se queda en 100
+        # (subirlo más causa grietas/NaN, y NO aplana: eso es trabajo de normal).
         run(["python", "/opt/2dgs/train.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--iterations", str(ITERS),
-             "--lambda_dist", "100"],
+             "--lambda_dist", "100",
+             "--lambda_normal", "0.2"],
             fase_label="PASO 3/5 — Entrenando 2DGS")
         log("   2DGS entrenado")
 
@@ -391,39 +393,41 @@ def main():
             log(f"   (no se midió la escala, uso valores por defecto: {e})")
         _diag = float(_np.linalg.norm(_ext))
         _maxext = float(_ext.max())
-        # ~400 voxeles en la dimensión mayor (resolución buena a cualquier escala)
-        voxel = max(_maxext / 400.0, 1e-5)
-        sdf_trunc = 2.0 * voxel          # banda DELGADA -> UNA sola cáscara (no dos)
+        # ~500 voxeles en la dimensión mayor (resolución fina para detalle/huecos)
+        voxel = max(_maxext / 500.0, 1e-5)
+        sdf_trunc = 4.0 * voxel          # banda MÁS GRUESA -> rellena huecos y cierra techo
         depth_trunc = _diag * 1.3        # cubre el cuarto + margen; corta agujas lejanas
         log(f"   escala medida: cuarto≈{_ext[0]:.2f}×{_ext[1]:.2f}×{_ext[2]:.2f}, "
             f"voxel={voxel:.4f}, sdf_trunc={sdf_trunc:.4f}, depth_trunc={depth_trunc:.2f}")
 
         # ── EXTRACCIÓN EN MODO BOUNDED (CORRECTO para un cuarto cerrado) ──
-        # CAMBIO CLAVE (investigación): el modo --unbounded (contracción tipo
-        # Mip-NeRF360) es para PAISAJES gigantes; en un cuarto cerrado deformaba
-        # las paredes y, con depth_ratio=0 y una banda TSDF gruesa, generaba DOS
-        # superficies casi pegadas (la "doble cáscara": comp0 52% + comp1 48% del
-        # log) -> z-fighting (líneas negras, ondas) y normales hacia adentro (ver a
-        # través de las paredes en MeshLab). El modo bounded con:
-        #   - --depth_ratio 1 (profundidad MEDIANA): un único cruce nítido, no una
-        #     banda ancha. Antes era 0 (media) -> superficie difusa y doble.
-        #   - --sdf_trunc DELGADO (2x voxel, no 5x): la banda es más fina que la
-        #     separación entre cáscaras -> marching cubes saca UNA superficie.
+        # CAMBIOS (2ª investigación) para COMPLETITUD sin perder la malla única:
+        #   - --depth_ratio 0 (profundidad MEDIA, no mediana): la mediana descartaba
+        #     superficies de poca confianza (techo liso, zonas de poco solape) ->
+        #     huecos y TECHO FALTANTE. La media integra lo que haya -> más completa.
+        #   - --sdf_trunc 4x voxel (antes 2x): banda más gruesa que FUNDE mejor las
+        #     superficies entre fotos -> rellena huecos y cierra el techo. (5x es el
+        #     default de 2DGS; usamos 4x como equilibrio para no re-fundir doble capa.)
+        #   - --voxel más fino (/500): más detalle y mejor relleno.
         #   - --depth_trunc acotado: recorta las AGUJAS de las ventanas (vidrio).
-        #   - --num_cluster 1: conserva SOLO la malla más grande -> elimina de un
-        #     golpe la cáscara duplicada y los floaters.
-        log(f"$ python /opt/2dgs/render.py (BOUNDED) --depth_ratio 1 "
+        #   - --num_cluster 50: conserva techo + muebles aunque queden como islas
+        #     separadas; los floaters diminutos los quita el post-proceso por TAMAÑO.
+        # NOTA: el modo bounded (no unbounded) sigue evitando la doble cáscara que
+        # daba z-fighting. Si el DIAG vuelve a mostrar dos componentes ~50%, bajar
+        # sdf_trunc a 3x. El suavizado Taubin del post-proceso limpia el ruido de
+        # usar media en vez de mediana.
+        log(f"$ python /opt/2dgs/render.py (BOUNDED) --depth_ratio 0 "
             f"--voxel_size {voxel:.4f} --sdf_trunc {sdf_trunc:.4f} "
-            f"--depth_trunc {depth_trunc:.2f} --num_cluster 1  (OMP=8)")
+            f"--depth_trunc {depth_trunc:.2f} --num_cluster 50  (OMP=8)")
         rc_mesh, _salida_mesh = run(
             ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--skip_train", "--skip_test",
-             "--depth_ratio", "1",
+             "--depth_ratio", "0",
              "--voxel_size", f"{voxel:.6f}",
              "--sdf_trunc", f"{sdf_trunc:.6f}",
              "--depth_trunc", f"{depth_trunc:.6f}",
-             "--num_cluster", "1"],
+             "--num_cluster", "50"],
             env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
         # Buscar la malla generada. En modo unbounded los nombres son
         # fuse_unbounded.ply (cruda) y fuse_unbounded_post.ply (limpia). Preferimos
@@ -459,11 +463,16 @@ def main():
         ply_mb = malla.stat().st_size / 1e6
         log(f"   malla: {malla.name} ({ply_mb:.1f} MB)")
 
-        # ── Simplificar la malla (de cientos de MB a algo liviano) ──
-        # La malla TSDF trae MILLONES de triángulos con color por vértice (por
-        # eso pesaba 355 MB). La decimamos a ~1 millón de triángulos manteniendo
-        # la forma y el color. Usamos open3d (ya instalado para el TSDF de 2DGS).
-        fase(0.90, "PASO 4/5 — Simplificando malla")
+        # ── Limpiar + SUAVIZAR + simplificar la malla ──
+        # 3 mejoras (investigación) sobre la malla cruda:
+        #  1. FILTRO POR TAMAÑO: conserva pedazos grandes (techo, muebles) y quita
+        #     solo floaters diminutos. Mejor que num_cluster=1 (que borraba el techo
+        #     si quedaba como isla suelta).
+        #  2. SUAVIZADO TAUBIN: quita el "papel arrugado"/facetado SIN encoger el
+        #     cuarto (Taubin λ=0.5 μ=-0.53 compensa la contracción). Se hace ANTES
+        #     de decimar para no congelar el ruido en la malla final.
+        #  3. Decimar a ~500k triángulos manteniendo forma y color.
+        fase(0.90, "PASO 4/5 — Suavizando y simplificando malla")
         decimada = WORK / "mesh_lite.ply"
         script_dec = (
             "import open3d as o3d\n"
@@ -471,29 +480,49 @@ def main():
             f"m = o3d.io.read_triangle_mesh(r'{malla}')\n"
             "n0 = len(m.triangles)\n"
             "print('DIAG vertices', len(m.vertices), 'triangulos', n0, flush=True)\n"
-            # --- DECIMAR PRIMERO (sobre la malla grande) ---
-            # ANTES los diagnósticos corrían sobre la malla GIGANTE y se quedaban
-            # sin memoria (se colgó en 90%). Ahora decimamos primero y los
-            # diagnósticos van después, sobre algo liviano. Si la malla viene
-            # enorme (>4M triángulos), decimamos en 2 pasos para no reventar RAM.
-            "target = 500000\n"
-            "if n0 > 4000000:\n"
-            "    print('DECIMATE malla muy grande (%d), simplifico en 2 pasos...' % n0, flush=True)\n"
-            "    m = m.simplify_quadric_decimation(target_number_of_triangles=1500000)\n"
-            "    print('DECIMATE paso 1 ok:', len(m.triangles), flush=True)\n"
-            "if len(m.triangles) > target:\n"
-            "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
+            # --- Limpieza básica ---
             "m.remove_unreferenced_vertices()\n"
             "m.remove_degenerate_triangles()\n"
             "m.remove_duplicated_vertices()\n"
+            "m.remove_duplicated_triangles()\n"
+            # --- 1) FILTRO POR TAMAÑO: quita floaters diminutos, conserva techo/muebles ---
+            "try:\n"
+            "    cl = m.cluster_connected_triangles()\n"
+            "    lab = np.asarray(cl[0]); ntri = np.asarray(cl[1])\n"
+            "    total = int(ntri.sum())\n"
+            "    umbral = max(1000, int(0.002 * total))\n"   # 0.2% de los triángulos
+            "    quitar = ntri[lab] < umbral\n"
+            "    m.remove_triangles_by_mask(quitar)\n"
+            "    m.remove_unreferenced_vertices()\n"
+            "    print('FILTER quedan %d de %d componentes (umbral=%d tri)' % (int((ntri>=umbral).sum()), len(ntri), umbral), flush=True)\n"
+            "except Exception as e:\n"
+            "    print('FILTER (fallo, sigo):', e, flush=True)\n"
+            # --- Si viene gigantesca, pre-decimar para no reventar RAM al suavizar ---
+            "if len(m.triangles) > 4000000:\n"
+            "    print('PRE-DECIMATE malla muy grande (%d)...' % len(m.triangles), flush=True)\n"
+            "    m = m.simplify_quadric_decimation(target_number_of_triangles=1500000)\n"
+            # --- 2) SUAVIZADO TAUBIN (quita el facetado sin encoger) ---
+            "try:\n"
+            "    m = m.filter_smooth_taubin(number_of_iterations=15)\n"
+            "    print('SMOOTH Taubin 15 iteraciones OK', flush=True)\n"
+            "except Exception as e:\n"
+            "    print('SMOOTH (fallo, sigo):', e, flush=True)\n"
+            # --- 3) DECIMAR a ~500k ---
+            "target = 500000\n"
+            "if len(m.triangles) > target:\n"
+            "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
+            # --- Suavizado final ligero (limpia artefactos de la decimación) ---
+            "try:\n"
+            "    m = m.filter_smooth_taubin(number_of_iterations=5)\n"
+            "except Exception as e:\n"
+            "    print('SMOOTH2 (fallo, sigo):', e, flush=True)\n"
+            "m.remove_unreferenced_vertices()\n"
+            "m.remove_degenerate_triangles()\n"
             "m.compute_vertex_normals()\n"
             "m.compute_triangle_normals()\n"
             f"o3d.io.write_triangle_mesh(r'{decimada}', m)\n"
             "print('DECIMATE triangulos', n0, '->', len(m.triangles), flush=True)\n"
             # --- DIAGNÓSTICOS (sobre la malla YA decimada = liviana y segura) ---
-            # Nos dicen: tamaño del cuarto (bbox), cuántos pedazos sueltos hay, y
-            # de cada pedazo su tamaño y QUÉ TAN LEJOS está del centro.
-            # La "ventana flotante" = un pedazo pequeño MUY lejos del centro.
             "try:\n"
             "    aabb = m.get_axis_aligned_bounding_box()\n"
             "    ext = aabb.get_extent(); cg = aabb.get_center()\n"
