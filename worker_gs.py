@@ -318,6 +318,27 @@ def main():
             log(f"   (no se pudo contar cámaras: {e})")
         log("   MASt3R OK (cámaras PINHOLE, sin necesidad de undistort)")
 
+        # ── PARCHE matplotlib en 2DGS ──
+        # 2DGS usa fig.canvas.tostring_rgb() en su función colormap(), pero
+        # matplotlib 3.8+ ELIMINÓ ese método (ahora es buffer_rgba). Esa función
+        # solo genera una imagen de diagnóstico para TensorBoard en la iteración
+        # de test (7000), pero su ausencia hace CRASHEAR todo el entrenamiento.
+        # Parcheamos el archivo de 2DGS en caliente (la imagen trae un matplotlib
+        # nuevo). Es un reemplazo de 2 líneas: tostring_rgb()->buffer_rgba() y el
+        # reshape a 4 canales (RGBA) recortando el alfa -> RGB.
+        try:
+            gu_path = Path("/opt/2dgs/utils/general_utils.py")
+            txt = gu_path.read_text()
+            if "tostring_rgb()" in txt:
+                txt = txt.replace("fig.canvas.tostring_rgb()",
+                                  "fig.canvas.buffer_rgba()")
+                txt = txt.replace("get_width_height()[::-1] + (3,))",
+                                  "get_width_height()[::-1] + (4,))[:, :, :3]")
+                gu_path.write_text(txt)
+                log("   parche matplotlib aplicado a 2DGS (tostring_rgb→buffer_rgba)")
+        except Exception as e:
+            log(f"   (no se pudo parchear general_utils: {e})")
+
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
