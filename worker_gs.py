@@ -367,80 +367,68 @@ def main():
         env_mesh = dict(os.environ)
         env_mesh["OMP_NUM_THREADS"] = "8"
 
-        # depth_trunc ADAPTATIVO: COLMAP usa una escala ARBITRARIA (no metros),
-        # así que un valor fijo (9.0) puede cortar el cuarto en una escena y
-        # sobrar en otra. Medimos la escala real con las posiciones de las
-        # cámaras y ponemos un depth_trunc generoso para que NUNCA corte las
-        # paredes (los floaters lejanos los limpia num_cluster).
-        def _centros_camara(images_txt):
-            centros = []
-            with open(images_txt, "r") as f:
-                lineas = [l for l in f if l.strip() and not l.startswith("#")]
-            # En images.txt cada cámara son 2 líneas; la de pose tiene >=10
-            # columnas (la 2ª, de puntos 2D, va vacía en nuestro caso).
-            for l in lineas:
-                p = l.split()
-                if len(p) < 10:
-                    continue
-                qw, qx, qy, qz = float(p[1]), float(p[2]), float(p[3]), float(p[4])
-                tx, ty, tz = float(p[5]), float(p[6]), float(p[7])
-                # centro de cámara C = -R^T t (R desde el cuaternión COLMAP)
-                R = [[1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw),   2*(qx*qz+qy*qw)],
-                     [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
-                     [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)]]
-                Cx = -(R[0][0]*tx + R[1][0]*ty + R[2][0]*tz)
-                Cy = -(R[0][1]*tx + R[1][1]*ty + R[2][1]*tz)
-                Cz = -(R[0][2]*tx + R[1][2]*ty + R[2][2]*tz)
-                centros.append((Cx, Cy, Cz))
-            return centros
-        depth_trunc = "8.0"   # fallback sensato si no se puede medir
+        # ── ESCALA DE LA ESCENA (robusta a la escala de MASt3R) ──
+        # Medimos el tamaño real del cuarto desde la nube de puntos de MASt3R y
+        # derivamos los parámetros del TSDF en proporción. Así funcionan igual
+        # aunque MASt3R entregue una escala distinta entre escenas.
+        import numpy as _np
+        _ext = _np.array([8.0, 6.0, 8.0])   # valor por defecto si falla la medición
         try:
-            import math
-            cps = _centros_camara(dataset / "sparse" / "0" / "images.txt")
-            if len(cps) >= 2:
-                cx = sum(p[0] for p in cps) / len(cps)
-                cy = sum(p[1] for p in cps) / len(cps)
-                cz = sum(p[2] for p in cps) / len(cps)
-                dists = sorted(math.sqrt((p[0]-cx)**2 + (p[1]-cy)**2 + (p[2]-cz)**2)
-                               for p in cps)
-                # CLAVE: antes usaba la distancia MÁXIMA ×3 = 40.99 → integraba
-                # ruido MUY detrás de las paredes → 50 millones de triángulos y
-                # pedazos flotando lejos. Ahora usamos el percentil 85 (robusto a
-                # cámaras atípicas) ×1.8 y lo acotamos a un rango sensato. Así
-                # cubre las paredes SIN integrar ruido lejano.
-                radio = dists[int(len(dists) * 0.85)]
-                depth_trunc = "(no se usa en unbounded)"
-                log(f"   escala COLMAP (informativa): radio(p85)={radio:.2f} unidades. "
-                    f"Modo unbounded → sin recorte de profundidad.")
+            _pts = []
+            with open(dataset / "sparse" / "0" / "points3D.txt") as _f:
+                for _l in _f:
+                    if _l.startswith("#") or not _l.strip():
+                        continue
+                    _p = _l.split()
+                    if len(_p) >= 4:
+                        _pts.append((float(_p[1]), float(_p[2]), float(_p[3])))
+            _pts = _np.asarray(_pts)
+            # percentiles 2-98 -> ignora floaters al medir el tamaño del cuarto
+            _lo = _np.percentile(_pts, 2, axis=0)
+            _hi = _np.percentile(_pts, 98, axis=0)
+            _ext = _hi - _lo
         except Exception as e:
-            log(f"   (depth_trunc fijo {depth_trunc}; no se midió escala: {e})")
+            log(f"   (no se midió la escala, uso valores por defecto: {e})")
+        _diag = float(_np.linalg.norm(_ext))
+        _maxext = float(_ext.max())
+        # ~400 voxeles en la dimensión mayor (resolución buena a cualquier escala)
+        voxel = max(_maxext / 400.0, 1e-5)
+        sdf_trunc = 2.0 * voxel          # banda DELGADA -> UNA sola cáscara (no dos)
+        depth_trunc = _diag * 1.3        # cubre el cuarto + margen; corta agujas lejanas
+        log(f"   escala medida: cuarto≈{_ext[0]:.2f}×{_ext[1]:.2f}×{_ext[2]:.2f}, "
+            f"voxel={voxel:.4f}, sdf_trunc={sdf_trunc:.4f}, depth_trunc={depth_trunc:.2f}")
 
-        # ── EXTRACCIÓN EN MODO UNBOUNDED (sin recorte) ──
-        # CAMBIO CLAVE (investigación): el modo BOUNDED del TSDF descarta toda la
-        # profundidad más lejana que depth_trunc. En un cuarto fotografiado desde
-        # adentro, eso RECORTABA paredes lejanas, techo y piso → "cuarto a medias".
-        # El modo --unbounded usa contracción de espacio (como Mip-NeRF360): NO
-        # recorta nada. Probamos si ESTE era el motivo de las zonas faltantes.
-        # En unbounded NO se usan depth_trunc/voxel_size/sdf_trunc (los ignora);
-        # solo manda --mesh_res (resolución). num_cluster=100 conserva los 100
-        # pedazos conectados más grandes (los diagnósticos de abajo nos dirán
-        # cuántos pedazos hay y dónde está la "ventana flotante").
-        # mesh_res=512 (NO 1024): con 1024 la malla salía GIGANTESCA y el paso de
-        # simplificación se quedaba sin memoria (se colgó en "90%"). 512 sigue
-        # siendo unbounded (sin recorte) pero produce una malla manejable.
-        log(f"$ python /opt/2dgs/render.py --unbounded --mesh_res 512 --num_cluster 100  (OMP=8)")
+        # ── EXTRACCIÓN EN MODO BOUNDED (CORRECTO para un cuarto cerrado) ──
+        # CAMBIO CLAVE (investigación): el modo --unbounded (contracción tipo
+        # Mip-NeRF360) es para PAISAJES gigantes; en un cuarto cerrado deformaba
+        # las paredes y, con depth_ratio=0 y una banda TSDF gruesa, generaba DOS
+        # superficies casi pegadas (la "doble cáscara": comp0 52% + comp1 48% del
+        # log) -> z-fighting (líneas negras, ondas) y normales hacia adentro (ver a
+        # través de las paredes en MeshLab). El modo bounded con:
+        #   - --depth_ratio 1 (profundidad MEDIANA): un único cruce nítido, no una
+        #     banda ancha. Antes era 0 (media) -> superficie difusa y doble.
+        #   - --sdf_trunc DELGADO (2x voxel, no 5x): la banda es más fina que la
+        #     separación entre cáscaras -> marching cubes saca UNA superficie.
+        #   - --depth_trunc acotado: recorta las AGUJAS de las ventanas (vidrio).
+        #   - --num_cluster 1: conserva SOLO la malla más grande -> elimina de un
+        #     golpe la cáscara duplicada y los floaters.
+        log(f"$ python /opt/2dgs/render.py (BOUNDED) --depth_ratio 1 "
+            f"--voxel_size {voxel:.4f} --sdf_trunc {sdf_trunc:.4f} "
+            f"--depth_trunc {depth_trunc:.2f} --num_cluster 1  (OMP=8)")
         rc_mesh, _salida_mesh = run(
             ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--skip_train", "--skip_test",
-             "--depth_ratio", "0",
-             "--unbounded",
-             "--mesh_res", "512",
-             "--num_cluster", "100"],
+             "--depth_ratio", "1",
+             "--voxel_size", f"{voxel:.6f}",
+             "--sdf_trunc", f"{sdf_trunc:.6f}",
+             "--depth_trunc", f"{depth_trunc:.6f}",
+             "--num_cluster", "1"],
             env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
         # Buscar la malla generada. En modo unbounded los nombres son
         # fuse_unbounded.ply (cruda) y fuse_unbounded_post.ply (limpia). Preferimos
-        # la limpia. Dejamos los nombres bounded como respaldo por si acaso.
+        # la limpia. En modo BOUNDED los nombres son fuse_post.ply (limpia) y
+        # fuse.ply (cruda); dejamos los unbounded como respaldo por si acaso.
         candidatos = list(dgs_out.rglob("*.ply"))
         def _es_no_vacia(p):
             try:
@@ -448,8 +436,8 @@ def main():
             except Exception:
                 return False
         malla = None
-        for nombre in ("fuse_unbounded_post.ply", "fuse_unbounded.ply",
-                       "fuse_post.ply", "fuse.ply"):
+        for nombre in ("fuse_post.ply", "fuse.ply",
+                       "fuse_unbounded_post.ply", "fuse_unbounded.ply"):
             for c in candidatos:
                 if c.name.lower() == nombre and _es_no_vacia(c):
                     malla = c; break
