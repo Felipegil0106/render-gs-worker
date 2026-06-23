@@ -345,10 +345,11 @@ def main():
         # --lambda_dist 100 : regularizador de DISTORSIÓN de profundidad (concentra
         # las gaussianas sobre una superficie fina → menos floaters/doble capa).
         # --lambda_normal 0.1 : regularizador de NORMALES, valor MEDIO. En la
-        # ronda anterior se probó 0.2 y aplanó DEMASIADO (todo se veía "plástico",
-        # el PSNR cayó de 32.9 a 30.2). 0.1 (2× el default 0.05) aplana las paredes
-        # blancas sin matar el detalle real de los muebles. El detalle fino de los
-        # objetos lo recupera el HORNEADO DE TEXTURA (PASO 4b), no la geometría.
+        # ronda anterior se probó 0.2 y aplanó DEMASIADO. 0.1 aplana las paredes
+        # blancas sin matar la forma real de los muebles. NO lo subimos: la malla
+        # que produce es BUENA (lo confirmaste). El aspecto "plástico" no venía de
+        # aquí sino del POST-PROCESO (Taubin excesivo), ya corregido: ahora el
+        # detalle de superficie se conserva con Taubin mínimo + Ambient Occlusion.
         run(["python", "/opt/2dgs/train.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--iterations", str(ITERS),
@@ -517,25 +518,59 @@ def main():
             "if len(m.triangles) > 4000000:\n"
             "    print('PRE-DECIMATE malla muy grande (%d)...' % len(m.triangles), flush=True)\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=1500000)\n"
-            # --- 2) SUAVIZADO TAUBIN (quita el facetado sin encoger) ---
+            # --- 2) SUAVIZADO TAUBIN MÍNIMO (CAMBIO ANTI-PLÁSTICO) ---
+            # ANTES eran 15+5 iteraciones: eso BORRABA el micro-relieve de la buena
+            # malla y la dejaba "plástica". La investigación confirmó que el facetado
+            # (ver triángulos) NO se quita con Taubin sino con NORMALES SUAVES (eso lo
+            # da el .glb al exportar). Así que bajamos Taubin a SOLO 3 iteraciones
+            # (apenas para quitar ruido del TSDF) y QUITAMOS el segundo pase →
+            # se conserva el detalle de superficie real.
             "try:\n"
-            "    m = m.filter_smooth_taubin(number_of_iterations=15)\n"
-            "    print('SMOOTH Taubin 15 iteraciones OK', flush=True)\n"
+            "    m = m.filter_smooth_taubin(number_of_iterations=3)\n"
+            "    print('SMOOTH Taubin 3 iter (minimo, conserva detalle) OK', flush=True)\n"
             "except Exception as e:\n"
             "    print('SMOOTH (fallo, sigo):', e, flush=True)\n"
-            # --- 3) DECIMAR a ~500k ---
-            "target = 500000\n"
+            # --- 3) DECIMAR a ~800k (más vértices = más detalle de color; sigue
+            #     ligero para web; con normales suaves NO se ven triángulos) ---
+            "target = 800000\n"
             "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
-            # --- Suavizado final ligero (limpia artefactos de la decimación) ---
-            "try:\n"
-            "    m = m.filter_smooth_taubin(number_of_iterations=5)\n"
-            "except Exception as e:\n"
-            "    print('SMOOTH2 (fallo, sigo):', e, flush=True)\n"
             "m.remove_unreferenced_vertices()\n"
             "m.remove_degenerate_triangles()\n"
             "m.compute_vertex_normals()\n"
             "m.compute_triangle_normals()\n"
+            # --- 4) AMBIENT OCCLUSION por vértice (EL PASO QUE MÁS QUITA EL PLÁSTICO)
+            #     Hornea sombras de contacto (rincones, juntas, muebles contra piso/
+            #     pared) en el color por vértice → el ojo lo lee como DETALLE y
+            #     profundidad. Lanza 64 rayos desde cada vértice (Open3D Raycasting)
+            #     y oscurece según cuántos chocan cerca. Si falla, sigue sin AO.
+            "try:\n"
+            "    scn = o3d.t.geometry.RaycastingScene()\n"
+            "    scn.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(m))\n"
+            "    Vv = np.asarray(m.vertices); Nn = np.asarray(m.vertex_normals)\n"
+            "    _ext = m.get_axis_aligned_bounding_box().get_extent()\n"
+            "    _dg = float(np.linalg.norm(_ext)); _rad = 0.08*_dg; _eps = 0.0015*_dg\n"
+            "    K = 64; _gi = (1+5**0.5)/2; _ii = np.arange(K)+0.5\n"
+            "    _phi = np.arccos(1-2*_ii/K); _th = 2*np.pi*_ii/_gi\n"
+            "    dirs = np.stack([np.sin(_phi)*np.cos(_th), np.sin(_phi)*np.sin(_th), np.cos(_phi)],1)\n"
+            "    ao = np.zeros(len(Vv)); _ch = 20000\n"
+            "    for s in range(0, len(Vv), _ch):\n"
+            "        vs = Vv[s:s+_ch]; ns = Nn[s:s+_ch]; nv = len(vs)\n"
+            "        O = np.repeat(vs + ns*_eps, K, axis=0); D = np.tile(dirs,(nv,1))\n"
+            "        nd = (D*np.repeat(ns,K,axis=0)).sum(1); up = nd > 0\n"
+            "        rays = np.concatenate([O,D],1).astype(np.float32)\n"
+            "        rt = scn.cast_rays(o3d.core.Tensor(rays))['t_hit'].numpy()\n"
+            "        hh = ((rt < _rad) & up).reshape(nv,K); u2 = up.reshape(nv,K)\n"
+            "        ao[s:s+_ch] = hh.sum(1)/np.maximum(u2.sum(1),1)\n"
+            "    C = np.asarray(m.vertex_colors)\n"
+            "    if len(C) == len(Vv):\n"
+            "        C = C * (1 - 0.6*ao)[:,None]\n"
+            "        m.vertex_colors = o3d.utility.Vector3dVector(np.clip(C,0,1))\n"
+            "        print('AO horneado: oclusion media %.3f' % float(ao.mean()), flush=True)\n"
+            "    else:\n"
+            "        print('AO: malla sin color por vertice, lo salto', flush=True)\n"
+            "except Exception as e:\n"
+            "    print('AO (fallo, sigo sin AO):', e, flush=True)\n"
             f"o3d.io.write_triangle_mesh(r'{decimada}', m)\n"
             "print('DECIMATE triangulos', n0, '->', len(m.triangles), flush=True)\n"
             # --- DIAGNÓSTICOS (sobre la malla YA decimada = liviana y segura) ---
@@ -569,74 +604,23 @@ def main():
             log("   (no se pudo simplificar; subo la malla original)")
 
         # ══════════════════════════════════════════════════════════════════════
-        # PASO 4b: TEXTURIZAR la malla con OpenMVS — la pieza que da TEXTURA REAL
+        # PASO 4b: exportar la malla (color por vértice + AO) a .glb
         # ══════════════════════════════════════════════════════════════════════
-        # La malla de 2DGS trae color POR VÉRTICE (baja frecuencia → "plástico").
-        # OpenMVS TextureMesh proyecta las fotos sobre la malla y genera una IMAGEN
-        # de textura UV de alta resolución → cada objeto con su textura real.
-        # Salida SIEMPRE .glb (textura embebida, ideal para visores). Si CUALQUIER
-        # sub-paso falla, caemos a exportar la malla con color por vértice: la
-        # corrida NUNCA se desperdicia.
-        fase(0.93, "PASO 4b/5 — Texturizando con OpenMVS")
+        # DESCARTAMOS el pegado de fotos (OpenMVS TextureMesh): daba mal resultado
+        # visual. Volvemos al color por vértice del 2DGS, PERO con las mejoras
+        # anti-plástico ya aplicadas en el post-proceso: Taubin mínimo (conserva el
+        # micro-relieve) + Ambient Occlusion horneado (da profundidad y sensación de
+        # detalle). Al exportar a .glb, trimesh genera NORMALES SUAVES → no se ven
+        # triángulos. Sin pasos pesados que puedan fallar.
+        fase(0.93, "PASO 4b/5 — Exportando malla a .glb")
         import trimesh
         glb_final = WORK / "mesh_2dgs.glb"
-        textura_ok = False
         try:
-            mvs_dir = WORK / "mvs"
-            mvs_dir.mkdir(exist_ok=True)
-            # 1) InterfaceCOLMAP: poses COLMAP de MASt3R (dataset/sparse/0 +
-            #    dataset/images) → scene.mvs (cámaras + fotos, sin malla).
-            log("   OpenMVS 1/2: InterfaceCOLMAP (importando cámaras y fotos)...")
-            run(["InterfaceCOLMAP",
-                 "-i", str(dataset),
-                 "--image-folder", str(dataset / "images"),
-                 "-o", str(mvs_dir / "scene.mvs")],
-                fase_label="PASO 4b — InterfaceCOLMAP", check=False)
-            if not (mvs_dir / "scene.mvs").exists():
-                raise RuntimeError("InterfaceCOLMAP no generó scene.mvs")
-            # 2) TextureMesh: proyecta las fotos sobre NUESTRA malla (mesh_lite.ply)
-            #    → .obj + textura. virtual-face-images 3 y cost-smoothness-ratio 0.5
-            #    son del hallazgo previo: parches de textura más grandes y limpios
-            #    (más cerca de la calidad Polycam).
-            log("   OpenMVS 2/2: TextureMesh (pegando fotos = textura real)...")
-            run(["TextureMesh", str(mvs_dir / "scene.mvs"),
-                 "--mesh-file", str(malla),
-                 "--export-type", "obj",
-                 "--virtual-face-images", "3",
-                 "--cost-smoothness-ratio", "0.5",
-                 "-o", str(mvs_dir / "textured.obj")],
-                cwd=str(mvs_dir),
-                fase_label="PASO 4b — TextureMesh", check=False)
-            # OpenMVS a veces añade sufijos al nombre → buscamos el .obj resultante.
-            obj_tex = None
-            for cand in ("textured.obj", "scene_texture.obj",
-                         "scene_mesh_texture.obj", "scene_dense_mesh_texture.obj"):
-                p = mvs_dir / cand
-                if p.exists() and p.stat().st_size > 1000:
-                    obj_tex = p; break
-            if obj_tex is None:
-                objs = [p for p in mvs_dir.glob("*.obj") if p.stat().st_size > 1000]
-                if objs:
-                    obj_tex = max(objs, key=lambda p: p.stat().st_size)
-            if obj_tex is None:
-                raise RuntimeError("TextureMesh no generó .obj texturizado")
-            log(f"   textura generada: {obj_tex.name}")
-            # 3) .obj (+ .mtl + imagen de textura) → .glb con la textura embebida.
-            sc = trimesh.load(str(obj_tex), process=False)
+            sc = trimesh.load(str(malla), process=False)
             sc.export(str(glb_final))
-            if glb_final.exists() and glb_final.stat().st_size > 1000:
-                textura_ok = True
-                log(f"   ✓ .glb TEXTURIZADO: {glb_final.stat().st_size/1e6:.1f} MB")
+            log(f"   .glb (color por vértice + AO): {glb_final.stat().st_size/1e6:.1f} MB")
         except Exception as e:
-            log(f"   ⚠ texturizado OpenMVS falló ({e}); uso color por vértice")
-        # FAIL-SAFE: sin textura → exportar la malla con color por vértice a .glb.
-        if not textura_ok:
-            try:
-                m2 = trimesh.load(str(malla), process=False)
-                m2.export(str(glb_final))
-                log(f"   .glb (color por vértice): {glb_final.stat().st_size/1e6:.1f} MB")
-            except Exception as e:
-                log(f"   ⚠ no se pudo exportar .glb ({e})")
+            log(f"   ⚠ no se pudo exportar .glb ({e}); subo el .ply")
         # Archivo a subir: el .glb si existe; si no, último recurso el .ply.
         if glb_final.exists() and glb_final.stat().st_size > 1000:
             archivo_subir = glb_final
@@ -644,7 +628,7 @@ def main():
         else:
             archivo_subir = malla
 
-        # ── PASO 5: subir la malla (.glb texturizado) ──
+        # ── PASO 5: subir la malla (.glb con color por vértice + AO) ──
         fase(0.95, "PASO 5/5 — Subiendo malla")
         with open(archivo_subir, "rb") as f:
             req = urllib.request.Request(UPLOAD_URL_PLY, data=f.read(),
