@@ -344,19 +344,16 @@ def main():
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
         # --lambda_dist 100 : regularizador de DISTORSIÓN de profundidad (concentra
         # las gaussianas sobre una superficie fina → menos floaters/doble capa).
-        # --lambda_normal 0.2 : regularizador de CONSISTENCIA DE NORMALES. CLAVE
-        # para el "papel arrugado": por defecto 2DGS lo deja en 0.05 (muy débil) y
-        # solo lo activa desde la iteración 7000, así que las paredes blancas (sin
-        # textura) quedaban con micro-relieve facetado. Subirlo a 0.2 (4× el
-        # default) APLANA paredes, techo y piso sin borrar el detalle de muebles.
-        # La investigación confirma 0.1-0.2 como rango bueno para interiores; no
-        # pasar de ~0.5 (redondea las esquinas de 90°). lambda_dist se queda en 100
-        # (subirlo más causa grietas/NaN, y NO aplana: eso es trabajo de normal).
+        # --lambda_normal 0.1 : regularizador de NORMALES, valor MEDIO. En la
+        # ronda anterior se probó 0.2 y aplanó DEMASIADO (todo se veía "plástico",
+        # el PSNR cayó de 32.9 a 30.2). 0.1 (2× el default 0.05) aplana las paredes
+        # blancas sin matar el detalle real de los muebles. El detalle fino de los
+        # objetos lo recupera el HORNEADO DE TEXTURA (PASO 4b), no la geometría.
         run(["python", "/opt/2dgs/train.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--iterations", str(ITERS),
              "--lambda_dist", "100",
-             "--lambda_normal", "0.2"],
+             "--lambda_normal", "0.1"],
             fase_label="PASO 3/5 — Entrenando 2DGS")
         log("   2DGS entrenado")
 
@@ -485,16 +482,35 @@ def main():
             "m.remove_degenerate_triangles()\n"
             "m.remove_duplicated_vertices()\n"
             "m.remove_duplicated_triangles()\n"
-            # --- 1) FILTRO POR TAMAÑO: quita floaters diminutos, conserva techo/muebles ---
+            # --- 1) FILTRO: quita floaters diminutos Y pedazos disparados FUERA del
+            #     cuarto (ventanas explotadas). El filtro por tamaño solo no bastaba:
+            #     la ventana explotada era "grande" (4%) pero estaba lejísimos. Ahora
+            #     hallamos el componente principal (el cuarto) y quitamos los demás
+            #     que: o son diminutos, o su centro cae FUERA de la caja del cuarto
+            #     expandida 15% (esos son los pedazos que el vidrio disparó hacia afuera).
             "try:\n"
             "    cl = m.cluster_connected_triangles()\n"
             "    lab = np.asarray(cl[0]); ntri = np.asarray(cl[1])\n"
             "    total = int(ntri.sum())\n"
             "    umbral = max(1000, int(0.002 * total))\n"   # 0.2% de los triángulos
-            "    quitar = ntri[lab] < umbral\n"
+            "    V = np.asarray(m.vertices); T = np.asarray(m.triangles)\n"
+            "    main_i = int(np.argmax(ntri))\n"
+            "    mv = np.unique(T[lab == main_i].reshape(-1))\n"
+            "    bmin = V[mv].min(0); bmax = V[mv].max(0)\n"
+            "    bc = (bmin+bmax)/2.0; bh = (bmax-bmin)/2.0 * 1.15 + 1e-6\n"
+            "    lo = bc - bh; hi = bc + bh\n"
+            "    quitar = np.zeros(len(T), dtype=bool); nq_s=0; nq_f=0\n"
+            "    for i in range(len(ntri)):\n"
+            "        if i == main_i: continue\n"
+            "        cm = lab == i\n"
+            "        if ntri[i] < umbral:\n"
+            "            quitar[cm] = True; nq_s += 1; continue\n"
+            "        cv = np.unique(T[cm].reshape(-1)); cc = (V[cv].min(0)+V[cv].max(0))/2.0\n"
+            "        if np.any(cc < lo) or np.any(cc > hi):\n"
+            "            quitar[cm] = True; nq_f += 1\n"
             "    m.remove_triangles_by_mask(quitar)\n"
             "    m.remove_unreferenced_vertices()\n"
-            "    print('FILTER quedan %d de %d componentes (umbral=%d tri)' % (int((ntri>=umbral).sum()), len(ntri), umbral), flush=True)\n"
+            "    print('FILTER quito %d diminutos + %d fuera-del-cuarto (de %d comp)' % (nq_s, nq_f, len(ntri)), flush=True)\n"
             "except Exception as e:\n"
             "    print('FILTER (fallo, sigo):', e, flush=True)\n"
             # --- Si viene gigantesca, pre-decimar para no reventar RAM al suavizar ---
@@ -552,13 +568,89 @@ def main():
         else:
             log("   (no se pudo simplificar; subo la malla original)")
 
-        # ── PASO 5: subir el .ply ──
-        fase(0.92, "PASO 5/5 — Subiendo malla")
-        with open(malla, "rb") as f:
+        # ══════════════════════════════════════════════════════════════════════
+        # PASO 4b: TEXTURIZAR la malla con OpenMVS — la pieza que da TEXTURA REAL
+        # ══════════════════════════════════════════════════════════════════════
+        # La malla de 2DGS trae color POR VÉRTICE (baja frecuencia → "plástico").
+        # OpenMVS TextureMesh proyecta las fotos sobre la malla y genera una IMAGEN
+        # de textura UV de alta resolución → cada objeto con su textura real.
+        # Salida SIEMPRE .glb (textura embebida, ideal para visores). Si CUALQUIER
+        # sub-paso falla, caemos a exportar la malla con color por vértice: la
+        # corrida NUNCA se desperdicia.
+        fase(0.93, "PASO 4b/5 — Texturizando con OpenMVS")
+        import trimesh
+        glb_final = WORK / "mesh_2dgs.glb"
+        textura_ok = False
+        try:
+            mvs_dir = WORK / "mvs"
+            mvs_dir.mkdir(exist_ok=True)
+            # 1) InterfaceCOLMAP: poses COLMAP de MASt3R (dataset/sparse/0 +
+            #    dataset/images) → scene.mvs (cámaras + fotos, sin malla).
+            log("   OpenMVS 1/2: InterfaceCOLMAP (importando cámaras y fotos)...")
+            run(["InterfaceCOLMAP",
+                 "-i", str(dataset),
+                 "--image-folder", str(dataset / "images"),
+                 "-o", str(mvs_dir / "scene.mvs")],
+                fase_label="PASO 4b — InterfaceCOLMAP", check=False)
+            if not (mvs_dir / "scene.mvs").exists():
+                raise RuntimeError("InterfaceCOLMAP no generó scene.mvs")
+            # 2) TextureMesh: proyecta las fotos sobre NUESTRA malla (mesh_lite.ply)
+            #    → .obj + textura. virtual-face-images 3 y cost-smoothness-ratio 0.5
+            #    son del hallazgo previo: parches de textura más grandes y limpios
+            #    (más cerca de la calidad Polycam).
+            log("   OpenMVS 2/2: TextureMesh (pegando fotos = textura real)...")
+            run(["TextureMesh", str(mvs_dir / "scene.mvs"),
+                 "--mesh-file", str(malla),
+                 "--export-type", "obj",
+                 "--virtual-face-images", "3",
+                 "--cost-smoothness-ratio", "0.5",
+                 "-o", str(mvs_dir / "textured.obj")],
+                cwd=str(mvs_dir),
+                fase_label="PASO 4b — TextureMesh", check=False)
+            # OpenMVS a veces añade sufijos al nombre → buscamos el .obj resultante.
+            obj_tex = None
+            for cand in ("textured.obj", "scene_texture.obj",
+                         "scene_mesh_texture.obj", "scene_dense_mesh_texture.obj"):
+                p = mvs_dir / cand
+                if p.exists() and p.stat().st_size > 1000:
+                    obj_tex = p; break
+            if obj_tex is None:
+                objs = [p for p in mvs_dir.glob("*.obj") if p.stat().st_size > 1000]
+                if objs:
+                    obj_tex = max(objs, key=lambda p: p.stat().st_size)
+            if obj_tex is None:
+                raise RuntimeError("TextureMesh no generó .obj texturizado")
+            log(f"   textura generada: {obj_tex.name}")
+            # 3) .obj (+ .mtl + imagen de textura) → .glb con la textura embebida.
+            sc = trimesh.load(str(obj_tex), process=False)
+            sc.export(str(glb_final))
+            if glb_final.exists() and glb_final.stat().st_size > 1000:
+                textura_ok = True
+                log(f"   ✓ .glb TEXTURIZADO: {glb_final.stat().st_size/1e6:.1f} MB")
+        except Exception as e:
+            log(f"   ⚠ texturizado OpenMVS falló ({e}); uso color por vértice")
+        # FAIL-SAFE: sin textura → exportar la malla con color por vértice a .glb.
+        if not textura_ok:
+            try:
+                m2 = trimesh.load(str(malla), process=False)
+                m2.export(str(glb_final))
+                log(f"   .glb (color por vértice): {glb_final.stat().st_size/1e6:.1f} MB")
+            except Exception as e:
+                log(f"   ⚠ no se pudo exportar .glb ({e})")
+        # Archivo a subir: el .glb si existe; si no, último recurso el .ply.
+        if glb_final.exists() and glb_final.stat().st_size > 1000:
+            archivo_subir = glb_final
+            ply_mb = glb_final.stat().st_size / 1e6
+        else:
+            archivo_subir = malla
+
+        # ── PASO 5: subir la malla (.glb texturizado) ──
+        fase(0.95, "PASO 5/5 — Subiendo malla")
+        with open(archivo_subir, "rb") as f:
             req = urllib.request.Request(UPLOAD_URL_PLY, data=f.read(),
                                          method="PUT")
             urllib.request.urlopen(req, timeout=300).read()
-        log("   malla subida")
+        log(f"   malla subida ({archivo_subir.name})")
 
         # ── Listo ──
         _estado["vivo"] = False
