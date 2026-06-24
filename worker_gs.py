@@ -514,6 +514,27 @@ def main():
             "    print('FILTER quito %d diminutos + %d fuera-del-cuarto (de %d comp)' % (nq_s, nq_f, len(ntri)), flush=True)\n"
             "except Exception as e:\n"
             "    print('FILTER (fallo, sigo):', e, flush=True)\n"
+            # --- 1b) RECORTE DE PROTRUSIONES (ventana que se dispara hacia afuera) ---
+            #     El filtro de arriba quita componentes SUELTOS fuera del cuarto, pero
+            #     el vidrio de la ventana suele quedar PEGADO a la pared (mismo
+            #     componente) y se proyecta hacia afuera (por eso "se aleja"). Aquí
+            #     quitamos los TRIÁNGULOS cuyo centroide cae muy fuera del cuarto (más
+            #     allá de los percentiles 1-99 de los vértices + 25% de margen) → deja
+            #     un HUECO LIMPIO en la ventana. (La transparencia real va en Fase 2.)
+            #     Tope de seguridad: nunca borra más del 25% de la malla.
+            "try:\n"
+            "    V2 = np.asarray(m.vertices); T2 = np.asarray(m.triangles)\n"
+            "    plo = np.percentile(V2, 1, axis=0); phi = np.percentile(V2, 99, axis=0)\n"
+            "    ctr2 = (plo+phi)/2.0; hf2 = (phi-plo)/2.0 * 1.25 + 1e-6\n"
+            "    lo2 = ctr2 - hf2; hi2 = ctr2 + hf2\n"
+            "    tc = V2[T2].mean(axis=1)\n"
+            "    out = np.any(tc < lo2, axis=1) | np.any(tc > hi2, axis=1)\n"
+            "    no = int(out.sum())\n"
+            "    if 0 < no < int(0.25*len(T2)):\n"
+            "        m.remove_triangles_by_mask(out); m.remove_unreferenced_vertices()\n"
+            "    print('CROP protrusiones: quito %d triangulos fuera del cuarto' % no, flush=True)\n"
+            "except Exception as e:\n"
+            "    print('CROP (fallo, sigo):', e, flush=True)\n"
             # --- Si viene gigantesca, pre-decimar para no reventar RAM al suavizar ---
             "if len(m.triangles) > 4000000:\n"
             "    print('PRE-DECIMATE malla muy grande (%d)...' % len(m.triangles), flush=True)\n"
@@ -530,13 +551,40 @@ def main():
             "    print('SMOOTH Taubin 3 iter (minimo, conserva detalle) OK', flush=True)\n"
             "except Exception as e:\n"
             "    print('SMOOTH (fallo, sigo):', e, flush=True)\n"
-            # --- 3) DECIMAR a ~800k (más vértices = más detalle de color; sigue
-            #     ligero para web; con normales suaves NO se ven triángulos) ---
-            "target = 800000\n"
+            # --- 3) DECIMAR a ~1.2M (SUBIDO de 800k): más vértices = más detalle de
+            #     color visible (juntas, arrugas, manecillas); sigue manejable para
+            #     web; con normales suaves NO se ven triángulos ---
+            "target = 1200000\n"
             "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             "m.remove_unreferenced_vertices()\n"
             "m.remove_degenerate_triangles()\n"
+            # --- 3b) APLANADO ADAPTATIVO DE PAREDES/PISO/TECHO (RANSAC) — CAMBIO CLAVE
+            #     El problema de las "ondulaciones tipo oleaje" en paredes lisas es
+            #     ruido del 2DGS en superficies sin textura. NO podemos subir el
+            #     suavizado global (borraría el detalle de los objetos). Solución
+            #     INTELIGENTE (lo que pediste): detectar los planos GRANDES (paredes,
+            #     piso, techo) con RANSAC y proyectar SOLO esos vértices a su plano
+            #     exacto → paredes perfectamente lisas, objetos detallados intactos.
+            #     distance_threshold=0.03 → solo jala vértices a <3cm del plano.
+            "try:\n"
+            "    Vp = np.asarray(m.vertices).copy()\n"
+            "    nverts = len(Vp); rem = np.arange(nverts); nplanos = 0\n"
+            "    for _pi in range(6):\n"
+            "        if len(rem) < int(0.05*nverts): break\n"
+            "        sub = o3d.geometry.PointCloud()\n"
+            "        sub.points = o3d.utility.Vector3dVector(Vp[rem])\n"
+            "        pm, inl = sub.segment_plane(distance_threshold=0.03, ransac_n=3, num_iterations=400)\n"
+            "        if len(inl) < int(0.08*nverts): break\n"
+            "        a,b,c,d = pm; nrm = np.array([a,b,c]); n2 = float(a*a+b*b+c*c) + 1e-12\n"
+            "        gi = rem[inl]; pts = Vp[gi]\n"
+            "        dist = (pts @ nrm + d) / n2\n"
+            "        Vp[gi] = pts - dist[:,None]*nrm\n"
+            "        rem = np.delete(rem, inl); nplanos += 1\n"
+            "    m.vertices = o3d.utility.Vector3dVector(Vp)\n"
+            "    print('FLATTEN %d planos grandes aplanados (paredes/piso/techo)' % nplanos, flush=True)\n"
+            "except Exception as e:\n"
+            "    print('FLATTEN (fallo, sigo):', e, flush=True)\n"
             "m.compute_vertex_normals()\n"
             "m.compute_triangle_normals()\n"
             # --- 4) AMBIENT OCCLUSION por vértice (EL PASO QUE MÁS QUITA EL PLÁSTICO)
@@ -564,9 +612,10 @@ def main():
             "        ao[s:s+_ch] = hh.sum(1)/np.maximum(u2.sum(1),1)\n"
             "    C = np.asarray(m.vertex_colors)\n"
             "    if len(C) == len(Vv):\n"
-            "        C = C * (1 - 0.6*ao)[:,None]\n"
+            "        C = C * (1 - 0.3*ao)[:,None]\n"
+            "        C = np.clip(C, 0, 1) ** 0.85\n"
             "        m.vertex_colors = o3d.utility.Vector3dVector(np.clip(C,0,1))\n"
-            "        print('AO horneado: oclusion media %.3f' % float(ao.mean()), flush=True)\n"
+            "        print('AO suave 0.3 + realce brillo (gamma 0.85); oclusion media %.3f' % float(ao.mean()), flush=True)\n"
             "    else:\n"
             "        print('AO: malla sin color por vertice, lo salto', flush=True)\n"
             "except Exception as e:\n"
