@@ -444,9 +444,20 @@ def main():
             log(f"   (no se midió la escala, uso valores por defecto: {e})")
         _diag = float(_np.linalg.norm(_ext))
         _maxext = float(_ext.max())
-        # ~500 voxeles en la dimensión mayor (resolución fina para detalle/huecos)
-        voxel = max(_maxext / 500.0, 1e-5)
-        sdf_trunc = 4.0 * voxel          # banda MÁS GRUESA -> rellena huecos y cierra techo
+        # ~800 voxeles en la dimensión mayor (≈6mm en este cuarto) — CAMBIO CLAVE
+        # PARA EL DETALLE. ANTES era /500 (≈1cm): la investigación confirmó que ESE
+        # era el cuello de botella — la malla NO podía capturar nada más fino que el
+        # voxel (1cm), así que manecillas, cantos y molduras se perdían ANTES del
+        # post-proceso (por eso subir vértices y bajar suavizado no ayudó: la geometría
+        # ya venía sin el detalle). A ≈6mm captura el medio-relieve.
+        # PISO de 5mm (no bajamos más): las imágenes son de 512px y no tienen info
+        # más fina que eso; un voxel menor solo metería RUIDO y triángulos de más.
+        # OJO: el .glb NO pesa más (se decima a 1.5M igual) — esos 1.5M triángulos
+        # simplemente capturan MÁS detalle. sdf_trunc sigue 4x (la banda se encoge
+        # con el voxel → suaviza menos → ayuda al detalle). FAIL-SAFE: si salen
+        # huecos o ruido, subir el divisor a 700 (≈7mm) o volver a 500.
+        voxel = max(_maxext / 800.0, 0.005)
+        sdf_trunc = 4.0 * voxel          # banda ~4 voxeles: funde superficies sin abrir huecos
         depth_trunc = _diag * 1.3        # cubre el cuarto + margen; corta agujas lejanas
         log(f"   escala medida: cuarto≈{_ext[0]:.2f}×{_ext[1]:.2f}×{_ext[2]:.2f}, "
             f"voxel={voxel:.4f}, sdf_trunc={sdf_trunc:.4f}, depth_trunc={depth_trunc:.2f}")
