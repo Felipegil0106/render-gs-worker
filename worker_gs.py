@@ -55,6 +55,16 @@ import torch
 from PIL import Image
 from scipy.spatial.transform import Rotation
 
+# Semilla fija → resultados reproducibles entre corridas (misma entrada = misma salida).
+# Antes, dos corridas con las MISMAS fotos podían dar geometrías distintas (a veces
+# buena, a veces dañada) por la aleatoriedad interna. Esto lo elimina en gran parte.
+import random as _rnd
+_rnd.seed(42); np.random.seed(42); torch.manual_seed(42)
+try:
+    torch.cuda.manual_seed_all(42)
+except Exception:
+    pass
+
 IMAGES_DIR = sys.argv[1]
 OUT_DIR = sys.argv[2]
 
@@ -339,24 +349,67 @@ def main():
         except Exception as e:
             log(f"   (no se pudo parchear general_utils: {e})")
 
+        # ── PARCHE de SEMILLA en 2DGS (reproducibilidad) ──
+        # Fijamos la semilla aleatoria al inicio de train.py para que el entrenamiento
+        # sea reproducible (misma entrada → misma malla). Esto, junto con bajar
+        # lambda_dist, elimina el problema de que una corrida salía buena y la siguiente
+        # fatal. HONESTIDAD: el rasterizador CUDA de 2DGS usa sumas atómicas que no son
+        # 100% deterministas, así que reduce MUCHO la varianza pero no del todo; por eso
+        # más abajo añadimos un chequeo de PSNR que avisa si la corrida salió mal.
+        try:
+            tp = Path("/opt/2dgs/train.py")
+            tptxt = tp.read_text()
+            if "manual_seed(42)" not in tptxt:
+                seed_code = (
+                    "import random as _sr, numpy as _snp, torch as _st\n"
+                    "_sr.seed(42); _snp.random.seed(42); _st.manual_seed(42)\n"
+                    "try:\n    _st.cuda.manual_seed_all(42)\nexcept Exception:\n    pass\n")
+                if tptxt.lstrip().startswith("from __future__"):
+                    _i = tptxt.index("\n") + 1   # 'from __future__' debe ir primero
+                    tp.write_text(tptxt[:_i] + seed_code + tptxt[_i:])
+                else:
+                    tp.write_text(seed_code + tptxt)
+                log("   semilla fija inyectada en train.py (reproducibilidad)")
+        except Exception as e:
+            log(f"   (no se pudo inyectar semilla en train.py: {e})")
+
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
-        # --lambda_dist 100 : regularizador de DISTORSIÓN de profundidad (concentra
-        # las gaussianas sobre una superficie fina → menos floaters/doble capa).
-        # --lambda_normal 0.1 : regularizador de NORMALES, valor MEDIO. En la
-        # ronda anterior se probó 0.2 y aplanó DEMASIADO. 0.1 aplana las paredes
-        # blancas sin matar la forma real de los muebles. NO lo subimos: la malla
-        # que produce es BUENA (lo confirmaste). El aspecto "plástico" no venía de
-        # aquí sino del POST-PROCESO (Taubin excesivo), ya corregido: ahora el
-        # detalle de superficie se conserva con Taubin mínimo + Ambient Occlusion.
-        run(["python", "/opt/2dgs/train.py",
+        # --lambda_dist 25 : regularizador de DISTORSIÓN de profundidad. ANTES estaba
+        # en 100 — DEMASIADO ALTO. La investigación encontró que ese valor era la
+        # CAUSA RAÍZ de que el render saliera dañado: en paredes lisas sin textura el
+        # término de distorsión se disparaba (picos de 0.17-0.49) y SACUDÍA las
+        # gaussianas en vez de asentarlas → geometría deformada, huecos, cuarto
+        # incompleto, y la calidad (PSNR) llegó a CAER de 27 a 25.8 con más iteraciones.
+        # Además era INESTABLE: a veces salía bien (PSNR 32.5) y a veces fatal (25.8)
+        # con el mismo input. Bajándolo a 25 el entrenamiento es estable y reproducible
+        # (junto con la semilla fija). --lambda_normal 0.05 es el default oficial (antes
+        # 0.1, el doble): mantiene las paredes planas sin el riesgo de la distorsión alta.
+        _rc_tr, _out_tr = run(["python", "/opt/2dgs/train.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--iterations", str(ITERS),
-             "--lambda_dist", "100",
-             "--lambda_normal", "0.1"],
+             "--lambda_dist", "25",
+             "--lambda_normal", "0.05"],
             fase_label="PASO 3/5 — Entrenando 2DGS")
         log("   2DGS entrenado")
+        # ── CHEQUEO DE CALIDAD (PSNR) — red de seguridad ──
+        # La investigación mostró que el entrenamiento puede salir mal e inestable.
+        # Leemos el PSNR final del log de 2DGS y avisamos si salió bajo (< 30): en ese
+        # caso la malla probablemente saldrá dañada/incompleta y conviene re-correr.
+        psnr_final = None
+        try:
+            import re as _re
+            _psnrs = _re.findall(r'PSNR\s+([0-9]+\.[0-9]+)', _out_tr or "")
+            if _psnrs:
+                psnr_final = float(_psnrs[-1])
+                if psnr_final >= 30:
+                    log(f"   ✓ CALIDAD OK: PSNR final {psnr_final:.1f} (buena base estable)")
+                else:
+                    log(f"   ⚠⚠⚠ CALIDAD BAJA: PSNR final {psnr_final:.1f} (< 30). La malla "
+                        f"puede salir dañada/incompleta. RECOMIENDO RE-CORRER el render.")
+        except Exception as e:
+            log(f"   (no se pudo leer el PSNR: {e})")
 
         # ── PASO 4: extraer malla por TSDF (OPTIMIZADO) ──
         fase(0.80, "PASO 4/5 — Extrayendo malla (TSDF)")
@@ -514,77 +567,36 @@ def main():
             "    print('FILTER quito %d diminutos + %d fuera-del-cuarto (de %d comp)' % (nq_s, nq_f, len(ntri)), flush=True)\n"
             "except Exception as e:\n"
             "    print('FILTER (fallo, sigo):', e, flush=True)\n"
-            # --- 1b) RECORTE DE PROTRUSIONES (ventana que se dispara hacia afuera) ---
-            #     El filtro de arriba quita componentes SUELTOS fuera del cuarto, pero
-            #     el vidrio de la ventana suele quedar PEGADO a la pared (mismo
-            #     componente) y se proyecta hacia afuera (por eso "se aleja"). Aquí
-            #     quitamos los TRIÁNGULOS cuyo centroide cae muy fuera del cuarto (más
-            #     allá de los percentiles 1-99 de los vértices + 25% de margen) → deja
-            #     un HUECO LIMPIO en la ventana. (La transparencia real va en Fase 2.)
-            #     Tope de seguridad: nunca borra más del 25% de la malla.
-            "try:\n"
-            "    V2 = np.asarray(m.vertices); T2 = np.asarray(m.triangles)\n"
-            "    plo = np.percentile(V2, 1, axis=0); phi = np.percentile(V2, 99, axis=0)\n"
-            "    ctr2 = (plo+phi)/2.0; hf2 = (phi-plo)/2.0 * 1.25 + 1e-6\n"
-            "    lo2 = ctr2 - hf2; hi2 = ctr2 + hf2\n"
-            "    tc = V2[T2].mean(axis=1)\n"
-            "    out = np.any(tc < lo2, axis=1) | np.any(tc > hi2, axis=1)\n"
-            "    no = int(out.sum())\n"
-            "    if 0 < no < int(0.25*len(T2)):\n"
-            "        m.remove_triangles_by_mask(out); m.remove_unreferenced_vertices()\n"
-            "    print('CROP protrusiones: quito %d triangulos fuera del cuarto' % no, flush=True)\n"
-            "except Exception as e:\n"
-            "    print('CROP (fallo, sigo):', e, flush=True)\n"
             # --- Si viene gigantesca, pre-decimar para no reventar RAM al suavizar ---
             "if len(m.triangles) > 4000000:\n"
             "    print('PRE-DECIMATE malla muy grande (%d)...' % len(m.triangles), flush=True)\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=1500000)\n"
-            # --- 2) SUAVIZADO TAUBIN MÍNIMO (CAMBIO ANTI-PLÁSTICO) ---
-            # ANTES eran 15+5 iteraciones: eso BORRABA el micro-relieve de la buena
-            # malla y la dejaba "plástica". La investigación confirmó que el facetado
-            # (ver triángulos) NO se quita con Taubin sino con NORMALES SUAVES (eso lo
-            # da el .glb al exportar). Así que bajamos Taubin a SOLO 3 iteraciones
-            # (apenas para quitar ruido del TSDF) y QUITAMOS el segundo pase →
-            # se conserva el detalle de superficie real.
+            # --- 2) SUAVIZADO TAUBIN MÍNIMO (1 ITERACIÓN) — PASO DE DETALLE ---
+            # La investigación confirmó que Taubin 3× sobre una malla de alta
+            # resolución DESPERDICIA los vértices nuevos (los alisa y borra el
+            # micro-relieve = arrugas, juntas, manecillas). Bajamos a 1 sola
+            # iteración: apenas quita el ruido más grueso del TSDF pero conserva
+            # el detalle fino. VA OBLIGATORIAMENTE JUNTO con subir la decimación a
+            # 1.5M (abajo): más vértices + menos suavizado = más definición real.
+            # FAIL-SAFE: si las paredes salen muy ruidosas (oleaje), subir a 2.
             "try:\n"
-            "    m = m.filter_smooth_taubin(number_of_iterations=3)\n"
-            "    print('SMOOTH Taubin 3 iter (minimo, conserva detalle) OK', flush=True)\n"
+            "    m = m.filter_smooth_taubin(number_of_iterations=1)\n"
+            "    print('SMOOTH Taubin 1 iter (conserva detalle fino) OK', flush=True)\n"
             "except Exception as e:\n"
             "    print('SMOOTH (fallo, sigo):', e, flush=True)\n"
-            # --- 3) DECIMAR a ~1.2M (SUBIDO de 800k): más vértices = más detalle de
-            #     color visible (juntas, arrugas, manecillas); sigue manejable para
-            #     web; con normales suaves NO se ven triángulos ---
-            "target = 1200000\n"
+            # --- 3) DECIMAR a ~1.5M (SUBIDO de 800k) — PASO DE DETALLE ---
+            #     El color por vértice solo puede variar tan rápido como hay vértices.
+            #     A 800k se perdía detalle fino (arrugas, juntas, manecillas → se veían
+            #     borrosas/plásticas). A 1.5M se conserva mucho más. VA JUNTO con bajar
+            #     Taubin a 1 (arriba). Con normales suaves NO se ven triángulos.
+            #     NOTA: el .glb pesará más (~40-50 MB vs ~25). Si el visor va lento o
+            #     pesa mucho, el siguiente paso es comprimir con Draco (sin perder
+            #     detalle). FAIL-SAFE: si va lento en 3dviewer.net, bajar a 1.2M.
+            "target = 1500000\n"
             "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             "m.remove_unreferenced_vertices()\n"
             "m.remove_degenerate_triangles()\n"
-            # --- 3b) APLANADO ADAPTATIVO DE PAREDES/PISO/TECHO (RANSAC) — CAMBIO CLAVE
-            #     El problema de las "ondulaciones tipo oleaje" en paredes lisas es
-            #     ruido del 2DGS en superficies sin textura. NO podemos subir el
-            #     suavizado global (borraría el detalle de los objetos). Solución
-            #     INTELIGENTE (lo que pediste): detectar los planos GRANDES (paredes,
-            #     piso, techo) con RANSAC y proyectar SOLO esos vértices a su plano
-            #     exacto → paredes perfectamente lisas, objetos detallados intactos.
-            #     distance_threshold=0.03 → solo jala vértices a <3cm del plano.
-            "try:\n"
-            "    Vp = np.asarray(m.vertices).copy()\n"
-            "    nverts = len(Vp); rem = np.arange(nverts); nplanos = 0\n"
-            "    for _pi in range(6):\n"
-            "        if len(rem) < int(0.05*nverts): break\n"
-            "        sub = o3d.geometry.PointCloud()\n"
-            "        sub.points = o3d.utility.Vector3dVector(Vp[rem])\n"
-            "        pm, inl = sub.segment_plane(distance_threshold=0.03, ransac_n=3, num_iterations=400)\n"
-            "        if len(inl) < int(0.08*nverts): break\n"
-            "        a,b,c,d = pm; nrm = np.array([a,b,c]); n2 = float(a*a+b*b+c*c) + 1e-12\n"
-            "        gi = rem[inl]; pts = Vp[gi]\n"
-            "        dist = (pts @ nrm + d) / n2\n"
-            "        Vp[gi] = pts - dist[:,None]*nrm\n"
-            "        rem = np.delete(rem, inl); nplanos += 1\n"
-            "    m.vertices = o3d.utility.Vector3dVector(Vp)\n"
-            "    print('FLATTEN %d planos grandes aplanados (paredes/piso/techo)' % nplanos, flush=True)\n"
-            "except Exception as e:\n"
-            "    print('FLATTEN (fallo, sigo):', e, flush=True)\n"
             "m.compute_vertex_normals()\n"
             "m.compute_triangle_normals()\n"
             # --- 4) AMBIENT OCCLUSION por vértice (EL PASO QUE MÁS QUITA EL PLÁSTICO)
