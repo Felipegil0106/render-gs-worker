@@ -444,19 +444,14 @@ def main():
             log(f"   (no se midió la escala, uso valores por defecto: {e})")
         _diag = float(_np.linalg.norm(_ext))
         _maxext = float(_ext.max())
-        # ~800 voxeles en la dimensión mayor (≈6mm en este cuarto) — CAMBIO CLAVE
-        # PARA EL DETALLE. ANTES era /500 (≈1cm): la investigación confirmó que ESE
-        # era el cuello de botella — la malla NO podía capturar nada más fino que el
-        # voxel (1cm), así que manecillas, cantos y molduras se perdían ANTES del
-        # post-proceso (por eso subir vértices y bajar suavizado no ayudó: la geometría
-        # ya venía sin el detalle). A ≈6mm captura el medio-relieve.
-        # PISO de 5mm (no bajamos más): las imágenes son de 512px y no tienen info
-        # más fina que eso; un voxel menor solo metería RUIDO y triángulos de más.
-        # OJO: el .glb NO pesa más (se decima a 1.5M igual) — esos 1.5M triángulos
-        # simplemente capturan MÁS detalle. sdf_trunc sigue 4x (la banda se encoge
-        # con el voxel → suaviza menos → ayuda al detalle). FAIL-SAFE: si salen
-        # huecos o ruido, subir el divisor a 700 (≈7mm) o volver a 500.
-        voxel = max(_maxext / 800.0, 0.005)
+        # ~500 voxeles en la dimensión mayor (≈1cm en este cuarto). PROBADO que la
+        # malla resultante SÍ carga en 3dviewer.net. Se intentó /800 (~6mm) para más
+        # detalle pero generaba una malla DEMASIADO densa/fragmentada (5.96M triángulos,
+        # 2539 pedazos) → la decimación agresiva dejaba triángulos degenerados y valores
+        # NaN → el visor se colgaba ("cargando para siempre"). El camino del voxel fino
+        # choca con un muro de visualización; el detalle vendrá por TEXTURA UV (no añade
+        # triángulos, no rompe el visor). FAIL-SAFE: este /500 es la base que carga.
+        voxel = max(_maxext / 500.0, 0.005)
         sdf_trunc = 4.0 * voxel          # banda ~4 voxeles: funde superficies sin abrir huecos
         depth_trunc = _diag * 1.3        # cubre el cuarto + margen; corta agujas lejanas
         log(f"   escala medida: cuarto≈{_ext[0]:.2f}×{_ext[1]:.2f}×{_ext[2]:.2f}, "
@@ -606,8 +601,31 @@ def main():
             "target = 1500000\n"
             "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
+            # --- LIMPIEZA PROFUNDA tras decimar (CLAVE para que el visor NO se cuelgue)
+            #     La decimación puede dejar triángulos degenerados (área ~0), vértices
+            #     duplicados y bordes no-manifold. Sobre esos, las normales salen NaN y
+            #     el visor se cuelga al calcular el encuadre. Limpiamos TODO antes de
+            #     calcular normales para garantizar una malla válida.
             "m.remove_unreferenced_vertices()\n"
             "m.remove_degenerate_triangles()\n"
+            "m.remove_duplicated_vertices()\n"
+            "m.remove_duplicated_triangles()\n"
+            "try:\n"
+            "    m.remove_non_manifold_edges()\n"
+            "except Exception as _e:\n"
+            "    print('non_manifold (fallo, sigo):', _e, flush=True)\n"
+            "m.remove_unreferenced_vertices()\n"
+            # Quitar triángulos con vértices NaN/Inf (de una decimación problemática):
+            # son la causa típica del 'cargando para siempre' en 3dviewer.net.
+            "try:\n"
+            "    _Vc = np.asarray(m.vertices)\n"
+            "    _bad = ~np.isfinite(_Vc).all(axis=1)\n"
+            "    if _bad.any():\n"
+            "        _keep = np.where(~_bad)[0]\n"
+            "        m = m.select_by_index(_keep.tolist())\n"
+            "        print('NAN-GUARD: quite %d vertices invalidos' % int(_bad.sum()), flush=True)\n"
+            "except Exception as _e:\n"
+            "    print('NAN-GUARD (fallo, sigo):', _e, flush=True)\n"
             "m.compute_vertex_normals()\n"
             "m.compute_triangle_normals()\n"
             # --- 4) AMBIENT OCCLUSION por vértice (EL PASO QUE MÁS QUITA EL PLÁSTICO)
@@ -634,9 +652,11 @@ def main():
             "        hh = ((rt < _rad) & up).reshape(nv,K); u2 = up.reshape(nv,K)\n"
             "        ao[s:s+_ch] = hh.sum(1)/np.maximum(u2.sum(1),1)\n"
             "    C = np.asarray(m.vertex_colors)\n"
+            "    ao = np.nan_to_num(ao, nan=0.0, posinf=0.0, neginf=0.0)\n"
             "    if len(C) == len(Vv):\n"
             "        C = C * (1 - 0.3*ao)[:,None]\n"
             "        C = np.clip(C, 0, 1) ** 0.85\n"
+            "        C = np.nan_to_num(C, nan=0.5, posinf=1.0, neginf=0.0)\n"
             "        m.vertex_colors = o3d.utility.Vector3dVector(np.clip(C,0,1))\n"
             "        print('AO suave 0.3 + realce brillo (gamma 0.85); oclusion media %.3f' % float(ao.mean()), flush=True)\n"
             "    else:\n"
