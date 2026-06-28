@@ -126,16 +126,55 @@ fcam = open(os.path.join(sparse_out, "cameras.txt"), "w")
 fimg = open(os.path.join(sparse_out, "images.txt"), "w")
 fcam.write("# Camera list\n")
 fimg.write("# Image list\n")
+# ===== ENTRENAMIENTO EN ALTA RESOLUCIÓN (CAMBIO CLAVE DE CALIDAD) =====
+# MASt3R calcula las POSES a 512px (donde da buenas poses), PERO guardamos las
+# imágenes de ENTRENAMIENTO en alta resolución desde las fotos ORIGINALES del
+# celular (12MP) para que 2DGS aprenda MÁS DETALLE. Esto NO es "pegar fotos a la
+# malla" (eso fue OpenMVS y se desalineaba): aquí la IA aprende el cuarto entero
+# con más detalle desde el inicio y el color queda integrado, sin nada que pueda
+# desalinearse. El FOV es un ÁNGULO (invariante a la resolución), así que las
+# poses de 512px siguen siendo válidas; solo escalamos los intrínsecos al nuevo
+# tamaño. Para fotos 4:3 el recorte central es exacto; para otros formatos,
+# near-exact. Si una foto original falla, cae a la de 512px (no rompe la corrida).
+TRAIN_RES = 1000   # lado mayor de las imágenes de entrenamiento (antes 512px)
+print("ENTRENAMIENTO a %dpx (alta resolucion; poses a 512px)" % TRAIN_RES, flush=True)
+_n_hi = 0
 for i in range(N):
     im = rgbimgs[i]
-    H, W = im.shape[:2]
+    H, W = im.shape[:2]              # tamaño a 512px (referencia de aspecto/encuadre)
+    aspect = W / float(H)
     name = "img_%04d.png" % i
-    Image.fromarray((np.clip(im, 0, 1) * 255).astype(np.uint8)).save(os.path.join(img_out, name))
     K = intrinsics[i]
-    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+    try:
+        orig = Image.open(filelist[i]).convert("RGB")   # foto original (cam i = filelist[i])
+        Wo, Ho = orig.size
+        # recorte central al MISMO aspecto que la versión 512px (replica el encuadre)
+        if (Wo / float(Ho)) > aspect:
+            cw = int(round(Ho * aspect)); ch = Ho
+        else:
+            cw = Wo; ch = int(round(Wo / aspect))
+        left = (Wo - cw) // 2; top = (Ho - ch) // 2
+        orig = orig.crop((left, top, left + cw, top + ch))
+        # escalar para que el lado mayor sea TRAIN_RES
+        if cw >= ch:
+            nw = TRAIN_RES; nh = max(1, int(round(ch * TRAIN_RES / float(cw))))
+        else:
+            nh = TRAIN_RES; nw = max(1, int(round(cw * TRAIN_RES / float(ch))))
+        orig.resize((nw, nh), Image.LANCZOS).save(os.path.join(img_out, name))
+        scale = nw / float(W)        # factor 512px -> alta resolución
+        Wsave, Hsave = nw, nh
+        _n_hi += 1
+    except Exception as _e:
+        # fallback seguro: guardar la imagen de 512px de MASt3R
+        print("HIRES fallo en cam %d (%s), uso 512px" % (i, _e), flush=True)
+        Image.fromarray((np.clip(im, 0, 1) * 255).astype(np.uint8)).save(os.path.join(img_out, name))
+        scale = 1.0; Wsave, Hsave = W, H
+    # intrínsecos escalados al nuevo tamaño (mismo FOV); cx,cy siguen centrados
+    fx = float(K[0, 0]) * scale; fy = float(K[1, 1]) * scale
+    cx = float(K[0, 2]) * scale; cy = float(K[1, 2]) * scale
     cam_id = i + 1
-    fcam.write("%d PINHOLE %d %d %.6f %.6f %.6f %.6f\n" % (cam_id, W, H, fx, fy, cx, cy))
-    # COLMAP guarda world->cam = inversa de cam->world
+    fcam.write("%d PINHOLE %d %d %.6f %.6f %.6f %.6f\n" % (cam_id, Wsave, Hsave, fx, fy, cx, cy))
+    # COLMAP guarda world->cam = inversa de cam->world (poses NO cambian con la resolución)
     w2c = np.linalg.inv(cams2world[i])
     q = Rotation.from_matrix(w2c[:3, :3]).as_quat()   # [x,y,z,w]
     t = w2c[:3, 3]
@@ -143,6 +182,7 @@ for i in range(N):
                (cam_id, float(q[3]), float(q[0]), float(q[1]), float(q[2]),
                 float(t[0]), float(t[1]), float(t[2]), cam_id, name))
     fimg.write("\n")   # linea de puntos 2D (vacia)
+print("ENTRENAMIENTO: %d/%d imagenes guardadas en alta resolucion" % (_n_hi, N), flush=True)
 fcam.close()
 fimg.close()
 print("MAST3R: poses escritas", flush=True)
@@ -390,7 +430,9 @@ def main():
              "-s", str(dataset), "-m", str(dgs_out),
              "--iterations", str(ITERS),
              "--lambda_dist", "25",
-             "--lambda_normal", "0.05"],
+             "--lambda_normal", "0.05",
+             "-r", "1",                   # usar la resolución COMPLETA de las imágenes (1000px), no reducir
+             "--data_device", "cpu"],     # imágenes en RAM (no en VRAM) → evita quedarse sin memoria a alta resolución
             fase_label="PASO 3/5 — Entrenando 2DGS")
         log("   2DGS entrenado")
         # ── CHEQUEO DE CALIDAD (PSNR) — red de seguridad ──
@@ -452,7 +494,9 @@ def main():
         # choca con un muro de visualización; el detalle vendrá por TEXTURA UV (no añade
         # triángulos, no rompe el visor). FAIL-SAFE: este /500 es la base que carga.
         voxel = max(_maxext / 500.0, 0.005)
-        sdf_trunc = 4.0 * voxel          # banda ~4 voxeles: funde superficies sin abrir huecos
+        sdf_trunc = 5.0 * voxel          # banda ~5 voxeles (antes 4): cierra mejor los HUECOS
+        #                                  en zonas de poca observación, a cambio de redondear
+        #                                  un poquito los detalles finos (compromiso aceptable).
         depth_trunc = _diag * 1.3        # cubre el cuarto + margen; corta agujas lejanas
         log(f"   escala medida: cuarto≈{_ext[0]:.2f}×{_ext[1]:.2f}×{_ext[2]:.2f}, "
             f"voxel={voxel:.4f}, sdf_trunc={sdf_trunc:.4f}, depth_trunc={depth_trunc:.2f}")
