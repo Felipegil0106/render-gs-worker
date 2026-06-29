@@ -624,25 +624,24 @@ def main():
             # --- 2) SUAVIZADO TAUBIN MÍNIMO (1 ITERACIÓN) — PASO DE DETALLE ---
             # La investigación confirmó que Taubin 3× sobre una malla de alta
             # resolución DESPERDICIA los vértices nuevos (los alisa y borra el
-            # micro-relieve = arrugas, juntas, manecillas). Bajamos a 1 sola
-            # iteración: apenas quita el ruido más grueso del TSDF pero conserva
-            # el detalle fino. VA OBLIGATORIAMENTE JUNTO con subir la decimación a
-            # 1.5M (abajo): más vértices + menos suavizado = más definición real.
-            # FAIL-SAFE: si las paredes salen muy ruidosas (oleaje), subir a 2.
+            # micro-relieve. CAMBIO: subimos a 5 ITERACIONES (antes 1) para alisar
+            # la RUGOSIDAD GEOMÉTRICA real ("braille"/papel de lija) que tiene la malla
+            # del TSDF — la realidad empírica es que el "detalle fino" que queríamos
+            # conservar NO existe (es ruido del TSDF a 1cm de voxel), así que suavizar
+            # fuerte solo quita lo malo. Taubin NO encoge la malla (preserva volumen),
+            # solo alisa. FAIL-SAFE: si quita demasiado (bordes muy redondeados), bajar
+            # a 3.
             "try:\n"
-            "    m = m.filter_smooth_taubin(number_of_iterations=1)\n"
-            "    print('SMOOTH Taubin 1 iter (conserva detalle fino) OK', flush=True)\n"
+            "    m = m.filter_smooth_taubin(number_of_iterations=5)\n"
+            "    print('SMOOTH Taubin 5 iter (alisa rugosidad/braille) OK', flush=True)\n"
             "except Exception as e:\n"
             "    print('SMOOTH (fallo, sigo):', e, flush=True)\n"
-            # --- 3) DECIMAR a ~1.5M (SUBIDO de 800k) — PASO DE DETALLE ---
-            #     El color por vértice solo puede variar tan rápido como hay vértices.
-            #     A 800k se perdía detalle fino (arrugas, juntas, manecillas → se veían
-            #     borrosas/plásticas). A 1.5M se conserva mucho más. VA JUNTO con bajar
-            #     Taubin a 1 (arriba). Con normales suaves NO se ven triángulos.
-            #     NOTA: el .glb pesará más (~40-50 MB vs ~25). Si el visor va lento o
-            #     pesa mucho, el siguiente paso es comprimir con Draco (sin perder
-            #     detalle). FAIL-SAFE: si va lento en 3dviewer.net, bajar a 1.2M.
-            "target = 2000000\n"
+            # --- 3) DECIMAR a ~1.2M (BAJADO de 2M) — MÁS LIVIANO + MENOS BRAILLE ---
+            #     El detalle fino real no existe, así que menos triángulos NO pierde
+            #     nada importante, Y menos vértices = superficie menos granulada +
+            #     archivo más liviano (~32 MB vs ~53). Con normales suaves NO se ven
+            #     triángulos. FAIL-SAFE: si se ve muy simplón, subir a 1.5M.
+            "target = 1200000\n"
             "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             # --- LIMPIEZA PROFUNDA tras decimar (CLAVE para que el visor NO se cuelgue)
