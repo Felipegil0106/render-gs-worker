@@ -136,7 +136,10 @@ fimg.write("# Image list\n")
 # poses de 512px siguen siendo válidas; solo escalamos los intrínsecos al nuevo
 # tamaño. Para fotos 4:3 el recorte central es exacto; para otros formatos,
 # near-exact. Si una foto original falla, cae a la de 512px (no rompe la corrida).
-TRAIN_RES = 1600   # lado mayor de las imágenes de entrenamiento (512px original → 1000 → 1600)
+TRAIN_RES = 1000   # lado mayor de las imágenes de entrenamiento. 1600px resultó
+#                    INESTABLE: el entrenamiento colapsaba (PSNR caía a 27.7, malla con
+#                    huecos y techo derrumbado). 1000px es ESTABLE (PSNR ~32.5). El techo
+#                    real es la captura (poses a 512px, celular sin LiDAR), no la resolución.
 print("ENTRENAMIENTO a %dpx (alta resolucion; poses a 512px)" % TRAIN_RES, flush=True)
 _n_hi = 0
 for i in range(N):
@@ -210,6 +213,162 @@ for j in range(len(pts)):
     fp.write("%d %.6f %.6f %.6f %d %d %d 0\n" % (j + 1, x, y, z, int(r), int(g), int(b)))
 fp.close()
 print("MAST3R: points3D.txt escrito. LISTO.", flush=True)
+'''
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SCRIPT DE TEXTURIZADO UV (corre en el pod como subproceso, estilo Polycam)
+# ────────────────────────────────────────────────────────────────────────────
+# Separa el COLOR de la GEOMETRÍA: en vez de pintar cada vértice (que obliga a
+# malla densa/rugosa = "braille"), hornea una TEXTURA UV (imagen) sobre la malla.
+# ANTI-DESALINEACIÓN (lo que arruinó OpenMVS): en vez de pegar UNA foto por cara
+# (que se tuerce con cualquier error de pose), PROMEDIA todas las fotos visibles
+# por texel, usando las MISMAS imágenes y poses del entrenamiento 2DGS. La
+# visibilidad/oclusión se resuelve con raycasting (cada foto solo aporta a las
+# superficies que realmente ve). El error de pose se reparte en un leve desenfoque,
+# no en cortes torcidos. Validado localmente con datos sintéticos.
+TEXTURE_SCRIPT = r'''
+import sys, os, gc
+import numpy as np
+from PIL import Image
+print("   [tex] iniciando horneado de textura UV", flush=True)
+try:
+    import xatlas
+except Exception:
+    print("   [tex] instalando xatlas...", flush=True)
+    os.system(sys.executable + " -m pip install xatlas --quiet")
+    import xatlas
+import open3d as o3d
+import trimesh
+
+MESH_PLY   = sys.argv[1]
+IMAGES_DIR = sys.argv[2]
+SPARSE_DIR = sys.argv[3]
+OUT_GLB    = sys.argv[4]
+TEXSIZE    = int(sys.argv[5]) if len(sys.argv) > 5 else 2048
+
+def log(s): print("   [tex] " + s, flush=True)
+
+# 1) malla
+m = o3d.io.read_triangle_mesh(MESH_PLY)
+V = np.asarray(m.vertices); F = np.asarray(m.triangles)
+if len(V) == 0 or len(F) == 0:
+    log("malla vacia, abortando"); sys.exit(1)
+log("malla %d vert %d caras" % (len(V), len(F)))
+
+# 2) UV unwrap (xatlas duplica vertices en costuras → vmapping mapea al original)
+vmapping, indices, uvs = xatlas.parametrize(V, F)
+Vn = np.ascontiguousarray(V[vmapping].astype(np.float64))
+Fn = np.ascontiguousarray(indices.astype(np.int32))
+UV = np.ascontiguousarray(uvs.astype(np.float64))
+log("UV unwrap: %d vert, uv[%.3f..%.3f]" % (len(Vn), UV.min(), UV.max()))
+
+# 3) escena de raycasting (para visibilidad/oclusion)
+mn = o3d.geometry.TriangleMesh()
+mn.vertices = o3d.utility.Vector3dVector(Vn)
+mn.triangles = o3d.utility.Vector3iVector(Fn)
+scene = o3d.t.geometry.RaycastingScene()
+scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mn))
+INVALID = scene.INVALID_ID
+
+# 4) intrinsecos (cameras.txt) + poses world->cam (images.txt)
+cams = {}
+for line in open(os.path.join(SPARSE_DIR, "cameras.txt")):
+    if line.startswith("#") or not line.strip(): continue
+    e = line.split()
+    cams[int(e[0])] = (int(e[2]), int(e[3]), float(e[4]), float(e[5]), float(e[6]), float(e[7]))
+
+def q2R(qw, qx, qy, qz):
+    n = (qw*qw + qx*qx + qy*qy + qz*qz) ** 0.5
+    qw, qx, qy, qz = qw/n, qx/n, qy/n, qz/n
+    return np.array([
+        [1-2*(qy*qy+qz*qz), 2*(qx*qy-qw*qz),   2*(qx*qz+qw*qy)],
+        [2*(qx*qy+qw*qz),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx)],
+        [2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx),   1-2*(qx*qx+qy*qy)]])
+
+views = []
+for line in open(os.path.join(SPARSE_DIR, "images.txt")):
+    if line.startswith("#") or not line.strip(): continue
+    e = line.split()
+    if len(e) >= 10 and (e[9].endswith(".png") or e[9].endswith(".jpg")):
+        qw, qx, qy, qz = map(float, e[1:5]); tx, ty, tz = map(float, e[5:8])
+        R = q2R(qw, qx, qy, qz); t = np.array([tx, ty, tz])
+        E = np.eye(4); E[:3, :3] = R; E[:3, 3] = t
+        views.append((int(e[8]), e[9], E, R, t))
+log("poses: %d camaras" % len(views))
+
+# 5) HORNEAR: por cada foto, raycast (visibilidad) + splat al texel promediando
+acc  = np.zeros((TEXSIZE, TEXSIZE, 3), np.float64)
+wsum = np.zeros((TEXSIZE, TEXSIZE), np.float64)
+Ktens = {}   # cache de tensores K (reutilizar EVITA un segfault de Open3D)
+nbaked = 0
+for cid, name, E, R, t in views:
+    if cid not in cams: continue
+    W, H, fx, fy, cx, cy = cams[cid]
+    path = os.path.join(IMAGES_DIR, name)
+    if not os.path.exists(path): continue
+    photo = np.asarray(Image.open(path).convert("RGB"), np.float32) / 255.0
+    Hp, Wp = photo.shape[:2]
+    sx = Wp / float(W); sy = Hp / float(H)   # por si la foto difiere de cameras.txt
+    key = (cid, Wp, Hp)
+    if key not in Ktens:
+        Ktens[key] = o3d.core.Tensor(np.array([[fx*sx, 0, cx*sx], [0, fy*sy, cy*sy], [0, 0, 1]]))
+    rays = scene.create_rays_pinhole(Ktens[key], o3d.core.Tensor(E), Wp, Hp)
+    ans = scene.cast_rays(rays)
+    tri  = ans['primitive_ids'].numpy().astype(np.int64)
+    bary = ans['primitive_uvs'].numpy().astype(np.float64)
+    nrm  = ans['primitive_normals'].numpy().astype(np.float64)
+    thit = ans['t_hit'].numpy()
+    del rays, ans
+    hit = np.isfinite(thit) & (tri != INVALID)
+    if hit.sum() == 0:
+        del photo; gc.collect(); continue
+    yy, xx = np.where(hit)
+    ti = tri[hit]; b1 = bary[hit][:, 0]; b2 = bary[hit][:, 1]; b0 = 1 - b1 - b2
+    uvt = UV[Fn[ti]]
+    uvp = b0[:, None]*uvt[:, 0] + b1[:, None]*uvt[:, 1] + b2[:, None]*uvt[:, 2]
+    col = photo[yy, xx]
+    # peso por angulo de vista: la camara que ve la superficie DE FRENTE pesa mas
+    P3 = Vn[Fn[ti]]
+    pos = b0[:, None]*P3[:, 0] + b1[:, None]*P3[:, 1] + b2[:, None]*P3[:, 2]
+    Ccam = -R.T @ t
+    vd = Ccam[None, :] - pos
+    vd /= (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-9)
+    nh = nrm[hit]; nh /= (np.linalg.norm(nh, axis=1, keepdims=True) + 1e-9)
+    w = np.clip(np.abs((nh*vd).sum(1)), 0.05, 1.0)
+    tx_i = np.clip(uvp[:, 0]*(TEXSIZE-1), 0, TEXSIZE-1).astype(int)
+    ty_i = np.clip((1-uvp[:, 1])*(TEXSIZE-1), 0, TEXSIZE-1).astype(int)
+    np.add.at(acc,  (ty_i, tx_i), col*w[:, None])
+    np.add.at(wsum, (ty_i, tx_i), w)
+    nbaked += 1
+    del photo, tri, bary, nrm, thit, hit, col; gc.collect()
+log("horneadas %d/%d camaras" % (nbaked, len(views)))
+if nbaked == 0:
+    log("ninguna camara horneada, abortando"); sys.exit(1)
+
+# 6) normalizar + rellenar costuras/huecos (dilatacion por vecinos)
+cov = wsum > 0
+tex = np.zeros((TEXSIZE, TEXSIZE, 3), np.float32)
+tex[cov] = (acc[cov] / wsum[cov, None]).astype(np.float32)
+log("cobertura textura %.1f%%" % (cov.mean()*100))
+mask = cov.copy()
+for _ in range(16):
+    if mask.all(): break
+    s = np.zeros_like(tex); c = np.zeros(mask.shape)
+    for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        sh = np.roll(np.roll(tex, dy, 0), dx, 1)
+        mh = np.roll(np.roll(mask, dy, 0), dx, 1).astype(np.float64)
+        s += sh * mh[..., None]; c += mh
+    fill = (~mask) & (c > 0)
+    tex[fill] = (s[fill] / c[fill, None]).astype(np.float32)
+    mask = mask | fill
+
+# 7) exportar .glb con la textura UV (color separado de la geometria)
+tex_img = Image.fromarray((np.clip(tex, 0, 1) * 255).astype(np.uint8))
+mesh_out = trimesh.Trimesh(vertices=Vn, faces=Fn, process=False)
+mesh_out.visual = trimesh.visual.TextureVisuals(uv=UV, image=tex_img)
+mesh_out.export(OUT_GLB)
+log("textura UV %dx%d exportada a .glb" % (TEXSIZE, TEXSIZE))
 '''
 
 
@@ -771,14 +930,42 @@ def main():
             log(f"   .glb (color por vértice + AO): {glb_final.stat().st_size/1e6:.1f} MB")
         except Exception as e:
             log(f"   ⚠ no se pudo exportar .glb ({e}); subo el .ply")
-        # Archivo a subir: el .glb si existe; si no, último recurso el .ply.
-        if glb_final.exists() and glb_final.stat().st_size > 1000:
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PASO 4c: HORNEAR TEXTURA UV (estilo Polycam) — FASE 0 de validación
+        # ──────────────────────────────────────────────────────────────────────
+        # Separa el color de la geometría: hornea una imagen de alta resolución
+        # sobre la malla (en vez de color por vértice). PROMEDIA todas las fotos
+        # visibles por texel usando las MISMAS imágenes y poses del entrenamiento
+        # 2DGS → no se tuerce como OpenMVS. Si falla, se sube el .glb de color por
+        # vértice (no se pierde el render). Esta corrida valida si la textura ALINEA.
+        glb_tex = WORK / "mesh_textured.glb"
+        try:
+            fase(0.94, "PASO 4c/5 — Horneando textura UV (estilo Polycam)")
+            bake_py = WORK / "bake_texture.py"
+            bake_py.write_text(TEXTURE_SCRIPT)
+            run(["python", str(bake_py), str(malla), str(dataset / "images"),
+                 str(dataset / "sparse" / "0"), str(glb_tex), "2048"],
+                fase_label="PASO 4c/5 — Horneando textura UV", check=False)
+            if glb_tex.exists() and glb_tex.stat().st_size > 1000:
+                log(f"   ✓ textura UV horneada: {glb_tex.stat().st_size/1e6:.1f} MB")
+            else:
+                log("   ⚠ el texturizado no produjo archivo; uso color por vértice")
+        except Exception as e:
+            log(f"   ⚠ texturizado falló ({e}); uso color por vértice (.glb)")
+
+        # Archivo a subir (orden de preferencia):
+        #   1º textura UV (estilo Polycam)  2º color por vértice + AO  3º .ply crudo
+        if glb_tex.exists() and glb_tex.stat().st_size > 1000:
+            archivo_subir = glb_tex
+            ply_mb = glb_tex.stat().st_size / 1e6
+        elif glb_final.exists() and glb_final.stat().st_size > 1000:
             archivo_subir = glb_final
             ply_mb = glb_final.stat().st_size / 1e6
         else:
             archivo_subir = malla
 
-        # ── PASO 5: subir la malla (.glb con color por vértice + AO) ──
+        # ── PASO 5: subir la malla ──
         fase(0.95, "PASO 5/5 — Subiendo malla")
         with open(archivo_subir, "rb") as f:
             req = urllib.request.Request(UPLOAD_URL_PLY, data=f.read(),
