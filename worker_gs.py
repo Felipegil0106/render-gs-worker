@@ -136,7 +136,7 @@ fimg.write("# Image list\n")
 # poses de 512px siguen siendo válidas; solo escalamos los intrínsecos al nuevo
 # tamaño. Para fotos 4:3 el recorte central es exacto; para otros formatos,
 # near-exact. Si una foto original falla, cae a la de 512px (no rompe la corrida).
-TRAIN_RES = 1000   # lado mayor de las imágenes de entrenamiento (antes 512px)
+TRAIN_RES = 1600   # lado mayor de las imágenes de entrenamiento (512px original → 1000 → 1600)
 print("ENTRENAMIENTO a %dpx (alta resolucion; poses a 512px)" % TRAIN_RES, flush=True)
 _n_hi = 0
 for i in range(N):
@@ -642,7 +642,7 @@ def main():
             #     NOTA: el .glb pesará más (~40-50 MB vs ~25). Si el visor va lento o
             #     pesa mucho, el siguiente paso es comprimir con Draco (sin perder
             #     detalle). FAIL-SAFE: si va lento en 3dviewer.net, bajar a 1.2M.
-            "target = 1500000\n"
+            "target = 2000000\n"
             "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             # --- LIMPIEZA PROFUNDA tras decimar (CLAVE para que el visor NO se cuelgue)
@@ -753,6 +753,21 @@ def main():
         glb_final = WORK / "mesh_2dgs.glb"
         try:
             sc = trimesh.load(str(malla), process=False)
+            # ── ARREGLO DEL FACETADO (probado): forzar el cálculo de NORMALES SUAVES
+            #    antes de exportar. Sin esto, trimesh exporta el .glb SIN normales y el
+            #    visor calcula normales PLANAS por triángulo → se ven los triángulos
+            #    (aspecto áspero/geométrico). Al acceder a vertex_normals, trimesh
+            #    promedia las caras por vértice (suave) y SÍ las mete en el .glb.
+            #    El color por vértice + AO se conserva intacto.
+            try:
+                if isinstance(sc, trimesh.Scene):
+                    for _g in sc.geometry.values():
+                        _ = _g.vertex_normals
+                else:
+                    _ = sc.vertex_normals
+                log("   normales suaves forzadas en el .glb (anti-facetado)")
+            except Exception as _ne:
+                log(f"   ⚠ no pude forzar normales ({_ne}); el visor podría facetar")
             sc.export(str(glb_final))
             log(f"   .glb (color por vértice + AO): {glb_final.stat().st_size/1e6:.1f} MB")
         except Exception as e:
