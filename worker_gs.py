@@ -791,16 +791,19 @@ def main():
             # solo alisa. FAIL-SAFE: si quita demasiado (bordes muy redondeados), bajar
             # a 3.
             "try:\n"
-            "    m = m.filter_smooth_taubin(number_of_iterations=5)\n"
-            "    print('SMOOTH Taubin 5 iter (alisa rugosidad/braille) OK', flush=True)\n"
+            "    m = m.filter_smooth_taubin(number_of_iterations=8)\n"
+            "    print('SMOOTH Taubin 8 iter (alisa rugosidad/braille) OK', flush=True)\n"
             "except Exception as e:\n"
             "    print('SMOOTH (fallo, sigo):', e, flush=True)\n"
-            # --- 3) DECIMAR a ~1.2M (BAJADO de 2M) — MÁS LIVIANO + MENOS BRAILLE ---
-            #     El detalle fino real no existe, así que menos triángulos NO pierde
-            #     nada importante, Y menos vértices = superficie menos granulada +
-            #     archivo más liviano (~32 MB vs ~53). Con normales suaves NO se ven
-            #     triángulos. FAIL-SAFE: si se ve muy simplón, subir a 1.5M.
-            "target = 1200000\n"
+            # --- 3) DECIMAR a ~300k (BAJADO de 1.2M) — MALLA LIGERA TIPO POLYCAM ---
+            #     Ahora el COLOR vive en la TEXTURA UV, no en los vértices. Entonces
+            #     la malla ya NO necesita ser densa para tener detalle: el detalle está
+            #     en la imagen. Menos triángulos = (1) MATA EL BRAILLE (superficie lisa,
+            #     no miles de triángulos visibles), (2) cada triángulo recibe MÁS pixeles
+            #     de textura → más definición, (3) desempaque UV (xatlas) ~4× más rápido.
+            #     300k es de sobra para la FORMA de un cuarto. FAIL-SAFE: si se ve muy
+            #     simplón/blocky, subir a 500k; si aún hay braille, bajar a 200k.
+            "target = 300000\n"
             "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             # --- LIMPIEZA PROFUNDA tras decimar (CLAVE para que el visor NO se cuelgue)
@@ -945,7 +948,7 @@ def main():
             bake_py = WORK / "bake_texture.py"
             bake_py.write_text(TEXTURE_SCRIPT)
             run(["python", str(bake_py), str(malla), str(dataset / "images"),
-                 str(dataset / "sparse" / "0"), str(glb_tex), "2048"],
+                 str(dataset / "sparse" / "0"), str(glb_tex), "4096"],
                 fase_label="PASO 4c/5 — Horneando textura UV", check=False)
             if glb_tex.exists() and glb_tex.stat().st_size > 1000:
                 log(f"   ✓ textura UV horneada: {glb_tex.stat().st_size/1e6:.1f} MB")
