@@ -228,7 +228,7 @@ print("MAST3R: points3D.txt escrito. LISTO.", flush=True)
 # superficies que realmente ve). El error de pose se reparte en un leve desenfoque,
 # no en cortes torcidos. Validado localmente con datos sintéticos.
 TEXTURE_SCRIPT = r'''
-import sys, os, gc
+import sys, os, gc, json, struct
 import numpy as np
 from PIL import Image
 print("   [tex] iniciando horneado de textura UV", flush=True)
@@ -366,8 +366,43 @@ for _ in range(16):
 # 7) exportar .glb con la textura UV (color separado de la geometria)
 tex_img = Image.fromarray((np.clip(tex, 0, 1) * 255).astype(np.uint8))
 mesh_out = trimesh.Trimesh(vertices=Vn, faces=Fn, process=False)
-mesh_out.visual = trimesh.visual.TextureVisuals(uv=UV, image=tex_img)
+# ── ARREGLO 1 (anti-facetado): forzar NORMALES SUAVES. Sin esto el .glb sale SIN
+#    normales y el visor calcula caras planas → se ven los triangulos. Al acceder a
+#    vertex_normals, trimesh promedia las caras por vertice (suave) y las mete al .glb.
+_ = mesh_out.vertex_normals
+# ── ARREGLO 2 (anti-oscuro): material MATE NO-METALICO. Por defecto glTF asume
+#    metallic=1.0 → la superficie sale OSCURA sin reflejos de entorno. metallic=0 +
+#    roughness=1 = superficie mate que muestra bien la textura.
+_mat = trimesh.visual.material.PBRMaterial(
+    baseColorTexture=tex_img, metallicFactor=0.0, roughnessFactor=1.0)
+mesh_out.visual = trimesh.visual.TextureVisuals(uv=UV, image=tex_img, material=_mat)
 mesh_out.export(OUT_GLB)
+
+# ── ARREGLO 3 (anti-oscuro, definitivo): marcar el material como KHR_materials_unlit.
+#    Las fotos YA traen la iluminacion real horneada, asi que NO queremos que el visor
+#    la re-ilumine. "unlit" = el visor muestra la textura tal cual (ni oscura ni quemada).
+try:
+    _d = bytearray(open(OUT_GLB, "rb").read())
+    _jlen = struct.unpack("<I", _d[12:16])[0]
+    _g = json.loads(_d[20:20+_jlen].decode("utf-8"))
+    _g.setdefault("extensionsUsed", [])
+    if "KHR_materials_unlit" not in _g["extensionsUsed"]:
+        _g["extensionsUsed"].append("KHR_materials_unlit")
+    for _m in _g.get("materials", []):
+        _m.setdefault("extensions", {})["KHR_materials_unlit"] = {}
+    _nj = json.dumps(_g, separators=(",", ":")).encode("utf-8")
+    while len(_nj) % 4:
+        _nj += b" "
+    _bin = _d[20+_jlen:]
+    _out = bytearray()
+    _out += _d[:12]
+    _out += struct.pack("<I", len(_nj)) + b"JSON" + _nj
+    _out += _bin
+    struct.pack_into("<I", _out, 8, len(_out))
+    open(OUT_GLB, "wb").write(_out)
+    log("material marcado unlit (textura sin re-iluminacion)")
+except Exception as _e:
+    log("no pude marcar unlit (%s); sigo con material mate" % _e)
 log("textura UV %dx%d exportada a .glb" % (TEXSIZE, TEXSIZE))
 '''
 
@@ -795,15 +830,14 @@ def main():
             "    print('SMOOTH Taubin 8 iter (alisa rugosidad/braille) OK', flush=True)\n"
             "except Exception as e:\n"
             "    print('SMOOTH (fallo, sigo):', e, flush=True)\n"
-            # --- 3) DECIMAR a ~300k (BAJADO de 1.2M) — MALLA LIGERA TIPO POLYCAM ---
-            #     Ahora el COLOR vive en la TEXTURA UV, no en los vértices. Entonces
-            #     la malla ya NO necesita ser densa para tener detalle: el detalle está
-            #     en la imagen. Menos triángulos = (1) MATA EL BRAILLE (superficie lisa,
-            #     no miles de triángulos visibles), (2) cada triángulo recibe MÁS pixeles
-            #     de textura → más definición, (3) desempaque UV (xatlas) ~4× más rápido.
-            #     300k es de sobra para la FORMA de un cuarto. FAIL-SAFE: si se ve muy
-            #     simplón/blocky, subir a 500k; si aún hay braille, bajar a 200k.
-            "target = 300000\n"
+            # --- 3) DECIMAR a ~600k — MALLA LIGERA pero SIN FRAGMENTARSE ---
+            #     300k fragmentó la malla en >1000 pedazos (la pieza principal cayó al
+            #     85%) → eso causaba HUECOS. 600k es bastante más suave: malla ligera
+            #     (color en la textura, no en vértices) PERO conserva la conectividad,
+            #     sin huecos. Con NORMALES SUAVES en el .glb NO se ven triángulos aunque
+            #     haya 600k. FAIL-SAFE: si vuelven huecos, subir a 900k; si pesa mucho
+            #     o el desempaque UV tarda, bajar a 450k.
+            "target = 600000\n"
             "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             # --- LIMPIEZA PROFUNDA tras decimar (CLAVE para que el visor NO se cuelgue)
