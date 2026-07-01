@@ -249,6 +249,15 @@ TEXSIZE    = int(sys.argv[5]) if len(sys.argv) > 5 else 2048
 
 def log(s): print("   [tex] " + s, flush=True)
 
+# Conversion sRGB <-> lineal. Las fotos vienen en sRGB (gamma). Promediar en sRGB
+# OSCURECE (promedio de blanco+negro da 50% de valor pero solo ~22% de luz). Hay que
+# convertir a LINEAL, promediar, y volver a sRGB. Arregla la oscuridad en bordes/sombras.
+def srgb_to_linear(c):
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+def linear_to_srgb(c):
+    c = np.maximum(c, 0.0)
+    return np.clip(np.where(c <= 0.0031308, c * 12.92, 1.055 * (c ** (1 / 2.4)) - 0.055), 0, 1)
+
 # 1) malla
 m = o3d.io.read_triangle_mesh(MESH_PLY)
 V = np.asarray(m.vertices); F = np.asarray(m.triangles)
@@ -308,6 +317,7 @@ for cid, name, E, R, t in views:
     path = os.path.join(IMAGES_DIR, name)
     if not os.path.exists(path): continue
     photo = np.asarray(Image.open(path).convert("RGB"), np.float32) / 255.0
+    photo = srgb_to_linear(photo)   # a LINEAL para promediar bien (anti-oscuro)
     Hp, Wp = photo.shape[:2]
     sx = Wp / float(W); sy = Hp / float(H)   # por si la foto difiere de cameras.txt
     key = (cid, Wp, Hp)
@@ -336,6 +346,12 @@ for cid, name, E, R, t in views:
     vd /= (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-9)
     nh = nrm[hit]; nh /= (np.linalg.norm(nh, axis=1, keepdims=True) + 1e-9)
     w = np.clip(np.abs((nh*vd).sum(1)), 0.05, 1.0)
+    # ARREGLO BORROSO: elevar el peso a la 4 → la vista que ve la superficie DE FRENTE
+    # domina mucho más que las oblicuas. Como las poses tienen error (~0.1°), promediar
+    # muchas vistas desalineadas desenfoca; al dar casi todo el peso a la mejor vista, la
+    # textura sale MÁS NÍTIDA (menos "tela"/borroso). Sin costuras duras (sigue siendo
+    # promedio, solo muy sesgado a la mejor vista).
+    w = w ** 4
     tx_i = np.clip(uvp[:, 0]*(TEXSIZE-1), 0, TEXSIZE-1).astype(int)
     ty_i = np.clip((1-uvp[:, 1])*(TEXSIZE-1), 0, TEXSIZE-1).astype(int)
     np.add.at(acc,  (ty_i, tx_i), col*w[:, None])
@@ -346,10 +362,13 @@ log("horneadas %d/%d camaras" % (nbaked, len(views)))
 if nbaked == 0:
     log("ninguna camara horneada, abortando"); sys.exit(1)
 
-# 6) normalizar + rellenar costuras/huecos (dilatacion por vecinos)
+# 6) normalizar (en LINEAL) + volver a sRGB + realce de brillo
 cov = wsum > 0
 tex = np.zeros((TEXSIZE, TEXSIZE, 3), np.float32)
-tex[cov] = (acc[cov] / wsum[cov, None]).astype(np.float32)
+tex_lin = np.zeros((TEXSIZE, TEXSIZE, 3), np.float32)
+tex_lin[cov] = (acc[cov] / wsum[cov, None]).astype(np.float32)   # promedio en LINEAL
+tex[cov] = linear_to_srgb(tex_lin[cov])                          # de vuelta a sRGB
+tex[cov] = np.clip(tex[cov] ** 0.8, 0, 1)                        # gamma 0.8 = realce de brillo (anti-oscuro)
 log("cobertura textura %.1f%%" % (cov.mean()*100))
 mask = cov.copy()
 for _ in range(16):
@@ -830,14 +849,13 @@ def main():
             "    print('SMOOTH Taubin 8 iter (alisa rugosidad/braille) OK', flush=True)\n"
             "except Exception as e:\n"
             "    print('SMOOTH (fallo, sigo):', e, flush=True)\n"
-            # --- 3) DECIMAR a ~600k — MALLA LIGERA pero SIN FRAGMENTARSE ---
-            #     300k fragmentó la malla en >1000 pedazos (la pieza principal cayó al
-            #     85%) → eso causaba HUECOS. 600k es bastante más suave: malla ligera
-            #     (color en la textura, no en vértices) PERO conserva la conectividad,
-            #     sin huecos. Con NORMALES SUAVES en el .glb NO se ven triángulos aunque
-            #     haya 600k. FAIL-SAFE: si vuelven huecos, subir a 900k; si pesa mucho
-            #     o el desempaque UV tarda, bajar a 450k.
-            "target = 600000\n"
+            # --- 3) DECIMAR a ~1.2M — la config que MEJOR se vio (Fase 0) ---
+            #     Decimar agresivo (a 300k/600k) FRAGMENTÓ la malla en >1000 pedazos
+            #     → eso causaba los HUECOS. 1.2M es una reducción suave (~2×) que NO
+            #     rompe la malla. Con NORMALES SUAVES en el .glb no se ven triángulos
+            #     aunque sea densa. FAIL-SAFE: si pesa mucho, probar 900k (sin bajar
+            #     de ahí, porque por debajo empieza a fragmentar y salen huecos).
+            "target = 1200000\n"
             "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             # --- LIMPIEZA PROFUNDA tras decimar (CLAVE para que el visor NO se cuelgue)
@@ -982,7 +1000,7 @@ def main():
             bake_py = WORK / "bake_texture.py"
             bake_py.write_text(TEXTURE_SCRIPT)
             run(["python", str(bake_py), str(malla), str(dataset / "images"),
-                 str(dataset / "sparse" / "0"), str(glb_tex), "4096"],
+                 str(dataset / "sparse" / "0"), str(glb_tex), "2048"],
                 fase_label="PASO 4c/5 — Horneando textura UV", check=False)
             if glb_tex.exists() and glb_tex.stat().st_size > 1000:
                 log(f"   ✓ textura UV horneada: {glb_tex.stat().st_size/1e6:.1f} MB")
