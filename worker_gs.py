@@ -426,6 +426,351 @@ log("textura UV %dx%d exportada a .glb" % (TEXSIZE, TEXSIZE))
 '''
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# BA_SCRIPT — PASO 2b: afinar poses con Bundle Adjustment (pycolmap).
+# Las poses de MASt3R traen ~0.1° de error angular; ese error emborrona la
+# textura al proyectar las fotos. Aquí: (1) SIFT en las fotos, (2) matching
+# secuencial, (3) triangular puntos 3D con las poses MASt3R FIJAS, (4) Bundle
+# Adjustment que afina poses+focal (centro óptico fijo: 2DGS lo exige),
+# (5) VALIDAR y solo entonces escribir. Si algo no cuadra → exit 2 y el
+# worker sigue con las poses MASt3R originales (respaldo en sparse/0_mast3r).
+# ═════════════════════════════════════════════════════════════════════════
+BA_SCRIPT = r'''
+import sys, os, shutil, time, traceback
+def log(s): print("   [ba] " + s, flush=True)
+
+IMAGES = sys.argv[1]   # dataset/images (fotos de entrenamiento)
+SPARSE = sys.argv[2]   # dataset/sparse/0 (modelo COLMAP texto de MASt3R)
+WORKD  = sys.argv[3]   # carpeta de trabajo
+
+try:
+    import pycolmap
+except Exception as e:
+    log("pycolmap no esta en la imagen (%s): dejo poses MASt3R" % e); sys.exit(2)
+
+os.makedirs(WORKD, exist_ok=True)
+db = os.path.join(WORKD, "ba.db")
+if os.path.exists(db): os.remove(db)
+t0 = time.time()
+try:
+    rec_in = pycolmap.Reconstruction(SPARSE)
+    n_in = rec_in.num_reg_images()
+    log("modelo MASt3R: %d camaras, %d puntos" % (n_in, rec_in.num_points3D()))
+
+    # 1) puntos SIFT (CPU)
+    ro = pycolmap.ImageReaderOptions(); ro.camera_model = "PINHOLE"
+    so = pycolmap.SiftExtractionOptions(); so.max_num_features = 4096
+    try: so.use_gpu = False
+    except Exception: pass
+    pycolmap.extract_features(db, IMAGES, camera_mode=pycolmap.CameraMode.SINGLE,
+                              reader_options=ro, sift_options=so)
+    log("SIFT extraido (%.0fs)" % (time.time() - t0))
+
+    # 2) matching secuencial (video: los frames vecinos se solapan)
+    po = pycolmap.SequentialPairingOptions()
+    try: po.overlap = 20
+    except Exception: pass
+    try: po.loop_detection = False
+    except Exception: pass
+    pycolmap.match_sequential(db, pairing_options=po)
+    log("matching secuencial OK (%.0fs)" % (time.time() - t0))
+
+    # 3) triangular con poses MASt3R FIJAS
+    tri_dir = os.path.join(WORKD, "tri"); os.makedirs(tri_dir, exist_ok=True)
+    rec = pycolmap.triangulate_points(rec_in, db, IMAGES, tri_dir)
+    log("triangulados %d puntos, err %.2f px" % (rec.num_points3D(),
+        rec.compute_mean_reprojection_error()))
+
+    # 4) Bundle Adjustment (afina poses + focal; centro optico FIJO)
+    bo = pycolmap.BundleAdjustmentOptions()
+    try:
+        bo.refine_focal_length = True
+        bo.refine_principal_point = False
+        bo.refine_extra_params = False
+    except Exception: pass
+    r = pycolmap.bundle_adjustment(rec, bo)
+    if r is not None: rec = r
+    err = rec.compute_mean_reprojection_error()
+    npts = rec.num_points3D(); nreg = rec.num_reg_images()
+    log("BA hecho: %d camaras, %d puntos, err %.2f px (%.0fs)" % (nreg, npts, err, time.time() - t0))
+
+    # 5) VALIDAR antes de tocar nada
+    if nreg != n_in:
+        log("VALIDACION FALLO: %d/%d camaras registradas -> dejo poses MASt3R" % (nreg, n_in)); sys.exit(2)
+    if npts < 5000:
+        log("VALIDACION FALLO: solo %d puntos (<5000) -> dejo poses MASt3R" % npts); sys.exit(2)
+    if err > 2.5:
+        log("VALIDACION FALLO: error reproyeccion %.2f px (>2.5) -> dejo poses MASt3R" % err); sys.exit(2)
+
+    # 6) color de los puntos (para el init de 2DGS); si falla, siguen sin color
+    try:
+        rec.extract_colors_for_all_images(IMAGES)
+    except Exception as e:
+        log("colores de puntos no extraidos (%s), sigo" % e)
+
+    # 7) respaldo y escritura del modelo refinado
+    bak = os.path.join(os.path.dirname(SPARSE), "0_mast3r")
+    if os.path.exists(bak): shutil.rmtree(bak)
+    shutil.copytree(SPARSE, bak)
+    rec.write_text(SPARSE)
+    log("poses REFINADAS escritas en sparse/0 (respaldo: sparse/0_mast3r)")
+    sys.exit(0)
+except SystemExit:
+    raise
+except Exception as e:
+    log("fallo inesperado: %s" % e)
+    traceback.print_exc()
+    sys.exit(2)
+'''
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PRIORS_SCRIPT — PASO 2c: priors monoculares por foto.
+# PROFUNDIDAD: Depth Anything V2 Metric-Indoor (vitb) → metros.
+# NORMALES: DSINE (si su checkpoint está en la imagen); si no, fallback de
+# normales-desde-profundidad (unproyectar con K + producto cruz).
+# Guarda <foto>.npz con depth (H,W f16) y normal (3,H,W f16, espacio CÁMARA
+# OpenCV apuntando HACIA la cámara). El train de 2DGS los usa para anclar
+# techos/paredes lisas → menos huecos, techo continuo.
+# Rutas sobreescribibles por entorno (para pruebas): DAV2_DIR, DSINE_DIR,
+# MODELS_DIR, PRIORS_INPUT_SIZE.
+# ═════════════════════════════════════════════════════════════════════════
+PRIORS_SCRIPT = r'''
+import sys, os, gc, traceback
+import numpy as np
+def log(s): print("   [priors] " + s, flush=True)
+
+IMAGES = sys.argv[1]; SPARSE = sys.argv[2]; OUT = sys.argv[3]
+DAV2_DIR   = os.environ.get("DAV2_DIR", "/opt/depth_anything_v2")
+DSINE_DIR  = os.environ.get("DSINE_DIR", "/opt/dsine")
+MODELS_DIR = os.environ.get("MODELS_DIR", "/opt/models")
+INSZ       = int(os.environ.get("PRIORS_INPUT_SIZE", "518"))
+os.makedirs(OUT, exist_ok=True)
+
+import torch
+import cv2
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
+log("dispositivo: %s" % DEV)
+
+# ---- leer camaras e imagenes del modelo COLMAP (texto) ----
+cams = {}
+with open(os.path.join(SPARSE, "cameras.txt")) as f:
+    for ln in f:
+        if ln.startswith("#") or not ln.strip(): continue
+        e = ln.split(); cid = int(e[0]); mdl = e[1]
+        W = int(e[2]); H = int(e[3]); p = [float(x) for x in e[4:]]
+        if mdl == "PINHOLE": fx, fy, cx, cy = p[0], p[1], p[2], p[3]
+        else: fx = fy = p[0]; cx, cy = p[1], p[2]
+        cams[cid] = (W, H, fx, fy, cx, cy)
+imgs = []
+with open(os.path.join(SPARSE, "images.txt")) as f:
+    raw = [l for l in f if not l.startswith("#")]
+i = 0
+while i < len(raw):
+    ln = raw[i].strip()
+    if ln:
+        e = ln.split()
+        if len(e) >= 10 and e[8].isdigit():
+            imgs.append((e[9], int(e[8]))); i += 2; continue
+    i += 1
+if not imgs:
+    log("no hay imagenes en images.txt"); sys.exit(1)
+log("%d imagenes en el modelo" % len(imgs))
+
+# ============ FASE 1: PROFUNDIDAD (Depth Anything V2 Metric-Indoor) ============
+ck_d = os.path.join(MODELS_DIR, "depth_anything_v2_metric_hypersim_vitb.pth")
+if not os.path.exists(ck_d):
+    log("falta el checkpoint de profundidad %s" % ck_d); sys.exit(1)
+sys.path.insert(0, os.path.join(DAV2_DIR, "metric_depth"))
+from depth_anything_v2.dpt import DepthAnythingV2
+md = DepthAnythingV2(encoder="vitb", features=128,
+                     out_channels=[96, 192, 384, 768], max_depth=20.0)
+md.load_state_dict(torch.load(ck_d, map_location="cpu"))
+md = md.to(DEV).eval()
+log("Depth Anything V2 (metric indoor) cargado")
+depths = {}
+with torch.no_grad():
+    for k, (name, cid) in enumerate(imgs):
+        bgr = cv2.imread(os.path.join(IMAGES, name))
+        if bgr is None:
+            log("no pude leer %s, la salto" % name); continue
+        d = md.infer_image(bgr, input_size=INSZ)   # HxW float32 (metros)
+        depths[name] = np.asarray(d, np.float16)
+        if (k + 1) % 20 == 0 or (k + 1) == len(imgs):
+            log("profundidad %d/%d" % (k + 1, len(imgs)))
+if not depths:
+    log("ninguna profundidad calculada"); sys.exit(1)
+_d0 = depths[next(iter(depths))].astype(np.float32)
+log("profundidad img0: %.2f..%.2f m" % (float(_d0.min()), float(_d0.max())))
+del md; gc.collect()
+if DEV == "cuda": torch.cuda.empty_cache()
+
+# ============ FASE 2: NORMALES (DSINE; fallback desde profundidad) ============
+def normal_desde_profundidad(d32, fx, fy, cx, cy):
+    H, W = d32.shape
+    xs, ys = np.meshgrid(np.arange(W, dtype=np.float32),
+                         np.arange(H, dtype=np.float32))
+    X = (xs - cx) / fx * d32; Y = (ys - cy) / fy * d32; Z = d32
+    P = np.stack([X, Y, Z], 0)                        # 3,H,W espacio camara OpenCV
+    dPy = np.stack([np.gradient(P[c], axis=0) for c in range(3)], 0)
+    dPx = np.stack([np.gradient(P[c], axis=1) for c in range(3)], 0)
+    n = np.cross(dPy.reshape(3, -1).T, dPx.reshape(3, -1).T).T.reshape(3, H, W)
+    nn = np.linalg.norm(n, axis=0, keepdims=True)
+    n = n / np.maximum(nn, 1e-8)
+    flip = (n * P).sum(0) > 0                         # que apunte HACIA la camara
+    n[:, flip] = -n[:, flip]
+    return n.astype(np.float16)
+
+dsine = None
+ck_n = os.path.join(MODELS_DIR, "dsine.pt")
+if os.path.exists(ck_n):
+    try:
+        sys.path.insert(0, DSINE_DIR)   # PRIMERO: sus 'models'/'utils' ganan a 2DGS
+        import geffnet
+        _og = geffnet.create_model
+        geffnet.create_model = lambda *a, **k: _og(*a, **{**k, "pretrained": False})
+        from models.dsine import DSINE as _DSINE
+        import utils.utils as _du
+        import torch.nn.functional as _F
+        from torchvision import transforms as _T
+        dsine = _DSINE()
+        _sd = torch.load(ck_n, map_location="cpu")
+        _sd = _sd.get("model", _sd) if isinstance(_sd, dict) else _sd
+        try:
+            dsine.load_state_dict(_sd)
+        except Exception:
+            dsine.load_state_dict(_sd, strict=False)
+            log("DSINE: pesos cargados con strict=False")
+        dsine = dsine.to(DEV).eval()
+        try: dsine.pixel_coords = dsine.pixel_coords.to(DEV)
+        except Exception: pass
+        _norm = _T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        log("DSINE cargado (normales de alta calidad)")
+    except Exception as e:
+        log("DSINE no cargo (%s): usare normales-desde-profundidad" % e)
+        traceback.print_exc()
+        dsine = None
+else:
+    log("dsine.pt no esta en la imagen: usare normales-desde-profundidad")
+
+nok = 0
+with torch.no_grad():
+    for k, (name, cid) in enumerate(imgs):
+        if name not in depths or cid not in cams: continue
+        W, H, fx, fy, cx, cy = cams[cid]
+        d16 = depths[name]
+        normal = None
+        if dsine is not None:
+            try:
+                bgr = cv2.imread(os.path.join(IMAGES, name))
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(DEV)
+                _, _, Hi, Wi = t.shape
+                pl, pr, pt, pb = _du.pad_input(Hi, Wi)
+                t = _F.pad(t, (pl, pr, pt, pb), mode="constant", value=0.0)
+                t = _norm(t)
+                K = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                                 dtype=torch.float32, device=DEV).unsqueeze(0)
+                K[:, 0, 2] += pl; K[:, 1, 2] += pt
+                out = dsine(t, intrins=K)[-1]
+                n = out[:, :3, pt:pt + Hi, pl:pl + Wi]
+                n = torch.nn.functional.normalize(n, dim=1)
+                normal = n[0].float().cpu().numpy().astype(np.float16)
+            except Exception as e:
+                log("DSINE fallo en %s (%s): fallback" % (name, e))
+                normal = None
+        if normal is None:
+            normal = normal_desde_profundidad(d16.astype(np.float32), fx, fy, cx, cy)
+        base = os.path.splitext(name)[0]
+        np.savez_compressed(os.path.join(OUT, base + ".npz"),
+                            depth=d16, normal=normal)
+        nok += 1
+        if (k + 1) % 20 == 0 or (k + 1) == len(imgs):
+            log("normales %d/%d" % (k + 1, len(imgs)))
+log("LISTO: %d priors guardados" % nok)
+sys.exit(0 if nok > 0 else 1)
+'''
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Parche de PRIORS al train.py de 2DGS (validado con test matemático local):
+# PRIOR_UTILS se inyecta tras "import uuid"; PRIOR_LOSS reemplaza la línea del
+# total_loss. Añade: L_depth (alineación escala+desplaz. por mínimos cuadrados,
+# estilo MonoSDF/DN-Splatter, con guardián s>0) y L_normal (1−coseno, con la
+# MISMA transformación cámara→mundo del renderer de 2DGS). Todo se controla
+# por entorno: MONO_PRIORS_DIR (si está vacío, NO hace nada), MONO_LAMBDA_DEPTH
+# (0.2), MONO_LAMBDA_NORMAL (0.1), MONO_FROM_ITER (100).
+# ═════════════════════════════════════════════════════════════════════════
+TRAIN_ANCHOR = "        total_loss = loss + dist_loss + normal_loss\n"
+
+PRIOR_UTILS = r'''
+# ======= PRIORS MONOCULARES (inyectado por el worker; DN-Splatter style) =======
+import numpy as _np
+_PRIORS_DIR = os.environ.get("MONO_PRIORS_DIR", "")
+_L_DEPTH = float(os.environ.get("MONO_LAMBDA_DEPTH", "0.2"))
+_L_NORM  = float(os.environ.get("MONO_LAMBDA_NORMAL", "0.1"))
+_P_FROM  = int(os.environ.get("MONO_FROM_ITER", "100"))
+_prior_cache = {}
+def _get_prior(name):
+    if not _PRIORS_DIR: return None
+    if name in _prior_cache: return _prior_cache[name]
+    p = os.path.join(_PRIORS_DIR, name + ".npz")
+    if not os.path.exists(p):
+        _prior_cache[name] = None; return None
+    try:
+        z = _np.load(p)
+        d = torch.from_numpy(z["depth"].astype(_np.float32))
+        n = torch.from_numpy(z["normal"].astype(_np.float32))
+        _prior_cache[name] = (d, n)
+    except Exception:
+        _prior_cache[name] = None
+    return _prior_cache[name]
+
+def _mono_losses(viewpoint_cam, render_pkg):
+    pr = _get_prior(viewpoint_cam.image_name)
+    if pr is None:
+        return None
+    d_mono, n_mono = pr
+    sd_full = render_pkg["surf_depth"]
+    dev = sd_full.device
+    H = viewpoint_cam.image_height; W = viewpoint_cam.image_width
+    d_mono = d_mono.to(dev); n_mono = n_mono.to(dev)
+    if d_mono.shape[0] != H or d_mono.shape[1] != W:
+        d_mono = torch.nn.functional.interpolate(d_mono[None, None], (H, W), mode="bilinear", align_corners=False)[0, 0]
+        n_mono = torch.nn.functional.interpolate(n_mono[None], (H, W), mode="bilinear", align_corners=False)[0]
+        n_mono = torch.nn.functional.normalize(n_mono, dim=0, eps=1e-6)
+    # --- profundidad: alinear escala+desplazamiento (minimos cuadrados, estilo MonoSDF) ---
+    sd = sd_full[0]
+    alpha = render_pkg["rend_alpha"][0].detach()
+    m = (alpha > 0.5) & (d_mono > 1e-4) & torch.isfinite(sd.detach()) & (sd.detach() > 1e-4)
+    L_d = sd.new_tensor(0.0)
+    if m.sum() > 500:
+        x = d_mono[m]; y = sd[m].detach()
+        mx = x.mean(); my = y.mean()
+        vx = ((x - mx) * (x - mx)).mean()
+        cov = ((x - mx) * (y - my)).mean()
+        s = cov / (vx + 1e-8); t = my - s * mx
+        if torch.isfinite(s) and s > 1e-4:
+            d_al = (s * d_mono + t).detach()
+            L_d = torch.abs(sd - d_al)[m].mean()
+    # --- normales: prior (espacio de camara) -> mundo, coseno vs rend_normal ---
+    n_world = (n_mono.permute(1, 2, 0) @ (viewpoint_cam.world_view_transform[:3, :3].T)).permute(2, 0, 1)
+    rn = render_pkg["rend_normal"]
+    cosine = (rn * n_world).sum(dim=0)
+    L_n = ((1.0 - cosine) * m.float()).sum() / (m.float().sum() + 1e-6)
+    return L_d, L_n
+# ======= fin priors =======
+'''
+
+PRIOR_LOSS = r'''        mono_loss = 0.0
+        if _PRIORS_DIR and iteration >= _P_FROM:
+            _ml = _mono_losses(viewpoint_cam, render_pkg)
+            if _ml is not None:
+                mono_loss = _L_DEPTH * _ml[0] + _L_NORM * _ml[1]
+        total_loss = loss + dist_loss + normal_loss + mono_loss
+'''
+
+
 # Buffer del log completo (se manda al backend en cada heartbeat y al final).
 _LOG = []
 def log(msg):
@@ -516,7 +861,7 @@ def main():
     t0 = time.time()
     hb = threading.Thread(target=_latido, daemon=True); hb.start()
     try:
-        log(f"═══ render-gs-worker 2DGS · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
+        log(f"═══ render-gs-worker 2DGS · v4-priors · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
         fase(0.05, "PASO 1/5 — Descargando fotos")
@@ -581,6 +926,52 @@ def main():
             log(f"   (no se pudo contar cámaras: {e})")
         log("   MASt3R OK (cámaras PINHOLE, sin necesidad de undistort)")
 
+        # ── PASO 2b: afinar poses con Bundle Adjustment (pycolmap) ──
+        # MASt3R deja un error de pose pequeño (~0.1°) que emborrona la textura
+        # al promediar vistas. Re-triangulamos puntos SIFT manteniendo las poses
+        # de MASt3R fijas y luego un BA clásico las pule. Si pycolmap no está o
+        # el resultado no pasa las validaciones, el script sale con código 2 y
+        # seguimos con las poses originales (el render NO se pierde por esto).
+        # Apagable sin rebuild: variable de entorno POSE_BA=0.
+        if os.environ.get("POSE_BA", "1") != "0":
+            fase(0.40, "PASO 2b/5 — Afinando poses (bundle adjustment)")
+            ba_py = WORK / "pose_ba.py"
+            ba_py.write_text(BA_SCRIPT)
+            _rc_ba, _ = run(["python", str(ba_py), str(dataset / "images"),
+                             str(dataset / "sparse" / "0"), str(WORK / "ba_work")],
+                            check=False)
+            if _rc_ba == 0:
+                log("   ✓ poses REFINADAS con BA (respaldo MASt3R en sparse/0_mast3r)")
+            else:
+                log(f"   BA no aplicado (rc={_rc_ba}): sigo con las poses MASt3R")
+        else:
+            log("   PASO 2b saltado (POSE_BA=0)")
+
+        # ── PASO 2c: priors monoculares (profundidad + normales) por foto ──
+        # Un modelo entrenado en millones de interiores "adivina" la profundidad
+        # y la orientación (normal) de cada pixel de CADA foto. Con eso el
+        # entrenamiento sabe qué hacer en paredes/techos lisos donde las fotos
+        # solas no anclan nada: cierra huecos y deja el techo continuo.
+        # Si algo falla, seguimos sin priors (el render no se pierde).
+        # Apagable sin rebuild: MONO_PRIORS=0.
+        if os.environ.get("MONO_PRIORS", "1") != "0":
+            fase(0.42, "PASO 2c/5 — Priors monoculares (profundidad+normales)")
+            pri_py = WORK / "make_priors.py"
+            pri_py.write_text(PRIORS_SCRIPT)
+            priors_dir = dataset / "priors"
+            _rc_pr, _ = run(["python", str(pri_py), str(dataset / "images"),
+                             str(dataset / "sparse" / "0"), str(priors_dir)],
+                            check=False)
+            _n_npz = len(list(priors_dir.glob("*.npz"))) if priors_dir.exists() else 0
+            if _rc_pr == 0 and _n_npz > 0:
+                os.environ["MONO_PRIORS_DIR"] = str(priors_dir)
+                log(f"   ✓ {_n_npz} priors listos (se usarán en el entrenamiento)")
+            else:
+                log(f"   priors no disponibles (rc={_rc_pr}, n={_n_npz}): "
+                    "entreno sin priors como hasta ahora")
+        else:
+            log("   PASO 2c saltado (MONO_PRIORS=0)")
+
         # ── PARCHE matplotlib en 2DGS ──
         # 2DGS usa fig.canvas.tostring_rgb() en su función colormap(), pero
         # matplotlib 3.8+ ELIMINÓ ese método (ahora es buffer_rgba). Esa función
@@ -625,6 +1016,27 @@ def main():
                 log("   semilla fija inyectada en train.py (reproducibilidad)")
         except Exception as e:
             log(f"   (no se pudo inyectar semilla en train.py: {e})")
+
+        # ── PARCHE de PRIORS MONOCULARES en train.py de 2DGS ──
+        # Inyecta (1) las utilidades que cargan los .npz del PASO 2c y (2) las dos
+        # pérdidas nuevas (profundidad alineada por escala + normales) justo donde
+        # 2DGS suma su pérdida total. El parche solo ACTÚA en runtime si
+        # MONO_PRIORS_DIR está definido (o sea, si el PASO 2c dejó priors listos);
+        # si no hay priors, train.py se comporta exactamente igual que antes.
+        try:
+            tp = Path("/opt/2dgs/train.py")
+            tptxt = tp.read_text()
+            if "_mono_losses" in tptxt:
+                log("   parche de priors ya presente en train.py")
+            elif "import uuid" in tptxt and TRAIN_ANCHOR in tptxt:
+                tptxt = tptxt.replace("import uuid", "import uuid" + PRIOR_UTILS, 1)
+                tptxt = tptxt.replace(TRAIN_ANCHOR, PRIOR_LOSS, 1)
+                tp.write_text(tptxt)
+                log("   parche de priors monoculares inyectado en train.py")
+            else:
+                log("   AVISO: no encontré las anclas en train.py — entreno SIN priors")
+        except Exception as e:
+            log(f"   (no se pudo parchear priors en train.py: {e})")
 
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
