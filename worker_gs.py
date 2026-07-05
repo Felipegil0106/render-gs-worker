@@ -266,7 +266,19 @@ if len(V) == 0 or len(F) == 0:
 log("malla %d vert %d caras" % (len(V), len(F)))
 
 # 2) UV unwrap (xatlas duplica vertices en costuras → vmapping mapea al original)
+# AVISO: esta llamada es UNA sola funcion C++ SIN progreso: con ~1.2M de caras
+# tarda 25-90 min segun el pod. El hilo de abajo imprime un latido cada 2 min
+# para que el log demuestre que sigue vivo y nadie cancele por susto.
+print("   [tex] desdoblando UV (xatlas) sobre %d caras: fase LARGA (25-90 min) SIN barra de progreso; NO cancelar" % len(F), flush=True)
+import threading as _th, time as _tt
+_t0 = _tt.time(); _fin = _th.Event()
+def _latido():
+    while not _fin.wait(120):
+        print("   [tex] xatlas sigue trabajando... %.0f min" % ((_tt.time()-_t0)/60.0), flush=True)
+_th.Thread(target=_latido, daemon=True).start()
 vmapping, indices, uvs = xatlas.parametrize(V, F)
+_fin.set()
+print("   [tex] UV desdoblado en %.1f min" % ((_tt.time()-_t0)/60.0), flush=True)
 Vn = np.ascontiguousarray(V[vmapping].astype(np.float64))
 Fn = np.ascontiguousarray(indices.astype(np.int32))
 UV = np.ascontiguousarray(uvs.astype(np.float64))
@@ -435,18 +447,199 @@ log("textura UV %dx%d exportada a .glb" % (TEXSIZE, TEXSIZE))
 # (5) VALIDAR y solo entonces escribir. Si algo no cuadra → exit 2 y el
 # worker sigue con las poses MASt3R originales (respaldo en sparse/0_mast3r).
 # ═════════════════════════════════════════════════════════════════════════
+# VERTEXPAINT_SCRIPT — PASO 4c por defecto: pinta CADA VERTICE proyectando las
+# fotos originales (misma matematica validada de la textura: espacio LINEAL,
+# peso cos^4 a la mejor vista, oclusion por raycast, gamma 0.8, unlit), pero
+# SIN el desdoblado UV de xatlas (que tardaba 25-90 min). Tarda ~1-3 min.
+# Vertices que ninguna foto ve conservan su color del entrenamiento (TSDF).
+# ═════════════════════════════════════════════════════════════════════════
+VERTEXPAINT_SCRIPT = r'''
+import sys, os, gc, json, struct
+import numpy as np
+from PIL import Image
+import open3d as o3d
+import trimesh
+
+MESH_PLY   = sys.argv[1]
+IMAGES_DIR = sys.argv[2]
+SPARSE_DIR = sys.argv[3]
+OUT_GLB    = sys.argv[4]
+
+def log(s): print("   [paint] " + s, flush=True)
+
+def srgb_to_linear(c):
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+def linear_to_srgb(c):
+    c = np.maximum(c, 0.0)
+    return np.clip(np.where(c <= 0.0031308, c * 12.92, 1.055 * (c ** (1 / 2.4)) - 0.055), 0, 1)
+
+# 1) malla (conserva el color TSDF como respaldo para vertices sin foto)
+m = o3d.io.read_triangle_mesh(MESH_PLY)
+V = np.asarray(m.vertices); F = np.asarray(m.triangles)
+if len(V) == 0 or len(F) == 0:
+    log("malla vacia, abortando"); sys.exit(1)
+orig = np.asarray(m.vertex_colors) if len(m.vertex_colors) == len(V) else None
+log("malla %d vert %d caras" % (len(V), len(F)))
+
+# 2) escena de raycasting (visibilidad/oclusion, igual que la textura)
+scene = o3d.t.geometry.RaycastingScene()
+scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(m))
+INVALID = scene.INVALID_ID
+
+# 3) intrinsecos + poses (parseo identico al validado)
+cams = {}
+for line in open(os.path.join(SPARSE_DIR, "cameras.txt")):
+    if line.startswith("#") or not line.strip(): continue
+    e = line.split()
+    cams[int(e[0])] = (int(e[2]), int(e[3]), float(e[4]), float(e[5]), float(e[6]), float(e[7]))
+
+def q2R(qw, qx, qy, qz):
+    n = (qw*qw + qx*qx + qy*qy + qz*qz) ** 0.5
+    qw, qx, qy, qz = qw/n, qx/n, qy/n, qz/n
+    return np.array([
+        [1-2*(qy*qy+qz*qz), 2*(qx*qy-qw*qz),   2*(qx*qz+qw*qy)],
+        [2*(qx*qy+qw*qz),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx)],
+        [2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx),   1-2*(qx*qx+qy*qy)]])
+
+views = []
+for line in open(os.path.join(SPARSE_DIR, "images.txt")):
+    if line.startswith("#") or not line.strip(): continue
+    e = line.split()
+    if len(e) >= 10 and (e[9].endswith(".png") or e[9].endswith(".jpg")):
+        qw, qx, qy, qz = map(float, e[1:5]); tx, ty, tz = map(float, e[5:8])
+        R = q2R(qw, qx, qy, qz); t = np.array([tx, ty, tz])
+        E = np.eye(4); E[:3, :3] = R; E[:3, 3] = t
+        views.append((int(e[8]), e[9], E, R, t))
+log("poses: %d camaras" % len(views))
+
+# 4) PINTAR: por cada foto, raycast y reparto del pixel a los 3 vertices del
+#    triangulo golpeado (peso = baricentrica x cos^4 de la mejor vista)
+accV  = np.zeros((len(V), 3), np.float64)
+wsumV = np.zeros(len(V), np.float64)
+Ktens = {}
+nuse = 0
+for cid, name, E, R, t in views:
+    if cid not in cams: continue
+    W, H, fx, fy, cx, cy = cams[cid]
+    path = os.path.join(IMAGES_DIR, name)
+    if not os.path.exists(path): continue
+    photo = np.asarray(Image.open(path).convert("RGB"), np.float32) / 255.0
+    photo = srgb_to_linear(photo)
+    Hp, Wp = photo.shape[:2]
+    sx = Wp / float(W); sy = Hp / float(H)
+    key = (cid, Wp, Hp)
+    if key not in Ktens:
+        Ktens[key] = o3d.core.Tensor(np.array([[fx*sx, 0, cx*sx], [0, fy*sy, cy*sy], [0, 0, 1]]))
+    rays = scene.create_rays_pinhole(Ktens[key], o3d.core.Tensor(E), Wp, Hp)
+    ans = scene.cast_rays(rays)
+    tri  = ans['primitive_ids'].numpy().astype(np.int64)
+    bary = ans['primitive_uvs'].numpy().astype(np.float64)
+    nrm  = ans['primitive_normals'].numpy().astype(np.float64)
+    thit = ans['t_hit'].numpy()
+    del rays, ans
+    hit = np.isfinite(thit) & (tri != INVALID)
+    if hit.sum() == 0:
+        del photo; gc.collect(); continue
+    yy, xx = np.where(hit)
+    ti = tri[hit]; b1 = bary[hit][:, 0]; b2 = bary[hit][:, 1]; b0 = 1 - b1 - b2
+    col = photo[yy, xx]
+    P3 = V[F[ti]]
+    pos = b0[:, None]*P3[:, 0] + b1[:, None]*P3[:, 1] + b2[:, None]*P3[:, 2]
+    Ccam = -R.T @ t
+    vd = Ccam[None, :] - pos
+    vd /= (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-9)
+    nh = nrm[hit]; nh /= (np.linalg.norm(nh, axis=1, keepdims=True) + 1e-9)
+    w = np.clip(np.abs((nh*vd).sum(1)), 0.05, 1.0) ** 4
+    tris = F[ti]
+    for k, bk in ((0, b0), (1, b1), (2, b2)):
+        ww = w * bk
+        np.add.at(accV,  tris[:, k], col * ww[:, None])
+        np.add.at(wsumV, tris[:, k], ww)
+    nuse += 1
+    del photo, tri, bary, nrm, thit, hit, col; gc.collect()
+log("proyectadas %d/%d camaras" % (nuse, len(views)))
+if nuse == 0:
+    log("ninguna camara proyectada, abortando"); sys.exit(1)
+
+# 5) normalizar en LINEAL -> sRGB -> gamma 0.8 (anti-oscuro validado)
+painted = wsumV > 0
+cols = np.zeros((len(V), 3), np.float32)
+if orig is not None:
+    cols[:] = orig.astype(np.float32)
+else:
+    cols[:] = 0.5
+lin = (accV[painted] / wsumV[painted, None]).astype(np.float32)
+cols[painted] = np.clip(linear_to_srgb(lin) ** 0.8, 0, 1)
+log("pintados %d/%d vertices (%.1f%%) desde las fotos" % (painted.sum(), len(V), 100.0*painted.mean()))
+
+# 6) exportar .glb: color por vertice + normales suaves + mate + unlit
+rgba = np.concatenate([(cols*255).astype(np.uint8),
+                       np.full((len(V), 1), 255, np.uint8)], 1)
+mesh_out = trimesh.Trimesh(vertices=V, faces=F, process=False)
+mesh_out.visual = trimesh.visual.ColorVisuals(mesh_out, vertex_colors=rgba)
+_ = mesh_out.vertex_normals
+mesh_out.export(OUT_GLB)
+try:
+    _d = bytearray(open(OUT_GLB, "rb").read())
+    _jlen = struct.unpack("<I", _d[12:16])[0]
+    _g = json.loads(_d[20:20+_jlen].decode("utf-8"))
+    _g.setdefault("extensionsUsed", [])
+    if "KHR_materials_unlit" not in _g["extensionsUsed"]:
+        _g["extensionsUsed"].append("KHR_materials_unlit")
+    if not _g.get("materials"):
+        _g["materials"] = [{}]
+        for _mesh in _g.get("meshes", []):
+            for _pr in _mesh.get("primitives", []):
+                _pr["material"] = 0
+    for _m in _g["materials"]:
+        _pbr = _m.setdefault("pbrMetallicRoughness", {})
+        _pbr["metallicFactor"] = 0.0
+        _pbr["roughnessFactor"] = 1.0
+        _m.setdefault("extensions", {})["KHR_materials_unlit"] = {}
+    _nj = json.dumps(_g, separators=(",", ":")).encode("utf-8")
+    while len(_nj) % 4:
+        _nj += b" "
+    _bin = _d[20+_jlen:]
+    _out = bytearray()
+    _out += _d[:12]
+    _out += struct.pack("<I", len(_nj)) + b"JSON" + _nj
+    _out += _bin
+    _out[8:12] = struct.pack("<I", len(_out))
+    open(OUT_GLB, "wb").write(bytes(_out))
+    log("material unlit + mate aplicado")
+except Exception as e:
+    log("(patch unlit fallo: %s; el visor podria oscurecer)" % e)
+log("color por vertice desde FOTOS exportado a .glb")
+sys.exit(0)
+'''
+
+# ═════════════════════════════════════════════════════════════════════════
 BA_SCRIPT = r'''
-import sys, os, shutil, time, traceback
+import sys, os, shutil, time, subprocess, traceback
 def log(s): print("   [ba] " + s, flush=True)
 
 IMAGES = sys.argv[1]   # dataset/images (fotos de entrenamiento)
 SPARSE = sys.argv[2]   # dataset/sparse/0 (modelo COLMAP texto de MASt3R)
 WORKD  = sys.argv[3]   # carpeta de trabajo
 
+# Usamos el binario colmap CLASICO que ya viene en la imagen (/usr/bin/colmap):
+# es pre-"rigs", asi que entiende el modelo texto de MASt3R sin los chequeos
+# internos nuevos de pycolmap 4.x que fallaron en el pod (RigId mismatch).
+# pycolmap se usa SOLO para leer y validar (eso si funciono siempre).
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+COLMAP = shutil.which("colmap")
+if not COLMAP:
+    log("colmap CLI no esta en la imagen: dejo poses MASt3R"); sys.exit(2)
 try:
     import pycolmap
 except Exception as e:
-    log("pycolmap no esta en la imagen (%s): dejo poses MASt3R" % e); sys.exit(2)
+    log("pycolmap no disponible (%s): dejo poses MASt3R" % e); sys.exit(2)
+
+def cli(args):
+    r = subprocess.run([COLMAP] + args, capture_output=True, text=True)
+    if r.returncode != 0:
+        cola = (r.stderr or r.stdout or "").strip().splitlines()[-6:]
+        raise RuntimeError("colmap %s rc=%d :: %s" % (args[0], r.returncode, " | ".join(cola)))
 
 os.makedirs(WORKD, exist_ok=True)
 db = os.path.join(WORKD, "ba.db")
@@ -457,50 +650,39 @@ try:
     n_in = rec_in.num_reg_images()
     log("modelo MASt3R: %d camaras, %d puntos" % (n_in, rec_in.num_points3D()))
 
-    # 1) puntos SIFT (CPU) — API pycolmap 4.x: los ajustes SIFT van DENTRO de
-    #    FeatureExtractionOptions (validado contra la 4.1.0 real de la imagen)
-    ro = pycolmap.ImageReaderOptions(); ro.camera_model = "PINHOLE"
-    eo = pycolmap.FeatureExtractionOptions()
-    try: eo.sift.max_num_features = 4096
-    except Exception: pass
-    try: eo.use_gpu = False
-    except Exception: pass
-    pycolmap.extract_features(db, IMAGES, camera_mode=pycolmap.CameraMode.SINGLE,
-                              reader_options=ro, extraction_options=eo)
+    # 1) puntos SIFT (CPU, mismo binario que hara todo lo demas)
+    cli(["feature_extractor", "--database_path", db, "--image_path", IMAGES,
+         "--ImageReader.single_camera", "1", "--ImageReader.camera_model", "PINHOLE",
+         "--SiftExtraction.max_num_features", "4096", "--SiftExtraction.use_gpu", "0"])
     log("SIFT extraido (%.0fs)" % (time.time() - t0))
 
-    # 2) matching secuencial (video: los frames vecinos se solapan)
-    po = pycolmap.SequentialPairingOptions()
-    try: po.overlap = 20
-    except Exception: pass
-    try: po.loop_detection = False
-    except Exception: pass
-    mo = pycolmap.FeatureMatchingOptions()
-    try: mo.use_gpu = False
-    except Exception: pass
-    pycolmap.match_sequential(db, matching_options=mo, pairing_options=po)
+    # 2) matching secuencial (video: frames vecinos se solapan)
+    cli(["sequential_matcher", "--database_path", db,
+         "--SequentialMatching.overlap", "20",
+         "--SequentialMatching.loop_detection", "0",
+         "--SiftMatching.use_gpu", "0"])
     log("matching secuencial OK (%.0fs)" % (time.time() - t0))
 
     # 3) triangular con poses MASt3R FIJAS
-    tri_dir = os.path.join(WORKD, "tri"); os.makedirs(tri_dir, exist_ok=True)
-    rec = pycolmap.triangulate_points(rec_in, db, IMAGES, tri_dir)
-    log("triangulados %d puntos, err %.2f px" % (rec.num_points3D(),
-        rec.compute_mean_reprojection_error()))
+    tri = os.path.join(WORKD, "tri"); os.makedirs(tri, exist_ok=True)
+    cli(["point_triangulator", "--database_path", db, "--image_path", IMAGES,
+         "--input_path", SPARSE, "--output_path", tri])
 
     # 4) Bundle Adjustment (afina poses + focal; centro optico FIJO)
-    bo = pycolmap.BundleAdjustmentOptions()
-    try:
-        bo.refine_focal_length = True
-        bo.refine_principal_point = False
-        bo.refine_extra_params = False
-    except Exception: pass
-    r = pycolmap.bundle_adjustment(rec, bo)
-    if r is not None: rec = r
+    ba = os.path.join(WORKD, "ba_out"); os.makedirs(ba, exist_ok=True)
+    cli(["bundle_adjuster", "--input_path", tri, "--output_path", ba,
+         "--BundleAdjustment.refine_focal_length", "1",
+         "--BundleAdjustment.refine_principal_point", "0",
+         "--BundleAdjustment.refine_extra_params", "0"])
+    txt = os.path.join(WORKD, "ba_txt"); os.makedirs(txt, exist_ok=True)
+    cli(["model_converter", "--input_path", ba, "--output_path", txt,
+         "--output_type", "TXT"])
+
+    # 5) VALIDAR antes de tocar nada
+    rec = pycolmap.Reconstruction(txt)
     err = rec.compute_mean_reprojection_error()
     npts = rec.num_points3D(); nreg = rec.num_reg_images()
     log("BA hecho: %d camaras, %d puntos, err %.2f px (%.0fs)" % (nreg, npts, err, time.time() - t0))
-
-    # 5) VALIDAR antes de tocar nada
     if nreg != n_in:
         log("VALIDACION FALLO: %d/%d camaras registradas -> dejo poses MASt3R" % (nreg, n_in)); sys.exit(2)
     if npts < 5000:
@@ -508,17 +690,13 @@ try:
     if err > 2.5:
         log("VALIDACION FALLO: error reproyeccion %.2f px (>2.5) -> dejo poses MASt3R" % err); sys.exit(2)
 
-    # 6) color de los puntos (para el init de 2DGS); si falla, siguen sin color
-    try:
-        rec.extract_colors_for_all_images(IMAGES)
-    except Exception as e:
-        log("colores de puntos no extraidos (%s), sigo" % e)
-
-    # 7) respaldo y escritura del modelo refinado
+    # 6) respaldo y escritura del modelo refinado (SOLO los 3 .txt clasicos,
+    #    para que 2DGS y el script de priors lo lean igual que el de MASt3R)
     bak = os.path.join(os.path.dirname(SPARSE), "0_mast3r")
     if os.path.exists(bak): shutil.rmtree(bak)
     shutil.copytree(SPARSE, bak)
-    rec.write_text(SPARSE)
+    for fn in ("cameras.txt", "images.txt", "points3D.txt"):
+        shutil.copy2(os.path.join(txt, fn), os.path.join(SPARSE, fn))
     log("poses REFINADAS escritas en sparse/0 (respaldo: sparse/0_mast3r)")
     sys.exit(0)
 except SystemExit:
@@ -1414,6 +1592,19 @@ def main():
         except Exception as e:
             log(f"   ⚠ no se pudo exportar .glb ({e}); subo el .ply")
 
+        # Subida ANTICIPADA: el .glb de color por vértice se sube YA, a la misma
+        # URL final. Si la textura (xatlas, 25-90 min) se cancela o el pod muere,
+        # igual queda un modelo visible para evaluar geometría (huecos/techo).
+        # El .glb texturizado lo SOBRESCRIBE al terminar.
+        try:
+            if glb_final.exists() and glb_final.stat().st_size > 1000:
+                with open(glb_final, "rb") as _f:
+                    _req = urllib.request.Request(UPLOAD_URL_PLY, data=_f.read(), method="PUT")
+                    urllib.request.urlopen(_req, timeout=300).read()
+                log("   ⬆ VISTA PREVIA subida (color por vértice): ya se puede abrir el modelo; ahora empieza la textura")
+        except Exception as _pe:
+            log(f"   (vista previa no subida: {_pe}; sigo)")
+
         # ══════════════════════════════════════════════════════════════════════
         # PASO 4c: HORNEAR TEXTURA UV (estilo Polycam) — FASE 0 de validación
         # ──────────────────────────────────────────────────────────────────────
@@ -1423,19 +1614,37 @@ def main():
         # 2DGS → no se tuerce como OpenMVS. Si falla, se sube el .glb de color por
         # vértice (no se pierde el render). Esta corrida valida si la textura ALINEA.
         glb_tex = WORK / "mesh_textured.glb"
-        try:
-            fase(0.94, "PASO 4c/5 — Horneando textura UV (estilo Polycam)")
-            bake_py = WORK / "bake_texture.py"
-            bake_py.write_text(TEXTURE_SCRIPT)
-            run(["python", str(bake_py), str(malla), str(dataset / "images"),
-                 str(dataset / "sparse" / "0"), str(glb_tex), "2048"],
-                fase_label="PASO 4c/5 — Horneando textura UV", check=False)
-            if glb_tex.exists() and glb_tex.stat().st_size > 1000:
-                log(f"   ✓ textura UV horneada: {glb_tex.stat().st_size/1e6:.1f} MB")
-            else:
-                log("   ⚠ el texturizado no produjo archivo; uso color por vértice")
-        except Exception as e:
-            log(f"   ⚠ texturizado falló ({e}); uso color por vértice (.glb)")
+        # COLOR FINAL — por defecto: PINTADO POR VERTICE desde las fotos (~1-3 min,
+        # misma matematica validada de la textura pero SIN xatlas). La textura UV
+        # completa (xatlas, 25-90 min extra) queda como opcion: TEXTURE_BAKE=1.
+        if os.environ.get("TEXTURE_BAKE", "0") == "1":
+            try:
+                fase(0.94, "PASO 4c/5 — Horneando textura UV (estilo Polycam)")
+                bake_py = WORK / "bake_texture.py"
+                bake_py.write_text(TEXTURE_SCRIPT)
+                run(["python", str(bake_py), str(malla), str(dataset / "images"),
+                     str(dataset / "sparse" / "0"), str(glb_tex), "2048"],
+                    fase_label="PASO 4c/5 — Horneando textura UV", check=False)
+                if glb_tex.exists() and glb_tex.stat().st_size > 1000:
+                    log(f"   ✓ textura UV horneada: {glb_tex.stat().st_size/1e6:.1f} MB")
+                else:
+                    log("   ⚠ el texturizado no produjo archivo; uso color por vértice")
+            except Exception as e:
+                log(f"   ⚠ texturizado falló ({e}); uso color por vértice (.glb)")
+        else:
+            try:
+                fase(0.94, "PASO 4c/5 — Pintando vértices desde las fotos")
+                paint_py = WORK / "vertex_paint.py"
+                paint_py.write_text(VERTEXPAINT_SCRIPT)
+                run(["python", str(paint_py), str(malla), str(dataset / "images"),
+                     str(dataset / "sparse" / "0"), str(glb_tex)],
+                    fase_label="PASO 4c/5 — Pintando vértices", check=False)
+                if glb_tex.exists() and glb_tex.stat().st_size > 1000:
+                    log(f"   ✓ vértices pintados desde las FOTOS: {glb_tex.stat().st_size/1e6:.1f} MB")
+                else:
+                    log("   ⚠ el pintado no produjo archivo; uso color por vértice del entrenamiento")
+            except Exception as e:
+                log(f"   ⚠ pintado falló ({e}); uso color por vértice del entrenamiento")
 
         # Archivo a subir (orden de preferencia):
         #   1º textura UV (estilo Polycam)  2º color por vértice + AO  3º .ply crudo
