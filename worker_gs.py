@@ -457,13 +457,16 @@ try:
     n_in = rec_in.num_reg_images()
     log("modelo MASt3R: %d camaras, %d puntos" % (n_in, rec_in.num_points3D()))
 
-    # 1) puntos SIFT (CPU)
+    # 1) puntos SIFT (CPU) — API pycolmap 4.x: los ajustes SIFT van DENTRO de
+    #    FeatureExtractionOptions (validado contra la 4.1.0 real de la imagen)
     ro = pycolmap.ImageReaderOptions(); ro.camera_model = "PINHOLE"
-    so = pycolmap.SiftExtractionOptions(); so.max_num_features = 4096
-    try: so.use_gpu = False
+    eo = pycolmap.FeatureExtractionOptions()
+    try: eo.sift.max_num_features = 4096
+    except Exception: pass
+    try: eo.use_gpu = False
     except Exception: pass
     pycolmap.extract_features(db, IMAGES, camera_mode=pycolmap.CameraMode.SINGLE,
-                              reader_options=ro, sift_options=so)
+                              reader_options=ro, extraction_options=eo)
     log("SIFT extraido (%.0fs)" % (time.time() - t0))
 
     # 2) matching secuencial (video: los frames vecinos se solapan)
@@ -472,7 +475,10 @@ try:
     except Exception: pass
     try: po.loop_detection = False
     except Exception: pass
-    pycolmap.match_sequential(db, pairing_options=po)
+    mo = pycolmap.FeatureMatchingOptions()
+    try: mo.use_gpu = False
+    except Exception: pass
+    pycolmap.match_sequential(db, matching_options=mo, pairing_options=po)
     log("matching secuencial OK (%.0fs)" % (time.time() - t0))
 
     # 3) triangular con poses MASt3R FIJAS
@@ -1074,10 +1080,16 @@ def main():
             _psnrs = _re.findall(r'PSNR\s+([0-9]+\.[0-9]+)', _out_tr or "")
             if _psnrs:
                 psnr_final = float(_psnrs[-1])
-                if psnr_final >= 30:
-                    log(f"   ✓ CALIDAD OK: PSNR final {psnr_final:.1f} (buena base estable)")
+                # Con priors activos el PSNR baja 1-3 puntos y ES NORMAL: se
+                # cambia un poco de fidelidad fotografica por geometria solida
+                # (paredes/techo). El umbral de alarma baja de 30 a 28.
+                _con_priors = bool(os.environ.get("MONO_PRIORS_DIR"))
+                _umbral = 28.0 if _con_priors else 30.0
+                if psnr_final >= _umbral:
+                    _nota = " (con priors; 1-3 pts menos que sin priors es normal)" if _con_priors else " (buena base estable)"
+                    log(f"   ✓ CALIDAD OK: PSNR final {psnr_final:.1f}{_nota}")
                 else:
-                    log(f"   ⚠⚠⚠ CALIDAD BAJA: PSNR final {psnr_final:.1f} (< 30). La malla "
+                    log(f"   ⚠⚠⚠ CALIDAD BAJA: PSNR final {psnr_final:.1f} (< {_umbral:.0f}). La malla "
                         f"puede salir dañada/incompleta. RECOMIENDO RE-CORRER el render.")
         except Exception as e:
             log(f"   (no se pudo leer el PSNR: {e})")
