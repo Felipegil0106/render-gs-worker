@@ -933,7 +933,7 @@ def main():
         # el resultado no pasa las validaciones, el script sale con código 2 y
         # seguimos con las poses originales (el render NO se pierde por esto).
         # Apagable sin rebuild: variable de entorno POSE_BA=0.
-        if os.environ.get("POSE_BA", "0") != "0":
+        if os.environ.get("POSE_BA", "1") != "0":
             fase(0.40, "PASO 2b/5 — Afinando poses (bundle adjustment)")
             ba_py = WORK / "pose_ba.py"
             ba_py.write_text(BA_SCRIPT)
@@ -954,7 +954,7 @@ def main():
         # solas no anclan nada: cierra huecos y deja el techo continuo.
         # Si algo falla, seguimos sin priors (el render no se pierde).
         # Apagable sin rebuild: MONO_PRIORS=0.
-        if os.environ.get("MONO_PRIORS", "0") != "0":
+        if os.environ.get("MONO_PRIORS", "1") != "0":
             fase(0.42, "PASO 2c/5 — Priors monoculares (profundidad+normales)")
             pri_py = WORK / "make_priors.py"
             pri_py.write_text(PRIORS_SCRIPT)
