@@ -861,7 +861,11 @@ def main():
     t0 = time.time()
     hb = threading.Thread(target=_latido, daemon=True); hb.start()
     try:
-        log(f"═══ render-gs-worker 2DGS · v4-priors · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
+        try:
+            _img_tag = Path("/opt/IMAGE_TAG").read_text().strip()
+        except Exception:
+            _img_tag = "v3-o-v4-vieja (sin marcador)"
+        log(f"═══ render-gs-worker 2DGS · v4-priors · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
         fase(0.05, "PASO 1/5 — Descargando fotos")
