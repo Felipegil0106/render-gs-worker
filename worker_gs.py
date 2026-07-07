@@ -577,7 +577,22 @@ rgba = np.concatenate([(cols*255).astype(np.uint8),
                        np.full((len(V), 1), 255, np.uint8)], 1)
 mesh_out = trimesh.Trimesh(vertices=V, faces=F, process=False)
 mesh_out.visual = trimesh.visual.ColorVisuals(mesh_out, vertex_colors=rgba)
-_ = mesh_out.vertex_normals
+# Normales calculadas A MANO: los exportadores viejos de trimesh re-normalizan
+# y dividen por cero con normales degeneradas, metiendo NaN literal al JSON del
+# .glb (el error "Unexpected token N" del visor). Aqui NINGUNA fila queda en
+# cero ni no-finita, en ninguna version de trimesh.
+_fv = V[F]
+_fn = np.cross(_fv[:, 1] - _fv[:, 0], _fv[:, 2] - _fv[:, 0])
+vn = np.zeros((len(V), 3), np.float64)
+for _k in range(3):
+    np.add.at(vn, F[:, _k], _fn)
+vn = np.nan_to_num(vn, nan=0.0, posinf=0.0, neginf=0.0)
+_bad = np.linalg.norm(vn, axis=1) < 1e-12
+vn[_bad] = (0.0, 0.0, 1.0)
+vn /= np.linalg.norm(vn, axis=1, keepdims=True)
+if _bad.any():
+    log("normales degeneradas corregidas: %d (anti-NaN)" % int(_bad.sum()))
+mesh_out.vertex_normals = vn
 mesh_out.export(OUT_GLB)
 try:
     _d = bytearray(open(OUT_GLB, "rb").read())
@@ -596,19 +611,54 @@ try:
         _pbr["metallicFactor"] = 0.0
         _pbr["roughnessFactor"] = 1.0
         _m.setdefault("extensions", {})["KHR_materials_unlit"] = {}
-    _nj = json.dumps(_g, separators=(",", ":")).encode("utf-8")
+    # ── SANEADOR ANTI-NaN (a prueba de cualquier version de trimesh) ──
+    # Repara valores NaN/inf en los buffers float (NORMAL -> 0,0,1) y recalcula
+    # los min/max REALES de cada accessor float. Un solo NaN en el JSON revienta
+    # JSON.parse del visor ("Unexpected token N").
+    _bin = bytearray(_d[20+_jlen:])   # incluye cabecera del chunk BIN (8 bytes)
+    _attr = {}
+    for _mesh in _g.get("meshes", []):
+        for _pr in _mesh.get("primitives", []):
+            for _an, _ai in _pr.get("attributes", {}).items():
+                _attr[_ai] = _an
+    _rep = 0
+    _NC = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}
+    for _ai, _acc in enumerate(_g.get("accessors", [])):
+        _ncomp = _NC.get(_acc.get("type"), 0)
+        if _acc.get("componentType") != 5126 or "bufferView" not in _acc or not _ncomp:
+            continue
+        _bv = _g["bufferViews"][_acc["bufferView"]]
+        _off = 8 + _bv.get("byteOffset", 0) + _acc.get("byteOffset", 0)
+        _nfl = _acc["count"] * _ncomp
+        _arr = np.frombuffer(bytes(_bin[_off:_off + _nfl * 4]), np.float32)
+        _arr = _arr.reshape(_acc["count"], _ncomp).copy()
+        if not np.isfinite(_arr).all():
+            if _attr.get(_ai) == "NORMAL" and _ncomp == 3:
+                _mal = ~np.isfinite(_arr).all(axis=1)
+                _arr[_mal] = (0.0, 0.0, 1.0)
+                _rep += int(_mal.sum())
+            else:
+                _rep += int((~np.isfinite(_arr)).sum())
+                _arr = np.nan_to_num(_arr, nan=0.0, posinf=0.0, neginf=0.0)
+            _bin[_off:_off + _nfl * 4] = _arr.astype(np.float32).tobytes()
+        if "min" in _acc or "max" in _acc or _attr.get(_ai) == "POSITION":
+            _acc["min"] = [float(x) for x in _arr.min(0)]
+            _acc["max"] = [float(x) for x in _arr.max(0)]
+    if _rep:
+        log("saneados %d valores NaN dentro del archivo" % _rep)
+    # allow_nan=False = alarma: si algo no-finito sobreviviera, aqui explota
+    _nj = json.dumps(_g, separators=(",", ":"), allow_nan=False).encode("utf-8")
     while len(_nj) % 4:
         _nj += b" "
-    _bin = _d[20+_jlen:]
     _out = bytearray()
     _out += _d[:12]
     _out += struct.pack("<I", len(_nj)) + b"JSON" + _nj
     _out += _bin
     _out[8:12] = struct.pack("<I", len(_out))
     open(OUT_GLB, "wb").write(bytes(_out))
-    log("material unlit + mate aplicado")
+    log("material unlit + mate + saneamiento anti-NaN aplicados")
 except Exception as e:
-    log("(patch unlit fallo: %s; el visor podria oscurecer)" % e)
+    log("(patch/saneamiento fallo: %s)" % e)
 log("color por vertice desde FOTOS exportado a .glb")
 sys.exit(0)
 '''
@@ -638,7 +688,9 @@ except Exception as e:
 def cli(args):
     r = subprocess.run([COLMAP] + args, capture_output=True, text=True)
     if r.returncode != 0:
-        cola = (r.stderr or r.stdout or "").strip().splitlines()[-6:]
+        lineas = ((r.stderr or "") + "\n" + (r.stdout or "")).strip().splitlines()
+        clave = [l for l in lineas if ("Check failed" in l or "ERROR" in l)][-3:]
+        cola = clave + lineas[-4:]
         raise RuntimeError("colmap %s rc=%d :: %s" % (args[0], r.returncode, " | ".join(cola)))
 
 os.makedirs(WORKD, exist_ok=True)
@@ -649,6 +701,19 @@ try:
     rec_in = pycolmap.Reconstruction(SPARSE)
     n_in = rec_in.num_reg_images()
     log("modelo MASt3R: %d camaras, %d puntos" % (n_in, rec_in.num_points3D()))
+
+    # El modelo de MASt3R trae ~200k puntos con referencias internas que el
+    # colmap CLASICO del pod verifica contra la base de datos y ABORTA (rc=-6).
+    # Receta canonica de "poses conocidas": darle SOLO las poses, sin puntos.
+    po = os.path.join(WORKD, "pose_only"); os.makedirs(po, exist_ok=True)
+    shutil.copy2(os.path.join(SPARSE, "cameras.txt"), os.path.join(po, "cameras.txt"))
+    with open(os.path.join(SPARSE, "images.txt")) as _f, \
+         open(os.path.join(po, "images.txt"), "w") as _g:
+        for _l in _f:
+            _e = _l.split()
+            if len(_e) >= 10 and (_e[9].endswith(".jpg") or _e[9].endswith(".png")):
+                _g.write(_l.rstrip("\n") + "\n\n")
+    open(os.path.join(po, "points3D.txt"), "w").write("# vacio: solo poses\n")
 
     # 1) puntos SIFT (CPU, mismo binario que hara todo lo demas)
     cli(["feature_extractor", "--database_path", db, "--image_path", IMAGES,
@@ -666,7 +731,7 @@ try:
     # 3) triangular con poses MASt3R FIJAS
     tri = os.path.join(WORKD, "tri"); os.makedirs(tri, exist_ok=True)
     cli(["point_triangulator", "--database_path", db, "--image_path", IMAGES,
-         "--input_path", SPARSE, "--output_path", tri])
+         "--input_path", po, "--output_path", tri])
 
     # 4) Bundle Adjustment (afina poses + focal; centro optico FIJO)
     ba = os.path.join(WORKD, "ba_out"); os.makedirs(ba, exist_ok=True)
@@ -1579,11 +1644,19 @@ def main():
             #    promedia las caras por vértice (suave) y SÍ las mete en el .glb.
             #    El color por vértice + AO se conserva intacto.
             try:
+                def _sane_normales(_gm):
+                    import numpy as _np
+                    _vn = _np.asarray(_gm.vertex_normals, dtype=_np.float64)
+                    _bad = ~_np.isfinite(_vn).all(axis=1) | (_np.linalg.norm(_vn, axis=1) < 1e-8)
+                    if _bad.any():
+                        _vn = _vn.copy(); _vn[_bad] = (0.0, 0.0, 1.0)
+                        _vn /= (_np.linalg.norm(_vn, axis=1, keepdims=True) + 1e-12)
+                        _gm.vertex_normals = _vn
                 if isinstance(sc, trimesh.Scene):
                     for _g in sc.geometry.values():
-                        _ = _g.vertex_normals
+                        _sane_normales(_g)
                 else:
-                    _ = sc.vertex_normals
+                    _sane_normales(sc)
                 log("   normales suaves forzadas en el .glb (anti-facetado)")
             except Exception as _ne:
                 log(f"   ⚠ no pude forzar normales ({_ne}); el visor podría facetar")
@@ -1591,6 +1664,58 @@ def main():
             log(f"   .glb (color por vértice + AO): {glb_final.stat().st_size/1e6:.1f} MB")
         except Exception as e:
             log(f"   ⚠ no se pudo exportar .glb ({e}); subo el .ply")
+
+        # ── SANEADOR ANTI-NaN de la vista previa (mismo escudo que el pintor):
+        # exportadores viejos de trimesh pueden meter NaN literal al JSON del .glb
+        # y eso revienta el JSON.parse del visor ("Unexpected token N"). Se repara
+        # el binario y se recalculan los min/max REALES de cada accessor float.
+        try:
+            if glb_final.exists() and glb_final.stat().st_size > 1000:
+                import json as _json, struct as _st
+                import numpy as _np
+                _d = bytearray(open(glb_final, "rb").read())
+                _jlen = _st.unpack("<I", _d[12:16])[0]
+                _g = _json.loads(_d[20:20 + _jlen].decode("utf-8"))
+                _bin = bytearray(_d[20 + _jlen:])
+                _attr = {}
+                for _msh in _g.get("meshes", []):
+                    for _pr in _msh.get("primitives", []):
+                        for _an, _ai in _pr.get("attributes", {}).items():
+                            _attr[_ai] = _an
+                _rep = 0
+                _NC = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}
+                for _ai, _acc in enumerate(_g.get("accessors", [])):
+                    _ncomp = _NC.get(_acc.get("type"), 0)
+                    if _acc.get("componentType") != 5126 or "bufferView" not in _acc or not _ncomp:
+                        continue
+                    _bv = _g["bufferViews"][_acc["bufferView"]]
+                    _off = 8 + _bv.get("byteOffset", 0) + _acc.get("byteOffset", 0)
+                    _nfl = _acc["count"] * _ncomp
+                    _arr = _np.frombuffer(bytes(_bin[_off:_off + _nfl * 4]), _np.float32)
+                    _arr = _arr.reshape(_acc["count"], _ncomp).copy()
+                    if not _np.isfinite(_arr).all():
+                        if _attr.get(_ai) == "NORMAL" and _ncomp == 3:
+                            _mal = ~_np.isfinite(_arr).all(axis=1)
+                            _arr[_mal] = (0.0, 0.0, 1.0)
+                            _rep += int(_mal.sum())
+                        else:
+                            _rep += int((~_np.isfinite(_arr)).sum())
+                            _arr = _np.nan_to_num(_arr, nan=0.0, posinf=0.0, neginf=0.0)
+                        _bin[_off:_off + _nfl * 4] = _arr.astype(_np.float32).tobytes()
+                    if "min" in _acc or "max" in _acc or _attr.get(_ai) == "POSITION":
+                        _acc["min"] = [float(x) for x in _arr.min(0)]
+                        _acc["max"] = [float(x) for x in _arr.max(0)]
+                _nj = _json.dumps(_g, separators=(",", ":"), allow_nan=False).encode("utf-8")
+                while len(_nj) % 4:
+                    _nj += b" "
+                _out = bytearray(); _out += _d[:12]
+                _out += _st.pack("<I", len(_nj)) + b"JSON" + _nj + _bin
+                _out[8:12] = _st.pack("<I", len(_out))
+                open(glb_final, "wb").write(bytes(_out))
+                if _rep:
+                    log(f"   saneados {_rep} valores NaN en la vista previa")
+        except Exception as _se:
+            log(f"   (saneador de vista previa falló: {_se}; sigo)")
 
         # Subida ANTICIPADA: el .glb de color por vértice se sube YA, a la misma
         # URL final. Si la textura (xatlas, 25-90 min) se cancela o el pod muere,
