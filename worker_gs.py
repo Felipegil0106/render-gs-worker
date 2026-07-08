@@ -702,24 +702,39 @@ try:
     n_in = rec_in.num_reg_images()
     log("modelo MASt3R: %d camaras, %d puntos" % (n_in, rec_in.num_points3D()))
 
-    # El modelo de MASt3R trae ~200k puntos con referencias internas que el
-    # colmap CLASICO del pod verifica contra la base de datos y ABORTA (rc=-6).
-    # Receta canonica de "poses conocidas": darle SOLO las poses, sin puntos.
-    po = os.path.join(WORKD, "pose_only"); os.makedirs(po, exist_ok=True)
-    shutil.copy2(os.path.join(SPARSE, "cameras.txt"), os.path.join(po, "cameras.txt"))
-    with open(os.path.join(SPARSE, "images.txt")) as _f, \
-         open(os.path.join(po, "images.txt"), "w") as _g:
-        for _l in _f:
-            _e = _l.split()
-            if len(_e) >= 10 and (_e[9].endswith(".jpg") or _e[9].endswith(".png")):
-                _g.write(_l.rstrip("\n") + "\n\n")
-    open(os.path.join(po, "points3D.txt"), "w").write("# vacio: solo poses\n")
 
     # 1) puntos SIFT (CPU, mismo binario que hara todo lo demas)
     cli(["feature_extractor", "--database_path", db, "--image_path", IMAGES,
          "--ImageReader.single_camera", "1", "--ImageReader.camera_model", "PINHOLE",
          "--SiftExtraction.max_num_features", "4096", "--SiftExtraction.use_gpu", "0"])
     log("SIFT extraido (%.0fs)" % (time.time() - t0))
+
+    # Modelo SOLO-POSES renumerado a los IDs de la BASE DE DATOS. Dos razones,
+    # ambas fallos REALES del pod: (a) el colmap clasico aborta si el modelo trae
+    # los 200k puntos de MASt3R; (b) tambien aborta si model.image_id no coincide
+    # con db.image_id ("Check failed: existing_image.Name() ... img_0125 vs
+    # img_0122"). Se mapea por NOMBRE de archivo, que es lo unico estable.
+    import sqlite3
+    _con = sqlite3.connect(db)
+    _dbids = {n: int(i) for i, n in _con.execute("SELECT image_id, name FROM images")}
+    _con.close()
+    po = os.path.join(WORKD, "pose_only"); os.makedirs(po, exist_ok=True)
+    shutil.copy2(os.path.join(SPARSE, "cameras.txt"), os.path.join(po, "cameras.txt"))
+    _falt = 0
+    with open(os.path.join(SPARSE, "images.txt")) as _f, \
+         open(os.path.join(po, "images.txt"), "w") as _g:
+        for _l in _f:
+            _e = _l.split()
+            if len(_e) >= 10 and (_e[9].endswith(".jpg") or _e[9].endswith(".png")):
+                _nid = _dbids.get(_e[9])
+                if _nid is None:
+                    _falt += 1
+                    continue
+                _g.write(" ".join([str(_nid)] + _e[1:10]) + "\n\n")
+    open(os.path.join(po, "points3D.txt"), "w").write("# vacio: solo poses\n")
+    if _falt:
+        log("VALIDACION FALLO: %d imagenes del modelo no estan en la BD -> dejo poses MASt3R" % _falt)
+        sys.exit(2)
 
     # 2) matching secuencial (video: frames vecinos se solapan)
     cli(["sequential_matcher", "--database_path", db,
@@ -956,7 +971,12 @@ PRIOR_UTILS = r'''
 # ======= PRIORS MONOCULARES (inyectado por el worker; DN-Splatter style) =======
 import numpy as _np
 _PRIORS_DIR = os.environ.get("MONO_PRIORS_DIR", "")
-_L_DEPTH = float(os.environ.get("MONO_LAMBDA_DEPTH", "0.2"))
+# EXPERIMENTO ANTI-LAMINADO (render b02d2d8c salio en "branquias"/estrias):
+# la profundidad monocular alineada por imagen puede tallar la superficie en
+# CAPAS paralelas (fallo documentado). Se APAGA L_depth (0.0) dejando las
+# NORMALES activas (ellas aplanan, no laminan). Si el proximo render sale
+# liso y el techo sigue cubierto, la causa queda aislada.
+_L_DEPTH = float(os.environ.get("MONO_LAMBDA_DEPTH", "0.0"))
 _L_NORM  = float(os.environ.get("MONO_LAMBDA_NORMAL", "0.1"))
 _P_FROM  = int(os.environ.get("MONO_FROM_ITER", "100"))
 _prior_cache = {}
@@ -1114,7 +1134,7 @@ def main():
             _img_tag = Path("/opt/IMAGE_TAG").read_text().strip()
         except Exception:
             _img_tag = "v3-o-v4-vieja (sin marcador)"
-        log(f"═══ render-gs-worker 2DGS · v4-priors · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
+        log(f"═══ render-gs-worker 2DGS · v4-priors-dOFF · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
         fase(0.05, "PASO 1/5 — Descargando fotos")
