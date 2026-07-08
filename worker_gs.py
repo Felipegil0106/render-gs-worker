@@ -750,10 +750,14 @@ try:
 
     # 4) Bundle Adjustment (afina poses + focal; centro optico FIJO)
     ba = os.path.join(WORKD, "ba_out"); os.makedirs(ba, exist_ok=True)
+    # CLAVE DEL ARREGLO: refine_extrinsics=0 CONGELA las poses de MASt3R.
+    # El BA solo mueve la focal para reducir el error de reproyeccion; NO puede
+    # trasladar/rotar/estirar las camaras -> imposible deformar la escena.
     cli(["bundle_adjuster", "--input_path", tri, "--output_path", ba,
          "--BundleAdjustment.refine_focal_length", "1",
          "--BundleAdjustment.refine_principal_point", "0",
-         "--BundleAdjustment.refine_extra_params", "0"])
+         "--BundleAdjustment.refine_extra_params", "0",
+         "--BundleAdjustment.refine_extrinsics", "0"])
     txt = os.path.join(WORKD, "ba_txt"); os.makedirs(txt, exist_ok=True)
     cli(["model_converter", "--input_path", ba, "--output_path", txt,
          "--output_type", "TXT"])
@@ -769,6 +773,26 @@ try:
         log("VALIDACION FALLO: solo %d puntos (<5000) -> dejo poses MASt3R" % npts); sys.exit(2)
     if err > 2.5:
         log("VALIDACION FALLO: error reproyeccion %.2f px (>2.5) -> dejo poses MASt3R" % err); sys.exit(2)
+    # GUARDIAN DE ESCALA: el modo anclado NO deberia mover las camaras, pero por
+    # seguridad medimos el bbox de los centros de camara antes/despues. Si la
+    # escala cambio > 5%, algo se deformo -> rechazar y quedarse con MASt3R.
+    import numpy as _np
+    def _span(_rec):
+        _c = _np.array([_img.projection_center() if hasattr(_img, "projection_center")
+                        else (-_img.cam_from_world.rotation.matrix().T @ _img.cam_from_world.translation)
+                        for _img in _rec.images.values()])
+        return float(_np.linalg.norm(_c.max(0) - _c.min(0)))
+    try:
+        _s_in = _span(rec_in); _s_out = _span(rec)
+        if _s_in > 1e-6:
+            _ratio = _s_out / _s_in
+            log("escala camaras: entrada %.3f -> BA %.3f (x%.3f)" % (_s_in, _s_out, _ratio))
+            if _ratio > 1.05 or _ratio < 0.95:
+                log("VALIDACION FALLO: el BA cambio la escala %.1f%% (>5%%) -> dejo poses MASt3R" % (abs(_ratio-1)*100)); sys.exit(2)
+    except SystemExit:
+        raise
+    except Exception as _se:
+        log("(guardian de escala no pudo medir: %s; sigo)" % _se)
 
     # 6) respaldo y escritura del modelo refinado (SOLO los 3 .txt clasicos,
     #    para que 2DGS y el script de priors lo lean igual que el de MASt3R)
@@ -1134,7 +1158,7 @@ def main():
             _img_tag = Path("/opt/IMAGE_TAG").read_text().strip()
         except Exception:
             _img_tag = "v3-o-v4-vieja (sin marcador)"
-        log(f"═══ render-gs-worker 2DGS · v4-priors-dOFF · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
+        log(f"═══ render-gs-worker 2DGS · v4-priors-dOFF-baLOCK · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
         fase(0.05, "PASO 1/5 — Descargando fotos")
@@ -1205,7 +1229,11 @@ def main():
         # de MASt3R fijas y luego un BA clásico las pule. Si pycolmap no está o
         # el resultado no pasa las validaciones, el script sale con código 2 y
         # seguimos con las poses originales (el render NO se pierde por esto).
-        # Apagable sin rebuild: variable de entorno POSE_BA=0.
+        # BA con ANCLAJE DE POSES (v2). El fallo anterior (cuarto estirado 2x,
+        # err 0.99px) fue porque refine_extrinsics=1 dejaba flotar las 127 camaras
+        # sin fijar la escala. Ahora las poses de MASt3R se CONGELAN
+        # (refine_extrinsics=0) y el BA solo afina la focal: imposible estirar la
+        # geometria. Apagable con POSE_BA=0.
         if os.environ.get("POSE_BA", "1") != "0":
             fase(0.40, "PASO 2b/5 — Afinando poses (bundle adjustment)")
             ba_py = WORK / "pose_ba.py"
