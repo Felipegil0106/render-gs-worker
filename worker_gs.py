@@ -1158,7 +1158,8 @@ def main():
             _img_tag = Path("/opt/IMAGE_TAG").read_text().strip()
         except Exception:
             _img_tag = "v3-o-v4-vieja (sin marcador)"
-        log(f"═══ render-gs-worker 2DGS · v4-priors-dOFF-baLOCK · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
+        _bn_dist = os.environ.get("LAMBDA_DIST", "100")
+        log(f"═══ render-gs-worker 2DGS · v4-priors-baLOCK-dist{_bn_dist} · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
         fase(0.05, "PASO 1/5 — Descargando fotos")
@@ -1342,20 +1343,25 @@ def main():
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
-        # --lambda_dist 25 : regularizador de DISTORSIÓN de profundidad. ANTES estaba
-        # en 100 — DEMASIADO ALTO. La investigación encontró que ese valor era la
-        # CAUSA RAÍZ de que el render saliera dañado: en paredes lisas sin textura el
-        # término de distorsión se disparaba (picos de 0.17-0.49) y SACUDÍA las
-        # gaussianas en vez de asentarlas → geometría deformada, huecos, cuarto
-        # incompleto, y la calidad (PSNR) llegó a CAER de 27 a 25.8 con más iteraciones.
-        # Además era INESTABLE: a veces salía bien (PSNR 32.5) y a veces fatal (25.8)
-        # con el mismo input. Bajándolo a 25 el entrenamiento es estable y reproducible
-        # (junto con la semilla fija). --lambda_normal 0.05 es el default oficial (antes
-        # 0.1, el doble): mantiene las paredes planas sin el riesgo de la distorsión alta.
+        # --lambda_dist : regularizador de DISTORSIÓN. Es lo que OBLIGA a los discos
+        # gaussianos a colapsar en UNA sola superficie a lo largo del rayo. La
+        # investigación identificó que 25 era DEMASIADO BAJO -> los surfels quedaban
+        # repartidos en varias capas de profundidad = el artefacto de LÁMINAS /
+        # branquias / escamas. El paper oficial de 2DGS usa 1000 para escenas
+        # cerradas (interior) y 100 para exteriores. Historia: en el pipeline VIEJO
+        # (sin priors) 100 causaba huecos porque la distorsion se disparaba a picos
+        # de 0.17-0.49 (100x0.17=17, catastrofico). AHORA con priors + MASt3R la
+        # distorsion es ~0.0006 (100x mas estable): 100x0.0006=0.06, SANO. Por eso
+        # 100 ya es seguro y ademas NO deforma (solo consolida superficies, no mueve
+        # camaras). Ajustable por entorno para barrer 100 -> 300 -> 1000 si hiciera
+        # falta mas. --lambda_normal 0.05 (default oficial) se deja IGUAL: una sola
+        # variable a la vez.
+        _LAMBDA_DIST = os.environ.get("LAMBDA_DIST", "100")
+        log(f"   lambda_dist = {_LAMBDA_DIST} (anti-laminas; 25 era muy bajo y laminaba)")
         _rc_tr, _out_tr = run(["python", "/opt/2dgs/train.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--iterations", str(ITERS),
-             "--lambda_dist", "25",
+             "--lambda_dist", _LAMBDA_DIST,
              "--lambda_normal", "0.05",
              "-r", "1",                   # usar la resolución COMPLETA de las imágenes (1000px), no reducir
              "--data_device", "cpu"],     # imágenes en RAM (no en VRAM) → evita quedarse sin memoria a alta resolución
