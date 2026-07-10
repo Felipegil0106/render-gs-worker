@@ -995,12 +995,12 @@ PRIOR_UTILS = r'''
 # ======= PRIORS MONOCULARES (inyectado por el worker; DN-Splatter style) =======
 import numpy as _np
 _PRIORS_DIR = os.environ.get("MONO_PRIORS_DIR", "")
-# EXPERIMENTO ANTI-LAMINADO (render b02d2d8c salio en "branquias"/estrias):
-# la profundidad monocular alineada por imagen puede tallar la superficie en
-# CAPAS paralelas (fallo documentado). Se APAGA L_depth (0.0) dejando las
-# NORMALES activas (ellas aplanan, no laminan). Si el proximo render sale
-# liso y el techo sigue cubierto, la causa queda aislada.
-_L_DEPTH = float(os.environ.get("MONO_LAMBDA_DEPTH", "0.0"))
+# Profundidad monocular EN 0.2 (valor del render b02d2d8c que preservaba la
+# estructura del cuarto). El experimento de apagarla (0.0) quedó confundido con
+# la deformación del BA, así que se vuelve al valor conocido-bueno. Ancla la
+# geometría métrica y densifica el techo. Las estrías se atacan por extracción
+# (depth_ratio=1), no aquí.
+_L_DEPTH = float(os.environ.get("MONO_LAMBDA_DEPTH", "0.2"))
 _L_NORM  = float(os.environ.get("MONO_LAMBDA_NORMAL", "0.1"))
 _P_FROM  = int(os.environ.get("MONO_FROM_ITER", "100"))
 _prior_cache = {}
@@ -1158,8 +1158,8 @@ def main():
             _img_tag = Path("/opt/IMAGE_TAG").read_text().strip()
         except Exception:
             _img_tag = "v3-o-v4-vieja (sin marcador)"
-        _bn_dist = os.environ.get("LAMBDA_DIST", "100")
-        log(f"═══ render-gs-worker 2DGS · v4-priors-baLOCK-dist{_bn_dist} · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
+        _bn_dr = os.environ.get("DEPTH_RATIO", "1")
+        log(f"═══ render-gs-worker 2DGS · v4-priors-baOFF-median(dr{_bn_dr}) · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
         fase(0.05, "PASO 1/5 — Descargando fotos")
@@ -1230,12 +1230,14 @@ def main():
         # de MASt3R fijas y luego un BA clásico las pule. Si pycolmap no está o
         # el resultado no pasa las validaciones, el script sale con código 2 y
         # seguimos con las poses originales (el render NO se pierde por esto).
-        # BA con ANCLAJE DE POSES (v2). El fallo anterior (cuarto estirado 2x,
-        # err 0.99px) fue porque refine_extrinsics=1 dejaba flotar las 127 camaras
-        # sin fijar la escala. Ahora las poses de MASt3R se CONGELAN
-        # (refine_extrinsics=0) y el BA solo afina la focal: imposible estirar la
-        # geometria. Apagable con POSE_BA=0.
-        if os.environ.get("POSE_BA", "1") != "0":
+        # BA APAGADO por defecto (POSE_BA=0). Evidencia de PRODUCCIÓN: el bundle
+        # adjustment deformó el cuarto en TODAS las corridas donde llegó a aplicarse
+        # (suelto: cuarto estirado 9x6x7m; incluso en modo anclado la estructura se
+        # dañó con las 127 cámaras reales). El render b02d2d8c que SÍ preservó la
+        # estructura tenía el BA sin aplicar. Para GARANTIZAR que la estructura no se
+        # deforme -prioridad #1 de Felipe- se apaga. NO se borra: reactivable con
+        # POSE_BA=1 para revisarlo con cuidado cuando el cuarto salga sólido.
+        if os.environ.get("POSE_BA", "0") == "1":
             fase(0.40, "PASO 2b/5 — Afinando poses (bundle adjustment)")
             ba_py = WORK / "pose_ba.py"
             ba_py.write_text(BA_SCRIPT)
@@ -1343,21 +1345,16 @@ def main():
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
-        # --lambda_dist : regularizador de DISTORSIÓN. Es lo que OBLIGA a los discos
-        # gaussianos a colapsar en UNA sola superficie a lo largo del rayo. La
-        # investigación identificó que 25 era DEMASIADO BAJO -> los surfels quedaban
-        # repartidos en varias capas de profundidad = el artefacto de LÁMINAS /
-        # branquias / escamas. El paper oficial de 2DGS usa 1000 para escenas
-        # cerradas (interior) y 100 para exteriores. Historia: en el pipeline VIEJO
-        # (sin priors) 100 causaba huecos porque la distorsion se disparaba a picos
-        # de 0.17-0.49 (100x0.17=17, catastrofico). AHORA con priors + MASt3R la
-        # distorsion es ~0.0006 (100x mas estable): 100x0.0006=0.06, SANO. Por eso
-        # 100 ya es seguro y ademas NO deforma (solo consolida superficies, no mueve
-        # camaras). Ajustable por entorno para barrer 100 -> 300 -> 1000 si hiciera
-        # falta mas. --lambda_normal 0.05 (default oficial) se deja IGUAL: una sola
-        # variable a la vez.
-        _LAMBDA_DIST = os.environ.get("LAMBDA_DIST", "100")
-        log(f"   lambda_dist = {_LAMBDA_DIST} (anti-laminas; 25 era muy bajo y laminaba)")
+        # --lambda_dist : regularizador de DISTORSIÓN. En TEORÍA (paper 2DGS) subirlo
+        # de 25 a 100-1000 debería consolidar las láminas en una superficie. Se probó
+        # en PRODUCCIÓN y el resultado fue INEQUÍVOCO: con 100 la malla se DEFORMÓ (el
+        # cuarto perdió su forma). La escala métrica de MASt3R hace que 100 sea
+        # demasiado y colapse la geometría. LECCIÓN: en ESTE pipeline, 25 es el valor
+        # que preserva la estructura; subirlo la rompe. Se vuelve a 25 (estructura
+        # intacta como en el render b02d2d8c). Las estrías se atacan por la vía SEGURA
+        # (extracción de malla: depth_ratio=1), no tocando la geometría entrenada.
+        _LAMBDA_DIST = os.environ.get("LAMBDA_DIST", "25")
+        log(f"   lambda_dist = {_LAMBDA_DIST} (25 preserva estructura; 100 deformaba)")
         _rc_tr, _out_tr = run(["python", "/opt/2dgs/train.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--iterations", str(ITERS),
@@ -1455,14 +1452,27 @@ def main():
         # daba z-fighting. Si el DIAG vuelve a mostrar dos componentes ~50%, bajar
         # sdf_trunc a 3x. El suavizado Taubin del post-proceso limpia el ruido de
         # usar media en vez de mediana.
-        log(f"$ python /opt/2dgs/render.py (BOUNDED) --depth_ratio 0 "
+        # ── depth_ratio: EL ATAQUE ANTI-ESTRÍAS (extracción, NO deforma) ──
+        # 0 = profundidad MEDIA: mezcla TODAS las capas apiladas que ve cada rayo ->
+        #     el TSDF talla varias cáscaras = las ESTRÍAS/láminas gruesas.
+        # 1 = profundidad MEDIANA: elige UNA sola superficie por rayo (donde la
+        #     opacidad acumulada cruza 0.5) y descarta las demás -> colapsa las
+        #     láminas en una superficie SÓLIDA. Opera solo sobre cómo se extrae la
+        #     malla de las gaussianas YA entrenadas: es IMPOSIBLE que deforme el
+        #     cuarto o cambie su tamaño. Riesgo conocido: la mediana puede dejar
+        #     algún hueco en el techo si estuviera poco poblado -> por eso se dejó
+        #     la profundidad monocular en 0.2 (densifica el techo) y sdf_trunc en
+        #     5x (banda ancha que rellena). Si aparecieran huecos, DEPTH_RATIO=0.
+        _DEPTH_RATIO = os.environ.get("DEPTH_RATIO", "1")
+        log(f"   depth_ratio = {_DEPTH_RATIO} (1=mediana: colapsa las láminas en UNA superficie)")
+        log(f"$ python /opt/2dgs/render.py (BOUNDED) --depth_ratio {_DEPTH_RATIO} "
             f"--voxel_size {voxel:.4f} --sdf_trunc {sdf_trunc:.4f} "
             f"--depth_trunc {depth_trunc:.2f} --num_cluster 50  (OMP=8)")
         rc_mesh, _salida_mesh = run(
             ["python", "/opt/2dgs/render.py",
              "-s", str(dataset), "-m", str(dgs_out),
              "--skip_train", "--skip_test",
-             "--depth_ratio", "0",
+             "--depth_ratio", _DEPTH_RATIO,
              "--voxel_size", f"{voxel:.6f}",
              "--sdf_trunc", f"{sdf_trunc:.6f}",
              "--depth_trunc", f"{depth_trunc:.6f}",
