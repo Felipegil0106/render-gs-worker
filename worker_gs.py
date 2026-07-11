@@ -464,6 +464,7 @@ MESH_PLY   = sys.argv[1]
 IMAGES_DIR = sys.argv[2]
 SPARSE_DIR = sys.argv[3]
 OUT_GLB    = sys.argv[4]
+AO_PATH    = sys.argv[5] if len(sys.argv) > 5 else ""   # ambient occlusion por vertice
 
 def log(s): print("   [paint] " + s, flush=True)
 
@@ -561,7 +562,23 @@ log("proyectadas %d/%d camaras" % (nuse, len(views)))
 if nuse == 0:
     log("ninguna camara proyectada, abortando"); sys.exit(1)
 
-# 5) normalizar en LINEAL -> sRGB -> gamma 0.8 (anti-oscuro validado)
+# 5) COLOR FINAL — cadena arreglada (el render salia "blanco"/lavado):
+#    (a) color FIEL desde las fotos (promedio en LINEAL -> sRGB). El gamma 0.8 que
+#        habia aqui INFLABA el brillo ~15% y empujaba todo hacia el blanco.
+#    (b) SATURACION: promediar ~127 vistas LAVA el color (como un desenfoque de
+#        color). Se recupera empujando la saturacion.
+#    (c) AMBIENT OCCLUSION: sombras de contacto en rincones/juntas. El post-proceso
+#        YA lo calculaba, pero este script lo BORRABA al sobrescribir el color ->
+#        render plano sin profundidad. Ahora se vuelve a aplicar.
+#    (d) gamma final leve, para compensar el oscurecimiento del AO.
+#    TODO ajustable por entorno SIN tocar codigo:
+#      PAINT_SAT  1.35 (1.0 = fiel a la foto; 1.5 = colores mas vivos)
+#      PAINT_AO   0.40 (0 = sin sombras/plano; 0.55 = mas profundidad/mas oscuro)
+#      PAINT_GAMMA 1.0 (0.9 = mas claro; 1.1 = mas oscuro). El 0.8 de antes
+#                  QUEMABA el 27% de la superficie hacia el blanco = el "velo blanco".
+_SAT   = float(os.environ.get("PAINT_SAT", "1.35"))
+_AOSTR = float(os.environ.get("PAINT_AO", "0.40"))
+_GAM   = float(os.environ.get("PAINT_GAMMA", "1.0"))
 painted = wsumV > 0
 cols = np.zeros((len(V), 3), np.float32)
 if orig is not None:
@@ -569,8 +586,34 @@ if orig is not None:
 else:
     cols[:] = 0.5
 lin = (accV[painted] / wsumV[painted, None]).astype(np.float32)
-cols[painted] = np.clip(linear_to_srgb(lin) ** 0.8, 0, 1)
+cols[painted] = np.clip(linear_to_srgb(lin), 0, 1)          # (a) color FIEL
 log("pintados %d/%d vertices (%.1f%%) desde las fotos" % (painted.sum(), len(V), 100.0*painted.mean()))
+_b0 = float(cols.mean())
+# (b) SATURACION alrededor de la luminancia (no cambia el brillo, solo la viveza)
+if abs(_SAT - 1.0) > 1e-3:
+    _lum = (cols * np.array([0.2126, 0.7152, 0.0722], np.float32)).sum(1, keepdims=True)
+    cols = np.clip(_lum + (cols - _lum) * _SAT, 0, 1)
+# (c) AMBIENT OCCLUSION (el paso que faltaba: devuelve profundidad y quita el "velo blanco")
+_ao = None
+if AO_PATH and os.path.exists(AO_PATH):
+    try:
+        _a = np.load(AO_PATH).astype(np.float32)
+        if len(_a) == len(V) and np.isfinite(_a).all():
+            _ao = np.clip(_a, 0.0, 1.0)
+        else:
+            log("AO ignorado: %d valores vs %d vertices" % (len(_a), len(V)))
+    except Exception as _e:
+        log("AO no cargado (%s)" % _e)
+if _ao is not None:
+    cols = cols * (1.0 - _AOSTR * _ao)[:, None]
+    log("AO aplicado al color de las fotos (fuerza %.2f, oclusion media %.3f)" % (_AOSTR, float(_ao.mean())))
+else:
+    log("AVISO: sin AO -> el render puede verse plano/lavado")
+# (d) gamma final
+cols = np.clip(cols, 0, 1) ** _GAM
+cols = np.nan_to_num(cols, nan=0.5, posinf=1.0, neginf=0.0)
+cols = np.clip(cols, 0, 1).astype(np.float32)
+log("color: brillo %.3f -> %.3f (sat %.2f, AO %.2f, gamma %.2f)" % (_b0, float(cols.mean()), _SAT, _AOSTR, _GAM))
 
 # 6) exportar .glb: color por vertice + normales suaves + mate + unlit
 rgba = np.concatenate([(cols*255).astype(np.uint8),
@@ -1362,17 +1405,47 @@ def main():
         # que preserva la estructura; subirlo la rompe. Se vuelve a 25 (estructura
         # intacta como en el render b02d2d8c). Las estrías se atacan por la vía SEGURA
         # (extracción de malla: depth_ratio=1), no tocando la geometría entrenada.
+        # ── VELOCIDAD: dónde viven las imágenes de entrenamiento ──
+        # "cpu" = las 127 fotos viven en RAM y se COPIAN a la GPU en CADA una de las
+        # 30.000 iteraciones. "cuda" = viven en la VRAM y no se copian nunca.
+        # Es la MISMA matemática y el MISMO resultado (ni un pixel cambia): solo
+        # cambia DÓNDE están los datos. Cuesta ~1.2 GB de VRAM (127 fotos de
+        # 1000x750). Se activa solo si la GPU tiene ≥20 GB (4090=24, A6000=48), y
+        # si el entrenamiento fallara por memoria, REINTENTA solo con cpu (red de
+        # seguridad: el render no se pierde). Forzable con DATA_DEVICE=cpu/cuda.
+        _dev = os.environ.get("DATA_DEVICE", "")
+        if not _dev:
+            _dev = "cpu"
+            try:
+                _r = subprocess.run(["nvidia-smi", "--query-gpu=memory.total",
+                                     "--format=csv,noheader,nounits"],
+                                    capture_output=True, text=True, timeout=20)
+                _vram = int(_r.stdout.strip().splitlines()[0])
+                if _vram >= 20000:
+                    _dev = "cuda"
+                log(f"   VRAM {_vram/1000:.0f} GB → data_device={_dev}"
+                    f"{' (imágenes en VRAM: sin copiar 30.000 veces)' if _dev=='cuda' else ' (VRAM justa: modo seguro)'}")
+            except Exception as _e:
+                log(f"   (no pude leer la VRAM: {_e}) → data_device=cpu (modo seguro)")
         _LAMBDA_DIST = os.environ.get("LAMBDA_DIST", "25")
         log(f"   lambda_dist = {_LAMBDA_DIST} (25 preserva estructura; 100 deformaba)")
-        _rc_tr, _out_tr = run(["python", "/opt/2dgs/train.py",
-             "-s", str(dataset), "-m", str(dgs_out),
-             "--iterations", str(ITERS),
-             "--lambda_dist", _LAMBDA_DIST,
-             "--lambda_normal", "0.05",
-             "-r", "1",                   # usar la resolución COMPLETA de las imágenes (1000px), no reducir
-             "--data_device", "cpu"],     # imágenes en RAM (no en VRAM) → evita quedarse sin memoria a alta resolución
-            fase_label="PASO 3/5 — Entrenando 2DGS")
-        log("   2DGS entrenado")
+        def _entrenar(_dd):
+            return run(["python", "/opt/2dgs/train.py",
+                 "-s", str(dataset), "-m", str(dgs_out),
+                 "--iterations", str(ITERS),
+                 "--lambda_dist", _LAMBDA_DIST,
+                 "--lambda_normal", "0.05",
+                 "-r", "1",                 # resolución COMPLETA (1000px), no reducir
+                 "--data_device", _dd],
+                fase_label="PASO 3/5 — Entrenando 2DGS", check=False)
+        _t_tr = time.time()
+        _rc_tr, _out_tr = _entrenar(_dev)
+        if _rc_tr != 0 and _dev == "cuda":
+            log("   ⚠ el entrenamiento falló en VRAM (probable falta de memoria); REINTENTO en modo seguro (cpu)")
+            _rc_tr, _out_tr = _entrenar("cpu")
+        if _rc_tr != 0:
+            raise RuntimeError(f"El entrenamiento 2DGS falló (código {_rc_tr}).")
+        log(f"   2DGS entrenado en {(time.time()-_t_tr)/60:.1f} min (data_device={_dev})")
         # ── CHEQUEO DE CALIDAD (PSNR) — red de seguridad ──
         # La investigación mostró que el entrenamiento puede salir mal e inestable.
         # Leemos el PSNR final del log de 2DGS y avisamos si salió bajo (< 30): en ese
@@ -1668,6 +1741,12 @@ def main():
             "        ao[s:s+_ch] = hh.sum(1)/np.maximum(u2.sum(1),1)\n"
             "    C = np.asarray(m.vertex_colors)\n"
             "    ao = np.nan_to_num(ao, nan=0.0, posinf=0.0, neginf=0.0)\n"
+            # GUARDAR EL AO A DISCO: el pintor (paso 4c) SOBRESCRIBE el color de los
+            # vertices con el de las fotos, y hasta ahora eso BORRABA el AO en el 97%
+            # de los vertices -> render plano, lavado, "blanco". Guardandolo aqui, el
+            # pintor puede volver a aplicarlo sobre el color de las fotos.
+            "    np.save('/workspace/job/ao.npy', ao.astype(np.float32))\n"
+            "    print('AO guardado para el pintor (%d vertices)' % len(ao), flush=True)\n"
             "    if len(C) == len(Vv):\n"
             "        C = C * (1 - 0.3*ao)[:,None]\n"
             "        C = np.clip(C, 0, 1) ** 0.85\n"
@@ -1849,7 +1928,8 @@ def main():
                 paint_py = WORK / "vertex_paint.py"
                 paint_py.write_text(VERTEXPAINT_SCRIPT)
                 run(["python", str(paint_py), str(malla), str(dataset / "images"),
-                     str(dataset / "sparse" / "0"), str(glb_tex)],
+                     str(dataset / "sparse" / "0"), str(glb_tex),
+                     str(WORK / "ao.npy")],   # AO -> devuelve profundidad al color
                     fase_label="PASO 4c/5 — Pintando vértices", check=False)
                 if glb_tex.exists() and glb_tex.stat().st_size > 1000:
                     log(f"   ✓ vértices pintados desde las FOTOS: {glb_tex.stat().st_size/1e6:.1f} MB")
@@ -1892,4 +1972,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()s
