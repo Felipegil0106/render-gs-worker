@@ -1158,8 +1158,8 @@ def main():
             _img_tag = Path("/opt/IMAGE_TAG").read_text().strip()
         except Exception:
             _img_tag = "v3-o-v4-vieja (sin marcador)"
-        _bn_dr = os.environ.get("DEPTH_RATIO", "1")
-        log(f"═══ render-gs-worker 2DGS · v4-priors-baOFF-median(dr{_bn_dr}) · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
+        _bn_pr = "priorsOFF" if os.environ.get("MONO_PRIORS", "0") != "1" else "priorsON"
+        log(f"═══ render-gs-worker 2DGS · v4-{_bn_pr}-baOFF-dist25 · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
         fase(0.05, "PASO 1/5 — Descargando fotos")
@@ -1251,14 +1251,23 @@ def main():
         else:
             log("   PASO 2b saltado (POSE_BA=0)")
 
-        # ── PASO 2c: priors monoculares (profundidad + normales) por foto ──
-        # Un modelo entrenado en millones de interiores "adivina" la profundidad
-        # y la orientación (normal) de cada pixel de CADA foto. Con eso el
-        # entrenamiento sabe qué hacer en paredes/techos lisos donde las fotos
-        # solas no anclan nada: cierra huecos y deja el techo continuo.
-        # Si algo falla, seguimos sin priors (el render no se pierde).
-        # Apagable sin rebuild: MONO_PRIORS=0.
-        if os.environ.get("MONO_PRIORS", "1") != "0":
+        # ── PASO 2c: priors monoculares — APAGADOS (causa de las LÁMINAS) ──
+        # EVIDENCIA DURA de los logs: al activar los priors, la malla cruda pasó de
+        # 17,949 a 116,896 PEDAZOS SUELTOS (6.5x), las gaussianas de 922k a 1.96M
+        # (2.1x) y el error de orientación de los surfels de 12° a 45° (13x peor).
+        # Y la queja de "láminas/branquias" apareció EXACTAMENTE en ese momento
+        # (nunca antes en todo el proyecto).
+        # MECANISMO: la profundidad monocular se alinea (escala+desplazamiento) FOTO
+        # POR FOTO. Cada foto pide la misma pared a una distancia distinta; para
+        # complacerlas a todas, el entrenamiento CONSTRUYE UNA CAPA POR VERSIÓN ->
+        # capas apiladas = las estrías. Está documentado (MonoFusion: "duplicated
+        # object parts" por la escala-shift por vista).
+        # Se APAGAN (MONO_PRIORS=0). Apagar una pérdida NO puede deformar el cuarto
+        # (solo quita una restricción; la forma viene de las poses MASt3R + fotos).
+        # Riesgo conocido: sin la profundidad, el techo liso puede volver a tener
+        # algún hueco -> lo compensa sdf_trunc 5x (banda ancha que rellena).
+        # Reactivable con MONO_PRIORS=1.
+        if os.environ.get("MONO_PRIORS", "0") == "1":
             fase(0.42, "PASO 2c/5 — Priors monoculares (profundidad+normales)")
             pri_py = WORK / "make_priors.py"
             pri_py.write_text(PRIORS_SCRIPT)
@@ -1452,19 +1461,13 @@ def main():
         # daba z-fighting. Si el DIAG vuelve a mostrar dos componentes ~50%, bajar
         # sdf_trunc a 3x. El suavizado Taubin del post-proceso limpia el ruido de
         # usar media en vez de mediana.
-        # ── depth_ratio: EL ATAQUE ANTI-ESTRÍAS (extracción, NO deforma) ──
-        # 0 = profundidad MEDIA: mezcla TODAS las capas apiladas que ve cada rayo ->
-        #     el TSDF talla varias cáscaras = las ESTRÍAS/láminas gruesas.
-        # 1 = profundidad MEDIANA: elige UNA sola superficie por rayo (donde la
-        #     opacidad acumulada cruza 0.5) y descarta las demás -> colapsa las
-        #     láminas en una superficie SÓLIDA. Opera solo sobre cómo se extrae la
-        #     malla de las gaussianas YA entrenadas: es IMPOSIBLE que deforme el
-        #     cuarto o cambie su tamaño. Riesgo conocido: la mediana puede dejar
-        #     algún hueco en el techo si estuviera poco poblado -> por eso se dejó
-        #     la profundidad monocular en 0.2 (densifica el techo) y sdf_trunc en
-        #     5x (banda ancha que rellena). Si aparecieran huecos, DEPTH_RATIO=0.
-        _DEPTH_RATIO = os.environ.get("DEPTH_RATIO", "1")
-        log(f"   depth_ratio = {_DEPTH_RATIO} (1=mediana: colapsa las láminas en UNA superficie)")
+        # ── depth_ratio: VUELTA A 0 (promedio). La mediana (1) se probó y EMPEORÓ:
+        # no quitó las estrías, quitó estructura (componente principal 95%->82%,
+        # pedazos 1713->3686) y blanqueó el tono. Las estrías NO son un problema de
+        # extracción: se fabrican en el entrenamiento (priors). Aquí se restaura el
+        # valor de b02d2d8c.
+        _DEPTH_RATIO = os.environ.get("DEPTH_RATIO", "0")
+        log(f"   depth_ratio = {_DEPTH_RATIO} (0=promedio, el de b02d2d8c; la mediana empeoró)")
         log(f"$ python /opt/2dgs/render.py (BOUNDED) --depth_ratio {_DEPTH_RATIO} "
             f"--voxel_size {voxel:.4f} --sdf_trunc {sdf_trunc:.4f} "
             f"--depth_trunc {depth_trunc:.2f} --num_cluster 50  (OMP=8)")
@@ -1511,6 +1514,26 @@ def main():
                 f"Posible: pocas iteraciones o poses débiles.")
         ply_mb = malla.stat().st_size / 1e6
         log(f"   malla: {malla.name} ({ply_mb:.1f} MB)")
+        # ── MEDIDOR DE LÁMINAS (objetivo, no depende del ojo) ──
+        # render.py imprime "#clusters=N": los PEDAZOS SUELTOS de la malla cruda.
+        # Una superficie sólida = pocos pedazos. Las láminas = muchísimos pedazos.
+        # Referencias medidas en este proyecto:
+        #   ~18,000  = SIN priors, superficie sana (nunca hubo queja de estrías)
+        #  ~117,000  = CON priors (render b02d2d8c): LAMINADO
+        #  ~317,000  = CON priors + mediana: PEOR
+        try:
+            import re as _re2
+            _cl = _re2.findall(r'#clusters=(\d+)', _salida_mesh or "")
+            if _cl:
+                _nc = int(_cl[-1])
+                if _nc < 40000:
+                    log(f"   ✓ LÁMINAS: {_nc} pedazos sueltos — SANO (ref: 18k sano / 117k laminado)")
+                elif _nc < 80000:
+                    log(f"   ~ LÁMINAS: {_nc} pedazos sueltos — MEJOR pero no del todo (ref: 18k sano / 117k laminado)")
+                else:
+                    log(f"   ⚠ LÁMINAS: {_nc} pedazos sueltos — SIGUE LAMINADO (ref: 18k sano / 117k laminado)")
+        except Exception as _e:
+            log(f"   (no pude medir las láminas: {_e})")
 
         # ── Limpiar + SUAVIZAR + simplificar la malla ──
         # 3 mejoras (investigación) sobre la malla cruda:
