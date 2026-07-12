@@ -25,6 +25,15 @@ UPLOAD_URL_PLY  = os.environ.get("UPLOAD_URL_PLY", "")     # subida del .ply
 CALLBACK_URL    = os.environ.get("CALLBACK_URL", "")       # a dónde reportar
 CALLBACK_SECRET = os.environ.get("CALLBACK_SECRET", "")    # para firmar HMAC
 QUALITY         = os.environ.get("QUALITY", "fast")
+# ID del pod donde estoy corriendo. RunPod lo inyecta solo. Se lo mandamos al
+# backend en CADA callback para que SIEMPRE sepa a quién apagar, aunque su base
+# de datos se haya borrado (Railway borra /data en cada reinicio/despliegue).
+# Sin esto pasó lo siguiente EN PRODUCCIÓN: el render terminó, el aviso rebotó
+# con 404, nadie apagó el pod, RunPod lo relanzó y volvió a rendir 35 min. En
+# bucle. Cobrando GPU.
+POD_ID = (os.environ.get("RUNPOD_POD_ID")
+          or os.environ.get("RUNPOD_POD_HOSTNAME", "").split("-")[0]
+          or "")
 
 # Iteraciones de 2DGS según calidad.
 # 2DGS aplica el regularizador de "normales" (une superficies) a partir de la
@@ -1118,10 +1127,12 @@ def _firmar(body: bytes) -> str:
     return hmac.new(CALLBACK_SECRET.encode(), body, hashlib.sha256).hexdigest()
 
 def callback(tipo, **datos):
-    """Manda un callback firmado al backend (progress/completed/error)."""
+    """Manda un callback firmado al backend (progress/completed/error).
+    SIEMPRE incluye pod_id: es lo único que permite al backend apagar este pod
+    aunque haya perdido su base de datos."""
     if not CALLBACK_URL:
         return
-    payload = {"type": tipo, **datos}
+    payload = {"type": tipo, "pod_id": POD_ID, **datos}
     body = json.dumps(payload).encode()
     try:
         req = urllib.request.Request(
@@ -1196,6 +1207,39 @@ def run(cmd, cwd=None, env=None, fase_label=None, check=True):
 def main():
     t0 = time.time()
     hb = threading.Thread(target=_latido, daemon=True); hb.start()
+    # ═══════════════════════════════════════════════════════════════════════
+    # SEGURO ANTI-BUCLE (el que te quemó crédito toda una noche)
+    # ───────────────────────────────────────────────────────────────────────
+    # Cuando el worker termina, el proceso principal del contenedor se acaba y
+    # RUNPOD LO RELANZA AUTOMÁTICAMENTE. Lo normal es que el backend apague el
+    # pod al recibir el aviso de "completed"... pero si ese aviso falla (404 por
+    # BD borrada, red, Railway reiniciando), NADIE lo apaga: RunPod lo relanza y
+    # el worker VUELVE A RENDIR 35 MINUTOS. Y otra vez. Y otra. Pasó de verdad.
+    # ARREGLO: al terminar dejamos una MARCA en /workspace (que es el volumen del
+    # pod y SOBREVIVE al reinicio del contenedor). Si al arrancar la marca ya
+    # existe, este job YA SE HIZO: NO se vuelve a rendir. Solo se reintenta el
+    # aviso al backend (por si aquella vez falló) y se sale.
+    # ═══════════════════════════════════════════════════════════════════════
+    marca = Path("/workspace") / f"HECHO_{TOUR_ID}.txt"
+    if marca.exists():
+        log("═" * 60)
+        log(f"⚠ ESTE JOB YA SE RENDERIZÓ ({TOUR_ID}). NO lo repito.")
+        log("  (RunPod relanzó el contenedor porque nadie apagó el pod.)")
+        log("  Reintento avisarle al backend para que lo apague...")
+        log("═" * 60)
+        try:
+            info = json.loads(marca.read_text())
+        except Exception:
+            info = {}
+        _estado["vivo"] = False
+        callback("completed",
+                 frames_used=info.get("frames_used", 0),
+                 ply_mb=info.get("ply_mb", 0),
+                 seconds=info.get("seconds", 0),
+                 log="\n".join(_LOG))
+        log("Aviso reenviado. Si el pod sigue encendido, APÁGALO EN runpod.io.")
+        time.sleep(20)          # dar tiempo a que el backend lo apague
+        sys.exit(0)
     try:
         try:
             _img_tag = Path("/opt/IMAGE_TAG").read_text().strip()
@@ -1961,12 +2005,33 @@ def main():
         _estado["vivo"] = False
         seconds = time.time() - t0
         log(f"═══ LISTO en {seconds/60:.1f} min ═══")
+        # MARCA DE TERMINADO: se escribe ANTES de avisar al backend, a propósito.
+        # Si el aviso falla (404, red caída, Railway reiniciando) y RunPod relanza
+        # el contenedor, el worker verá esta marca y NO volverá a rendir. Sin ella
+        # se repetía el render entero: 35 min de GPU, una y otra vez.
+        try:
+            marca.write_text(json.dumps({
+                "frames_used": n_fotos, "ply_mb": round(ply_mb, 1),
+                "seconds": round(seconds), "pod_id": POD_ID}))
+            log("   marca de terminado escrita — este job NO se repetirá aunque se reinicie")
+        except Exception as _me:
+            log(f"   ⚠ no pude escribir la marca ({_me}); si el pod se reinicia PODRÍA repetir")
         callback("completed", frames_used=n_fotos, ply_mb=round(ply_mb, 1),
                  seconds=round(seconds), log="\n".join(_LOG))
+        if POD_ID:
+            log(f"   backend avisado (pod {POD_ID}); debería apagarse solo")
+        else:
+            log("   ⚠ no sé mi pod_id: si no se apaga solo, apágalo en runpod.io")
 
     except Exception as e:
         _estado["vivo"] = False
         log(f"✗ ERROR: {e}")
+        # Marca también al fallar: un error determinista (ZIP corrupto, imagen mala)
+        # volvería a fallar igual al reiniciar, quemando GPU para nada.
+        try:
+            marca.write_text(json.dumps({"error": str(e)[:200], "pod_id": POD_ID}))
+        except Exception:
+            pass
         callback("error", error_message=str(e), log="\n".join(_LOG))
         sys.exit(1)
 
