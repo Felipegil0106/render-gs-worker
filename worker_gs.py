@@ -531,9 +531,32 @@ nuse = 0
 for cid, name, E, R, t in views:
     if cid not in cams: continue
     W, H, fx, fy, cx, cy = cams[cid]
+    # PINTAR DESDE LAS FOTOS DE 12MP (originales) en vez de las de 1000px.
+    # El color se ve borroso de cerca en parte por la resolución de la foto de
+    # entrenamiento (1000px). Si existe la original (12MP), la usamos.
+    # OJO: MASt3R RECORTA al centro las fotos de entrenamiento al aspecto W/H de
+    # cameras.txt antes de escalarlas. Para NO desalinear, aplicamos EXACTAMENTE
+    # el mismo recorte central a la foto original; tras el recorte, el aspecto
+    # coincide y el escalado de intrínsecos (sx=Wp/W) ya es correcto.
+    # PAINT_ORIG_DIR lo pasa el worker; si falta, cae a la de entrenamiento.
     path = os.path.join(IMAGES_DIR, name)
+    _origdir = os.environ.get("PAINT_ORIG_DIR", "")
+    _usa_orig = False
+    if _origdir:
+        _cand = os.path.join(_origdir, name)
+        if os.path.exists(_cand):
+            path = _cand; _usa_orig = True
     if not os.path.exists(path): continue
-    photo = np.asarray(Image.open(path).convert("RGB"), np.float32) / 255.0
+    _im = Image.open(path).convert("RGB")
+    if _usa_orig:
+        _Wo, _Ho = _im.size; _asp = W / float(H)
+        if (_Wo / float(_Ho)) > _asp:
+            _cw = int(round(_Ho * _asp)); _ch = _Ho
+        else:
+            _cw = _Wo; _ch = int(round(_Wo / _asp))
+        _l = (_Wo - _cw) // 2; _tp = (_Ho - _ch) // 2
+        _im = _im.crop((_l, _tp, _l + _cw, _tp + _ch))   # MISMO recorte que MASt3R
+    photo = np.asarray(_im, np.float32) / 255.0
     photo = srgb_to_linear(photo)
     Hp, Wp = photo.shape[:2]
     sx = Wp / float(W); sy = Hp / float(H)
@@ -585,9 +608,17 @@ if nuse == 0:
 #      PAINT_AO   0.40 (0 = sin sombras/plano; 0.55 = mas profundidad/mas oscuro)
 #      PAINT_GAMMA 1.0 (0.9 = mas claro; 1.1 = mas oscuro). El 0.8 de antes
 #                  QUEMABA el 27% de la superficie hacia el blanco = el "velo blanco".
-_SAT   = float(os.environ.get("PAINT_SAT", "1.35"))
+_SAT   = float(os.environ.get("PAINT_SAT", "1.15"))
 _AOSTR = float(os.environ.get("PAINT_AO", "0.40"))
 _GAM   = float(os.environ.get("PAINT_GAMMA", "1.0"))
+# ESPACIO DE COLOR DE SALIDA (arregla el "velo blanco" residual).
+# La spec de glTF dice que el color por vértice COLOR_0 es LINEAL, no sRGB. Este
+# pintor venía guardándolo en sRGB -> los visores correctos le aplicaban gamma
+# OTRA VEZ = doble gamma = lavado. PAINT_STORE=linear (nuevo default) guarda en
+# lineal como manda la spec: se ve fiel en gltf-viewer.donmccurdy.com (Linear) y
+# en F3D --unlit. Si algún visor viejo lo necesita en sRGB, PAINT_STORE=srgb.
+# Nota: como ya no hay doble-gamma que compensar, bajo PAINT_SAT de 1.35 a 1.15.
+_STORE = os.environ.get("PAINT_STORE", "linear").lower()
 painted = wsumV > 0
 cols = np.zeros((len(V), 3), np.float32)
 if orig is not None:
@@ -623,6 +654,18 @@ cols = np.clip(cols, 0, 1) ** _GAM
 cols = np.nan_to_num(cols, nan=0.5, posinf=1.0, neginf=0.0)
 cols = np.clip(cols, 0, 1).astype(np.float32)
 log("color: brillo %.3f -> %.3f (sat %.2f, AO %.2f, gamma %.2f)" % (_b0, float(cols.mean()), _SAT, _AOSTR, _GAM))
+
+# ESPACIO DE SALIDA: la spec de glTF exige COLOR_0 en LINEAL. Todo el ajuste
+# (saturación, AO, gamma) se hizo en sRGB porque es perceptual; ahora, si
+# PAINT_STORE=linear (default), convertimos a lineal para guardarlo como manda
+# la spec. Así los visores correctos NO le vuelven a aplicar gamma (adiós doble
+# gamma / velo blanco). PAINT_STORE=srgb mantiene el comportamiento viejo.
+if _STORE == "linear":
+    cols = np.clip(srgb_to_linear(cols), 0, 1).astype(np.float32)
+    log("COLOR_0 guardado en LINEAL (spec glTF): evaluar en "
+        "gltf-viewer.donmccurdy.com [Tone Mapping=Linear] o F3D --unlit")
+else:
+    log("COLOR_0 guardado en sRGB (modo compatible viejo)")
 
 # 6) exportar .glb: color por vertice + normales suaves + mate + unlit
 rgba = np.concatenate([(cols*255).astype(np.uint8),
@@ -1246,7 +1289,12 @@ def main():
         except Exception:
             _img_tag = "v3-o-v4-vieja (sin marcador)"
         _bn_pr = "priorsOFF" if os.environ.get("MONO_PRIORS", "0") != "1" else "priorsON"
-        log(f"═══ render-gs-worker 2DGS · v4-{_bn_pr}-baOFF-dist25 · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
+        _bn_sm = os.environ.get("SMOOTH_MODE", "twostep")
+        _bn_sn = "snapON" if os.environ.get("PLANE_SNAP", "1") == "1" else "snapOFF"
+        _bn_tr = int(os.environ.get("MESH_TRIS", "2500000")) // 1000
+        _bn_st = os.environ.get("PAINT_STORE", "linear")
+        log(f"═══ render-gs-worker 2DGS · v5-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}"
+            f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
         fase(0.05, "PASO 1/5 — Descargando fotos")
@@ -1666,6 +1714,7 @@ def main():
         script_dec = (
             "import open3d as o3d\n"
             "import numpy as np\n"
+            "import os\n"
             f"m = o3d.io.read_triangle_mesh(r'{malla}')\n"
             "n0 = len(m.triangles)\n"
             "print('DIAG vertices', len(m.vertices), 'triangulos', n0, flush=True)\n"
@@ -1719,18 +1768,151 @@ def main():
             # fuerte solo quita lo malo. Taubin NO encoge la malla (preserva volumen),
             # solo alisa. FAIL-SAFE: si quita demasiado (bordes muy redondeados), bajar
             # a 3.
-            "try:\n"
-            "    m = m.filter_smooth_taubin(number_of_iterations=8)\n"
-            "    print('SMOOTH Taubin 8 iter (alisa rugosidad/braille) OK', flush=True)\n"
-            "except Exception as e:\n"
-            "    print('SMOOTH (fallo, sigo):', e, flush=True)\n"
-            # --- 3) DECIMAR a ~1.2M — la config que MEJOR se vio (Fase 0) ---
-            #     Decimar agresivo (a 300k/600k) FRAGMENTÓ la malla en >1000 pedazos
-            #     → eso causaba los HUECOS. 1.2M es una reducción suave (~2×) que NO
-            #     rompe la malla. Con NORMALES SUAVES en el .glb no se ven triángulos
-            #     aunque sea densa. FAIL-SAFE: si pesa mucho, probar 900k (sin bajar
-            #     de ahí, porque por debajo empieza a fragmentar y salen huecos).
-            "target = 1200000\n"
+            # --- 2) SUAVIZADO BILATERAL "TwoStep" (preserva aristas) ---
+            # ANTES: Taubin 8 iter, que alisa TODO POR IGUAL -> quitaba la lija pero
+            # también REDONDEABA los muebles (el síntoma "geometría derretida").
+            # AHORA: TwoStep Smooth de MeshLab (Belyaev & Ohtake), que es un filtro
+            # BILATERAL en dos etapas: (1) promedia solo normales PARECIDAS entre sí,
+            # (2) recoloca los vértices para ajustarse a esas normales. Las aristas que
+            # forman ángulos MAYORES al umbral (45°) SE PRESERVAN. Resultado: alisa lo
+            # plano (paredes/techo/piso) y NO redondea las esquinas ni los muebles.
+            # Si pymeshlab no está o falla, cae a Taubin (comportamiento anterior).
+            "SMOOTH_MODE = os.environ.get('SMOOTH_MODE', 'twostep')\n"
+            "_suavizado = False\n"
+            "if SMOOTH_MODE == 'twostep':\n"
+            "    try:\n"
+            "        import pymeshlab\n"
+            "        Vs = np.array(m.vertices, dtype=np.float64)   # COPIA (no vista)\n"
+            "        Ts = np.asarray(m.triangles)\n"
+            "        ms = pymeshlab.MeshSet()\n"
+            "        ms.add_mesh(pymeshlab.Mesh(vertex_matrix=Vs, face_matrix=Ts))\n"
+            "        ms.apply_coord_two_steps_smoothing(\n"
+            "            stepsmoothnum=4, normalthr=45.0, stepnormalnum=20, stepfitnum=15,\n"
+            "            selected=False)\n"
+            "        Vn = ms.current_mesh().vertex_matrix()\n"
+            "        assert Vn.shape == Vs.shape, 'TwoStep cambio el numero de vertices'\n"
+            "        _des = float(np.linalg.norm(Vn - Vs, axis=1).mean())\n"
+            "        m.vertices = o3d.utility.Vector3dVector(Vn)\n"
+            "        print('SMOOTH TwoStep bilateral OK (umbral 45 grados; preserva aristas); '\n"
+            "              'desplazamiento medio %.2f mm' % (_des*1000), flush=True)\n"
+            "        _suavizado = True\n"
+            "    except Exception as e:\n"
+            "        print('SMOOTH TwoStep FALLO (%s) -> caigo a Taubin' % e, flush=True)\n"
+            "if not _suavizado:\n"
+            "    try:\n"
+            "        m = m.filter_smooth_taubin(number_of_iterations=8)\n"
+            "        print('SMOOTH Taubin 8 iter (respaldo) OK', flush=True)\n"
+            "    except Exception as e:\n"
+            "        print('SMOOTH (fallo, sigo):', e, flush=True)\n"
+            # --- 2b) SNAP A PLANOS (RANSAC) — paredes/techo/piso PLANOS DE VERDAD ---
+            # Detecta los planos dominantes del cuarto y proyecta SOLO sus vértices
+            # sobre el plano ideal. Es post-proceso puro: no reescala nada, no toca
+            # el entrenamiento -> RIESGO CERO de deformar la estructura.
+            # TRES CANDADOS para NO aplanar la cama ni los muebles:
+            #   1) TAMAÑO: el plano debe medir >=1.2 m en sus dos ejes (una cama no).
+            #   2) PERIFERIA: el plano debe estar en el BORDE del cuarto (paredes,
+            #      techo, piso), no flotando en el medio (la cama está en el medio).
+            #   3) NORMAL DEL VÉRTICE: solo se mueve el vértice si su normal ya
+            #      apunta casi igual que el plano (<35 grados) -> los objetos apoyados
+            #      contra la pared no se absorben.
+            # Además: FEATHERING en el borde (anillos con peso 0.75/0.5/0.25) para que
+            # no quede un escalón entre la zona aplanada y el resto.
+            "PLANE_SNAP = os.environ.get('PLANE_SNAP', '1') == '1'\n"
+            "if PLANE_SNAP:\n"
+            "  try:\n"
+            "    import scipy.sparse as _sp\n"
+            "    _V = np.asarray(m.vertices); _T = np.asarray(m.triangles)\n"
+            "    m.compute_vertex_normals()\n"
+            "    _N = np.asarray(m.vertex_normals)\n"
+            "    _ab = m.get_axis_aligned_bounding_box()\n"
+            "    _ext = _ab.get_extent(); _cg = _ab.get_center()\n"
+            "    _half = np.linalg.norm(_ext)/2.0\n"
+            "    _diag = float(np.linalg.norm(_ext))\n"
+            "    _thr = float(np.clip(0.004*_diag, 0.012, 0.03))   # ~2.5 cm\n"
+            "    _minin = max(30000, int(0.03*len(_V)))\n"
+            "    # grafo de vecinos (para el feathering)\n"
+            "    _e0 = np.concatenate([_T[:,0],_T[:,1],_T[:,2]])\n"
+            "    _e1 = np.concatenate([_T[:,1],_T[:,2],_T[:,0]])\n"
+            "    _A = _sp.csr_matrix((np.ones(len(_e0),dtype=np.int8), (_e0,_e1)),\n"
+            "                        shape=(len(_V),len(_V)))\n"
+            "    _A = _A + _A.T\n"
+            "    _pcd = o3d.geometry.PointCloud()\n"
+            "    _pcd.points = o3d.utility.Vector3dVector(_V)\n"
+            "    _rest = np.arange(len(_V))\n"
+            "    _nuevo = _V.copy(); _nplanos = 0\n"
+            "    for _ronda in range(8):\n"
+            "        if len(_rest) < _minin: break\n"
+            "        _sub = o3d.geometry.PointCloud()\n"
+            "        _sub.points = o3d.utility.Vector3dVector(_V[_rest])\n"
+            "        try:\n"
+            "            _mod, _inl = _sub.segment_plane(distance_threshold=_thr,\n"
+            "                                            ransac_n=3, num_iterations=2000)\n"
+            "        except Exception:\n"
+            "            break\n"
+            "        if len(_inl) < _minin: break\n"
+            "        _idx = _rest[np.asarray(_inl)]\n"
+            "        _rest = np.setdiff1d(_rest, _idx, assume_unique=False)\n"
+            "        _a,_b,_c,_d = _mod; _nrm = np.array([_a,_b,_c],dtype=np.float64)\n"
+            "        _ln = np.linalg.norm(_nrm)\n"
+            "        if _ln < 1e-9: continue\n"
+            "        _nrm = _nrm/_ln; _d = _d/_ln\n"
+            "        # CANDADO 1 — tamaño: debe medir >=1.2 m en sus dos ejes\n"
+            "        _pv = _V[_idx]\n"
+            "        _u = np.array([1.0,0,0]) if abs(_nrm[0])<0.9 else np.array([0,1.0,0])\n"
+            "        _e_1 = np.cross(_nrm,_u); _e_1 /= (np.linalg.norm(_e_1)+1e-12)\n"
+            "        _e_2 = np.cross(_nrm,_e_1)\n"
+            "        _p1 = _pv@_e_1; _p2 = _pv@_e_2\n"
+            "        _ex2 = (float(_p1.max()-_p1.min()), float(_p2.max()-_p2.min()))\n"
+            "        if min(_ex2) < 1.2:\n"
+            "            print('PLANO descartado (pequeno %.2fx%.2f m: es un mueble)'\n"
+            "                  % _ex2, flush=True); continue\n"
+            "        # CANDADO 2 — periferia: debe estar en el BORDE del cuarto\n"
+            "        _perif = abs(float(_nrm@_cg) + _d) / max(_half,1e-9)\n"
+            "        if _perif < 0.5:\n"
+            "            print('PLANO descartado (esta en el MEDIO del cuarto, perif %.2f:'\n"
+            "                  ' probablemente un mueble)' % _perif, flush=True); continue\n"
+            "        # CANDADO 3 — normal del vertice casi paralela al plano (<35 grados)\n"
+            "        _cos = np.abs(_N[_idx] @ _nrm)\n"
+            "        _core = _idx[_cos > 0.819]\n"
+            "        if len(_core) < _minin//2:\n"
+            "            print('PLANO descartado (normales no coinciden)', flush=True); continue\n"
+            "        # distancia ANTES (para medir la mejora)\n"
+            "        _dist0 = np.abs(_V[_core] @ _nrm + _d)\n"
+            "        _rms0 = float(np.sqrt((_dist0**2).mean()))\n"
+            "        # FEATHERING: peso 1.0 en el nucleo, y 0.75/0.5/0.25 hacia fuera\n"
+            "        _w = np.zeros(len(_V)); _w[_core] = 1.0\n"
+            "        _frente = np.zeros(len(_V), dtype=bool); _frente[_core] = True\n"
+            "        for _pw in (0.75, 0.5, 0.25):\n"
+            "            _vec = np.zeros(len(_V), dtype=np.int8); _vec[_frente] = 1\n"
+            "            _nb = (_A @ _vec) > 0\n"
+            "            _nuevos = _nb & (_w == 0)\n"
+            "            _w[_nuevos] = _pw; _frente = _nuevos\n"
+            "        _mask = _w > 0\n"
+            "        _dd = (_V[_mask] @ _nrm + _d)[:,None] * _nrm[None,:]\n"
+            "        _nuevo[_mask] = _V[_mask] - _w[_mask][:,None] * _dd\n"
+            "        _dist1 = np.abs(_nuevo[_core] @ _nrm + _d)\n"
+            "        _rms1 = float(np.sqrt((_dist1**2).mean()))\n"
+            "        _nplanos += 1\n"
+            "        print('PLANO %d: %d vertices, planitud RMS %.1f mm -> %.1f mm '\n"
+            "              '(tamano %.1fx%.1f m)' % (_nplanos, len(_core), _rms0*1000,\n"
+            "              _rms1*1000, _ex2[0], _ex2[1]), flush=True)\n"
+            "    if _nplanos:\n"
+            "        m.vertices = o3d.utility.Vector3dVector(_nuevo)\n"
+            "        m.compute_vertex_normals()\n"
+            "        print('SNAP %d superficies aplanadas (paredes/techo/piso)'\n"
+            "              % _nplanos, flush=True)\n"
+            "    else:\n"
+            "        print('SNAP: no encontre planos grandes que aplanar', flush=True)\n"
+            "  except Exception as e:\n"
+            "    print('SNAP a planos (fallo, sigo sin el):', e, flush=True)\n"
+            # --- 3) DECIMAR a 2.5M — EL DOBLE de densidad de color ---
+            #     El color se ve BORROSO de cerca porque la densidad de vertices ES la
+            #     resolucion del color. La malla cruda tiene ~2.28M triangulos; ANTES
+            #     la bajabamos a 1.2M (perdiendo la mitad del color). AHORA target=2.5M:
+            #     como la cruda es menor, en la practica NO se decima (~1.18M vertices
+            #     = el DOBLE de colores). Los visores de escritorio manejan 2-3M bien.
+            #     FAIL-SAFE: si pesa mucho o el visor va lento, bajar MESH_TRIS a 1500000.
+            "target = int(os.environ.get('MESH_TRIS', '2500000'))\n"
             "if len(m.triangles) > target:\n"
             "    m = m.simplify_quadric_decimation(target_number_of_triangles=target)\n"
             # --- LIMPIEZA PROFUNDA tras decimar (CLAVE para que el visor NO se cuelgue)
@@ -1823,6 +2005,10 @@ def main():
             "except Exception as e:\n"
             "    print('DIAG (fallo diagnostico, sigo):', e, flush=True)\n"
         )
+        # pymeshlab lo usa el suavizado TwoStep (preserva aristas). No viene en la
+        # imagen; lo instalamos aquí (rápido). Si falla, el postproc cae a Taubin.
+        log("   preparando suavizado bilateral (pymeshlab)...")
+        os.system(sys.executable + " -m pip install pymeshlab --quiet 2>/dev/null")
         rc_dec, _ = run(["python", "-c", script_dec],
                         fase_label="PASO 4/5 — Simplificando malla", check=False)
         if decimada.exists() and decimada.stat().st_size > 1000:
@@ -1971,10 +2157,28 @@ def main():
                 fase(0.94, "PASO 4c/5 — Pintando vértices desde las fotos")
                 paint_py = WORK / "vertex_paint.py"
                 paint_py.write_text(VERTEXPAINT_SCRIPT)
+                # Preparar las fotos ORIGINALES de 12MP con el nombre que usa el
+                # pintor (img_NNNN.*). MASt3R nombra sus imágenes img_0000, img_0001…
+                # en el MISMO orden en que copiamos las originales foto_0000,
+                # foto_0001… (ambos son sorted() del ZIP), así que el índice coincide.
+                # El pintor recorta cada original al aspecto de cameras.txt, así que
+                # solo importa el índice, no el tamaño.
+                _paint_env = dict(os.environ)
+                try:
+                    _orig_src = sorted((WORK / "images").glob("foto_*"))
+                    _dst = WORK / "orig12mp"; _dst.mkdir(exist_ok=True)
+                    for _i, _op in enumerate(_orig_src):
+                        _lnk = _dst / ("img_%04d%s" % (_i, _op.suffix.lower()))
+                        if not _lnk.exists():
+                            shutil.copy(_op, _lnk)
+                    _paint_env["PAINT_ORIG_DIR"] = str(_dst)
+                    log(f"   pintaré desde las {len(_orig_src)} fotos ORIGINALES 12MP")
+                except Exception as _pe:
+                    log(f"   (no pude preparar las 12MP: {_pe}; pinto desde 1000px)")
                 run(["python", str(paint_py), str(malla), str(dataset / "images"),
                      str(dataset / "sparse" / "0"), str(glb_tex),
                      str(WORK / "ao.npy")],   # AO -> devuelve profundidad al color
-                    fase_label="PASO 4c/5 — Pintando vértices", check=False)
+                    fase_label="PASO 4c/5 — Pintando vértices", check=False, env=_paint_env)
                 if glb_tex.exists() and glb_tex.stat().st_size > 1000:
                     log(f"   ✓ vértices pintados desde las FOTOS: {glb_tex.stat().st_size/1e6:.1f} MB")
                 else:
