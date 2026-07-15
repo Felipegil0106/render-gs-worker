@@ -655,6 +655,11 @@ cols = np.nan_to_num(cols, nan=0.5, posinf=1.0, neginf=0.0)
 cols = np.clip(cols, 0, 1).astype(np.float32)
 log("color: brillo %.3f -> %.3f (sat %.2f, AO %.2f, gamma %.2f)" % (_b0, float(cols.mean()), _SAT, _AOSTR, _GAM))
 
+# Guardamos el color COMO SE VE (sRGB, lo que muestra un visor fiel) para la
+# auditoría automática de más abajo. La conversión a lineal es solo para el
+# archivo; lo que Felipe ve en F3D --unlit es esta versión sRGB.
+_cols_display = cols.copy()
+
 # ESPACIO DE SALIDA: la spec de glTF exige COLOR_0 en LINEAL. Todo el ajuste
 # (saturación, AO, gamma) se hizo en sRGB porque es perceptual; ahora, si
 # PAINT_STORE=linear (default), convertimos a lineal para guardarlo como manda
@@ -754,6 +759,81 @@ try:
     log("material unlit + mate + saneamiento anti-NaN aplicados")
 except Exception as e:
     log("(patch/saneamiento fallo: %s)" % e)
+# ════════════════════════════════════════════════════════════════════════
+# AUDITORÍA AUTOMÁTICA — "ver" la malla con NÚMEROS, sin enviar archivos.
+# Re-proyecta la malla YA pintada a las poses REALES de las cámaras y la
+# compara contra las FOTOS reales. Dos números clave que van al log:
+#   NITIDEZ = detalle(render) / detalle(foto)  -> mide el EFECTO DERRETIDO
+#             (100% = igual de nítido que la foto; 30% = perdió 70% del detalle)
+#   FIDELIDAD = PSNR de la malla final vs la realidad (distinto del PSNR de
+#             entrenamiento, que solo mide las gaussianas, no la malla+color).
+# Felipe pega el log y así yo "veo" objetivamente qué tan derretido está.
+try:
+    if os.environ.get("AUDIT", "1") == "1" and len(views) > 0:
+        def _gray(a): return a @ np.array([0.299, 0.587, 0.114])
+        def _lap(g):
+            return (-4.0*g + np.roll(g,1,0) + np.roll(g,-1,0)
+                    + np.roll(g,1,1) + np.roll(g,-1,1))
+        def _erode(mk, n=2):
+            m = mk.copy()
+            for _ in range(n):
+                m = m & np.roll(m,1,0) & np.roll(m,-1,0) & np.roll(m,1,1) & np.roll(m,-1,1)
+            return m
+        _origd = os.environ.get("PAINT_ORIG_DIR", "")
+        _Nv = min(12, len(views))
+        _sel = np.linspace(0, len(views)-1, _Nv).astype(int)
+        _psnrs=[]; _vratios=[]; _vr=[]; _vf=[]
+        for _k in _sel:
+            cid, name, E, R, t = views[int(_k)]
+            if cid not in cams: continue
+            W,H,fx,fy,cx,cy = cams[cid]
+            _p = os.path.join(IMAGES_DIR, name); _uo=False
+            if _origd:
+                _c = os.path.join(_origd, name)
+                if os.path.exists(_c): _p=_c; _uo=True
+            if not os.path.exists(_p): continue
+            _im = Image.open(_p).convert("RGB")
+            if _uo:
+                _Wo,_Ho=_im.size; _asp=W/float(H)
+                if (_Wo/float(_Ho))>_asp: _cw=int(round(_Ho*_asp)); _ch=_Ho
+                else: _cw=_Wo; _ch=int(round(_Wo/_asp))
+                _l=(_Wo-_cw)//2; _tp=(_Ho-_ch)//2
+                _im=_im.crop((_l,_tp,_l+_cw,_tp+_ch))
+            _im=_im.resize((W,H), Image.LANCZOS)
+            _photo=np.asarray(_im,np.float32)/255.0
+            _K=o3d.core.Tensor(np.array([[fx,0,cx],[0,fy,cy],[0,0,1]]))
+            _rays=scene.create_rays_pinhole(_K, o3d.core.Tensor(E), W, H)
+            _ans=scene.cast_rays(_rays)
+            _tri=_ans['primitive_ids'].numpy().astype(np.int64)
+            _bb=_ans['primitive_uvs'].numpy().astype(np.float64)
+            _th=_ans['t_hit'].numpy()
+            _hit=np.isfinite(_th)&(_tri!=INVALID)
+            if _hit.sum()<1000: continue
+            _rend=np.zeros((H,W,3),np.float32)
+            _ti=_tri[_hit]; _b1=_bb[_hit][:,0]; _b2=_bb[_hit][:,1]; _b0=1-_b1-_b2
+            _c3=_cols_display[F[_ti]]
+            _rc=(_b0[:,None]*_c3[:,0]+_b1[:,None]*_c3[:,1]+_b2[:,None]*_c3[:,2])
+            _yy,_xx=np.where(_hit); _rend[_yy,_xx]=_rc.astype(np.float32)
+            _mask=_erode(_hit,2)
+            if _mask.sum()<1000: _mask=_hit
+            _gr=_gray(_rend); _gf=_gray(_photo)
+            _volr=float(_lap(_gr)[_mask].var()); _volf=float(_lap(_gf)[_mask].var())
+            _vratios.append(_volr/max(_volf,1e-9)); _vr.append(_volr); _vf.append(_volf)
+            _mse=float(((_rend[_mask]-_photo[_mask])**2).mean())
+            _psnrs.append(99.0 if _mse<1e-12 else float(10*np.log10(1.0/_mse)))
+        if _psnrs:
+            _mp=float(np.mean(_psnrs)); _mv=float(np.mean(_vratios))
+            log("")
+            log("=== AUDITORIA DE CALIDAD (malla vs %d fotos reales) ===" % len(_psnrs))
+            log("  NITIDEZ (efecto derretido): %.0f%% del detalle de la foto real" % (_mv*100))
+            log("     100%% = tan nitido como la foto ; <50%% = muy derretido/oleo")
+            log("     detalle_render=%.1f  detalle_foto=%.1f" % (float(np.mean(_vr)), float(np.mean(_vf))))
+            log("  FIDELIDAD de la malla: PSNR %.1f dB vs la realidad" % _mp)
+            log("     >28 muy bueno ; 24-28 aceptable ; <24 pobre")
+            log("=======================================================")
+except Exception as _ae:
+    log("(auditoria fallo, sigo: %s)" % _ae)
+
 log("color por vertice desde FOTOS exportado a .glb")
 sys.exit(0)
 '''
@@ -1293,7 +1373,8 @@ def main():
         _bn_sn = "snapON" if os.environ.get("PLANE_SNAP", "1") == "1" else "snapOFF"
         _bn_tr = int(os.environ.get("MESH_TRIS", "2500000")) // 1000
         _bn_st = os.environ.get("PAINT_STORE", "linear")
-        log(f"═══ render-gs-worker 2DGS · v5-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}"
+        _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
+        log(f"═══ render-gs-worker 2DGS · v6-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -1866,11 +1947,19 @@ def main():
             "        if min(_ex2) < 1.2:\n"
             "            print('PLANO descartado (pequeno %.2fx%.2f m: es un mueble)'\n"
             "                  % _ex2, flush=True); continue\n"
-            "        # CANDADO 2 — periferia: debe estar en el BORDE del cuarto\n"
-            "        _perif = abs(float(_nrm@_cg) + _d) / max(_half,1e-9)\n"
-            "        if _perif < 0.5:\n"
-            "            print('PLANO descartado (esta en el MEDIO del cuarto, perif %.2f:'\n"
-            "                  ' probablemente un mueble)' % _perif, flush=True); continue\n"
+            "        # CANDADO 2 — periferia por PERCENTIL (robusto a bbox desbalanceado)\n"
+            "        # ANTES: distancia del plano al CENTRO del bbox. Fallaba porque\n"
+            "        # con muebles/geometria fuera del cuarto el centro se corre y\n"
+            "        # TODAS las paredes daban perif baja -> se descartaban (visto en\n"
+            "        # produccion: 0.04, 0.28, 0.35...). AHORA: proyectamos TODOS los\n"
+            "        # vertices sobre la normal y miramos en que PERCENTIL cae el plano.\n"
+            "        # Una pared/piso/techo real esta en el EXTREMO (percentil <12 o\n"
+            "        # >88); un mueble cae en el medio. No depende del centro del cuarto.\n"
+            "        _sall = _V @ _nrm; _splane = -_d\n"
+            "        _pct = float((_sall < _splane).mean()) * 100.0\n"
+            "        if 12.0 < _pct < 88.0:\n"
+            "            print('PLANO descartado (percentil %.0f: en el MEDIO del'\n"
+            "                  ' cuarto, probablemente un mueble)' % _pct, flush=True); continue\n"
             "        # CANDADO 3 — normal del vertice casi paralela al plano (<35 grados)\n"
             "        _cos = np.abs(_N[_idx] @ _nrm)\n"
             "        _core = _idx[_cos > 0.819]\n"
