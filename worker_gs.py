@@ -236,214 +236,395 @@ print("MAST3R: points3D.txt escrito. LISTO.", flush=True)
 # visibilidad/oclusión se resuelve con raycasting (cada foto solo aporta a las
 # superficies que realmente ve). El error de pose se reparte en un leve desenfoque,
 # no en cortes torcidos. Validado localmente con datos sintéticos.
-TEXTURE_SCRIPT = r'''
-import sys, os, gc, json, struct
+# UV_TEXTURE_SCRIPT — PASO 4d: hornea la TEXTURA UV 4K de MEJOR-VISTA sobre la
+# malla decimada (el arreglo REAL del efecto oleo). Reemplaza al TEXTURE_SCRIPT
+# viejo, que PROMEDIABA las 127 fotos (el promedio ES una fuente de borrosidad,
+# Waechter et al. ECCV 2014) y por eso estaba apagado.
+UV_TEXTURE_SCRIPT = r'''
+#!/usr/bin/env python3
+# ============================================================================
+# TEXTURA UV — el arreglo del "efecto derretido/óleo".
+#
+# El color por vértice reparte ~1.1M colores sobre la superficie del cuarto =
+# texel efectivo ~5mm = incapaz de mostrar letras/microtextura. Esta etapa
+# hornea una TEXTURA UV de alta resolución (4K/8K) sobre la malla decimada,
+# tomando el color de las MISMAS fotos 12MP y con SELECCIÓN DE MEJOR-VISTA
+# (por texel, la cámara más frontal; NO el promedio de 127 vistas, que es una
+# fuente de borrosidad — Waechter et al. ECCV 2014, base de OpenMVS).
+#
+# Uso:
+#   python uv_texture.py  mesh_lite.ply  IMAGES_DIR  SPARSE_DIR  out.glb  [ao.npy]
+#
+# Perillas de entorno (sin tocar código):
+#   TEX_SIZE=4096        lado de la textura (4096 base; 8192 si el visor aguanta)
+#   UV_MESH_TRIS=500000  caras tras decimar antes del unwrap (xatlas se atasca >~500k)
+#   TEX_BAKE_RES=2600    resolución de raycast por cámara (cobertura de texeles)
+#   TEX_SAT=1.15         saturación (igual que el pintor)
+#   TEX_AO=0.40          fuerza del AO (igual que el pintor)
+#   TEX_GAMMA=1.0        gamma final
+#   TEX_ANGLE_MAX=75     descarta vistas más rasantes que esto (grados)
+#   TEX_HOLE_ITERS=128   iteraciones de relleno de huecos
+# ============================================================================
+import os, sys, json, struct, time
 import numpy as np
+
+t0 = time.time()
+def log(m): print("   [uv] %s" % m, flush=True)
+
+TEX_SIZE      = int(os.environ.get("TEX_SIZE", "4096"))
+UV_MESH_TRIS  = int(os.environ.get("UV_MESH_TRIS", "500000"))
+BAKE_RES      = int(os.environ.get("TEX_BAKE_RES", "2600"))
+TEX_SAT       = float(os.environ.get("TEX_SAT", "1.15"))
+TEX_AO        = float(os.environ.get("TEX_AO", "0.40"))
+TEX_GAMMA     = float(os.environ.get("TEX_GAMMA", "1.0"))
+TEX_ANGLE_MAX = float(os.environ.get("TEX_ANGLE_MAX", "75"))
+HOLE_ITERS    = int(os.environ.get("TEX_HOLE_ITERS", "128"))
+
+MESH   = sys.argv[1]
+IMGDIR = sys.argv[2]
+SPARSE = sys.argv[3]
+OUTGLB = sys.argv[4]
+AONPY  = sys.argv[5] if len(sys.argv) > 5 else ""
+
+import open3d as o3d
 from PIL import Image
-print("   [tex] iniciando horneado de textura UV", flush=True)
+
+def srgb_to_linear(c):
+    c = np.clip(c, 0, 1)
+    return np.where(c <= 0.04045, c/12.92, ((c+0.055)/1.055)**2.4)
+def linear_to_srgb(c):
+    c = np.clip(c, 0, 1)
+    return np.where(c <= 0.0031308, c*12.92, 1.055*(c**(1/2.4))-0.055)
+
+# ── 1) cargar malla ────────────────────────────────────────────────────────
+m = o3d.io.read_triangle_mesh(MESH)
+m.remove_unreferenced_vertices()
+m.remove_degenerate_triangles()
+V0 = np.asarray(m.vertices).copy()
+log("malla: %d vert, %d caras" % (len(V0), len(np.asarray(m.triangles))))
+
+ao_src = None
+if AONPY and os.path.exists(AONPY):
+    try:
+        ao_src = np.load(AONPY).astype(np.float64)
+        if len(ao_src) != len(V0):
+            log("AO ignorado (%d valores vs %d vertices)" % (len(ao_src), len(V0)))
+            ao_src = None
+    except Exception as e:
+        log("AO no cargado (%s)" % e); ao_src = None
+
+# ── 2) decimar a UV_MESH_TRIS (xatlas se atasca por encima) ────────────────
+if len(np.asarray(m.triangles)) > UV_MESH_TRIS:
+    m = m.simplify_quadric_decimation(target_number_of_triangles=UV_MESH_TRIS)
+    m.remove_unreferenced_vertices()
+    log("decimada a %d caras para el unwrap" % len(np.asarray(m.triangles)))
+m.compute_vertex_normals()
+V  = np.asarray(m.vertices)
+F  = np.asarray(m.triangles).astype(np.int64)
+VN = np.asarray(m.vertex_normals)
+
+ao_vert = None
+if ao_src is not None:
+    try:
+        from scipy.spatial import cKDTree
+        _, idx = cKDTree(V0).query(V, k=1)
+        ao_vert = np.clip(ao_src[idx], 0, 1)
+        log("AO transferido a la malla decimada (oclusion media %.3f)" % float(ao_vert.mean()))
+    except Exception as e:
+        log("AO transfer fallo (%s)" % e); ao_vert = None
+
+# ── 3) UV unwrap con xatlas ────────────────────────────────────────────────
 try:
     import xatlas
 except Exception:
-    print("   [tex] instalando xatlas...", flush=True)
+    log("instalando xatlas (no viene en la imagen v4.2)...")
     os.system(sys.executable + " -m pip install xatlas --quiet")
     import xatlas
-import open3d as o3d
-import trimesh
-
-MESH_PLY   = sys.argv[1]
-IMAGES_DIR = sys.argv[2]
-SPARSE_DIR = sys.argv[3]
-OUT_GLB    = sys.argv[4]
-TEXSIZE    = int(sys.argv[5]) if len(sys.argv) > 5 else 2048
-
-def log(s): print("   [tex] " + s, flush=True)
-
-# Conversion sRGB <-> lineal. Las fotos vienen en sRGB (gamma). Promediar en sRGB
-# OSCURECE (promedio de blanco+negro da 50% de valor pero solo ~22% de luz). Hay que
-# convertir a LINEAL, promediar, y volver a sRGB. Arregla la oscuridad en bordes/sombras.
-def srgb_to_linear(c):
-    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
-def linear_to_srgb(c):
-    c = np.maximum(c, 0.0)
-    return np.clip(np.where(c <= 0.0031308, c * 12.92, 1.055 * (c ** (1 / 2.4)) - 0.055), 0, 1)
-
-# 1) malla
-m = o3d.io.read_triangle_mesh(MESH_PLY)
-V = np.asarray(m.vertices); F = np.asarray(m.triangles)
-if len(V) == 0 or len(F) == 0:
-    log("malla vacia, abortando"); sys.exit(1)
-log("malla %d vert %d caras" % (len(V), len(F)))
-
-# 2) UV unwrap (xatlas duplica vertices en costuras → vmapping mapea al original)
-# AVISO: esta llamada es UNA sola funcion C++ SIN progreso: con ~1.2M de caras
-# tarda 25-90 min segun el pod. El hilo de abajo imprime un latido cada 2 min
-# para que el log demuestre que sigue vivo y nadie cancele por susto.
-print("   [tex] desdoblando UV (xatlas) sobre %d caras: fase LARGA (25-90 min) SIN barra de progreso; NO cancelar" % len(F), flush=True)
-import threading as _th, time as _tt
-_t0 = _tt.time(); _fin = _th.Event()
-def _latido():
-    while not _fin.wait(120):
-        print("   [tex] xatlas sigue trabajando... %.0f min" % ((_tt.time()-_t0)/60.0), flush=True)
-_th.Thread(target=_latido, daemon=True).start()
+log("xatlas: desplegando UV (puede tardar)...")
 vmapping, indices, uvs = xatlas.parametrize(V, F)
-_fin.set()
-print("   [tex] UV desdoblado en %.1f min" % ((_tt.time()-_t0)/60.0), flush=True)
-Vn = np.ascontiguousarray(V[vmapping].astype(np.float64))
-Fn = np.ascontiguousarray(indices.astype(np.int32))
-UV = np.ascontiguousarray(uvs.astype(np.float64))
-log("UV unwrap: %d vert, uv[%.3f..%.3f]" % (len(Vn), UV.min(), UV.max()))
+Vu  = V[vmapping]
+Fu  = indices.astype(np.int64)
+UV  = uvs.astype(np.float64)
+VNu = VN[vmapping]
+AOu = ao_vert[vmapping] if ao_vert is not None else None
+UV[:, 0] = np.clip(UV[:, 0], 0, 1); UV[:, 1] = np.clip(UV[:, 1], 0, 1)
+log("xatlas OK: %d vert desplegados, %d caras" % (len(Vu), len(Fu)))
 
-# 3) escena de raycasting (para visibilidad/oclusion)
-mn = o3d.geometry.TriangleMesh()
-mn.vertices = o3d.utility.Vector3dVector(Vn)
-mn.triangles = o3d.utility.Vector3iVector(Fn)
-scene = o3d.t.geometry.RaycastingScene()
-scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mn))
-INVALID = scene.INVALID_ID
-
-# 4) intrinsecos (cameras.txt) + poses world->cam (images.txt)
+# ── 4) poses COLMAP (parseo IDÉNTICO al pintor) ────────────────────────────
 cams = {}
-for line in open(os.path.join(SPARSE_DIR, "cameras.txt")):
+for line in open(os.path.join(SPARSE, "cameras.txt")):
     if line.startswith("#") or not line.strip(): continue
     e = line.split()
     cams[int(e[0])] = (int(e[2]), int(e[3]), float(e[4]), float(e[5]), float(e[6]), float(e[7]))
-
 def q2R(qw, qx, qy, qz):
-    n = (qw*qw + qx*qx + qy*qy + qz*qz) ** 0.5
-    qw, qx, qy, qz = qw/n, qx/n, qy/n, qz/n
+    n = (qw*qw+qx*qx+qy*qy+qz*qz)**0.5; qw,qx,qy,qz = qw/n,qx/n,qy/n,qz/n
     return np.array([
         [1-2*(qy*qy+qz*qz), 2*(qx*qy-qw*qz),   2*(qx*qz+qw*qy)],
         [2*(qx*qy+qw*qz),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx)],
         [2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx),   1-2*(qx*qx+qy*qy)]])
-
 views = []
-for line in open(os.path.join(SPARSE_DIR, "images.txt")):
+for line in open(os.path.join(SPARSE, "images.txt")):
     if line.startswith("#") or not line.strip(): continue
     e = line.split()
     if len(e) >= 10 and (e[9].endswith(".png") or e[9].endswith(".jpg")):
-        qw, qx, qy, qz = map(float, e[1:5]); tx, ty, tz = map(float, e[5:8])
-        R = q2R(qw, qx, qy, qz); t = np.array([tx, ty, tz])
-        E = np.eye(4); E[:3, :3] = R; E[:3, 3] = t
+        qw,qx,qy,qz = map(float, e[1:5]); tx,ty,tz = map(float, e[5:8])
+        R = q2R(qw,qx,qy,qz); t = np.array([tx,ty,tz])
+        E = np.eye(4); E[:3,:3] = R; E[:3,3] = t
         views.append((int(e[8]), e[9], E, R, t))
 log("poses: %d camaras" % len(views))
 
-# 5) HORNEAR: por cada foto, raycast (visibilidad) + splat al texel promediando
-acc  = np.zeros((TEXSIZE, TEXSIZE, 3), np.float64)
-wsum = np.zeros((TEXSIZE, TEXSIZE), np.float64)
-Ktens = {}   # cache de tensores K (reutilizar EVITA un segfault de Open3D)
-nbaked = 0
+# ── 5) escena de raycast sobre la malla DESPLEGADA ─────────────────────────
+um = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(Vu),
+                               o3d.utility.Vector3iVector(Fu))
+scene = o3d.t.geometry.RaycastingScene()
+scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(um))
+INVALID = scene.INVALID_ID
+
+NT = TEX_SIZE
+tex   = np.zeros((NT*NT, 3), np.float32)     # color por texel (LINEAL mientras horneo)
+texw  = np.full(NT*NT, -1.0, np.float32)     # mejor peso visto por texel
+texao = np.zeros(NT*NT, np.float32)          # AO por texel
+cos_min = float(np.cos(np.deg2rad(TEX_ANGLE_MAX)))
+
+def bilinear(img, x, y):
+    H, W = img.shape[:2]
+    x0 = np.floor(x).astype(np.int64); y0 = np.floor(y).astype(np.int64)
+    wx = (x - x0)[:, None]; wy = (y - y0)[:, None]
+    x0 = np.clip(x0, 0, W-1); x1 = np.clip(x0+1, 0, W-1)
+    y0 = np.clip(y0, 0, H-1); y1 = np.clip(y0+1, 0, H-1)
+    return (img[y0,x0]*(1-wx)*(1-wy) + img[y0,x1]*wx*(1-wy)
+            + img[y1,x0]*(1-wx)*wy + img[y1,x1]*wx*wy)
+
+nuse = 0
 for cid, name, E, R, t in views:
     if cid not in cams: continue
     W, H, fx, fy, cx, cy = cams[cid]
-    path = os.path.join(IMAGES_DIR, name)
+    path = os.path.join(IMGDIR, name)
     if not os.path.exists(path): continue
-    photo = np.asarray(Image.open(path).convert("RGB"), np.float32) / 255.0
-    photo = srgb_to_linear(photo)   # a LINEAL para promediar bien (anti-oscuro)
+    _im = Image.open(path).convert("RGB")
+    _Wo, _Ho = _im.size; _asp = W/float(H)
+    if (_Wo/float(_Ho)) > _asp: _cw = int(round(_Ho*_asp)); _ch = _Ho
+    else:                        _cw = _Wo; _ch = int(round(_Wo/_asp))
+    _l = (_Wo-_cw)//2; _tp = (_Ho-_ch)//2
+    _im = _im.crop((_l, _tp, _l+_cw, _tp+_ch))
+    photo = np.asarray(_im, np.float32)/255.0
+    photo_lin = srgb_to_linear(photo)            # horneo en LINEAL, como el pintor
     Hp, Wp = photo.shape[:2]
-    sx = Wp / float(W); sy = Hp / float(H)   # por si la foto difiere de cameras.txt
-    key = (cid, Wp, Hp)
-    if key not in Ktens:
-        Ktens[key] = o3d.core.Tensor(np.array([[fx*sx, 0, cx*sx], [0, fy*sy, cy*sy], [0, 0, 1]]))
-    rays = scene.create_rays_pinhole(Ktens[key], o3d.core.Tensor(E), Wp, Hp)
+
+    scl = BAKE_RES / float(max(W, H))
+    rw, rh = max(1, int(round(W*scl))), max(1, int(round(H*scl)))
+    Kb = o3d.core.Tensor(np.array([[fx*scl,0,cx*scl],[0,fy*scl,cy*scl],[0,0,1.0]]))
+    rays = scene.create_rays_pinhole(Kb, o3d.core.Tensor(E), rw, rh)
     ans = scene.cast_rays(rays)
     tri  = ans['primitive_ids'].numpy().astype(np.int64)
     bary = ans['primitive_uvs'].numpy().astype(np.float64)
-    nrm  = ans['primitive_normals'].numpy().astype(np.float64)
     thit = ans['t_hit'].numpy()
-    del rays, ans
     hit = np.isfinite(thit) & (tri != INVALID)
-    if hit.sum() == 0:
-        del photo; gc.collect(); continue
-    yy, xx = np.where(hit)
-    ti = tri[hit]; b1 = bary[hit][:, 0]; b2 = bary[hit][:, 1]; b0 = 1 - b1 - b2
-    uvt = UV[Fn[ti]]
-    uvp = b0[:, None]*uvt[:, 0] + b1[:, None]*uvt[:, 1] + b2[:, None]*uvt[:, 2]
-    col = photo[yy, xx]
-    # peso por angulo de vista: la camara que ve la superficie DE FRENTE pesa mas
-    P3 = Vn[Fn[ti]]
-    pos = b0[:, None]*P3[:, 0] + b1[:, None]*P3[:, 1] + b2[:, None]*P3[:, 2]
-    Ccam = -R.T @ t
-    vd = Ccam[None, :] - pos
-    vd /= (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-9)
-    nh = nrm[hit]; nh /= (np.linalg.norm(nh, axis=1, keepdims=True) + 1e-9)
-    w = np.clip(np.abs((nh*vd).sum(1)), 0.05, 1.0)
-    # ARREGLO BORROSO: elevar el peso a la 4 → la vista que ve la superficie DE FRENTE
-    # domina mucho más que las oblicuas. Como las poses tienen error (~0.1°), promediar
-    # muchas vistas desalineadas desenfoca; al dar casi todo el peso a la mejor vista, la
-    # textura sale MÁS NÍTIDA (menos "tela"/borroso). Sin costuras duras (sigue siendo
-    # promedio, solo muy sesgado a la mejor vista).
-    w = w ** 4
-    tx_i = np.clip(uvp[:, 0]*(TEXSIZE-1), 0, TEXSIZE-1).astype(int)
-    ty_i = np.clip((1-uvp[:, 1])*(TEXSIZE-1), 0, TEXSIZE-1).astype(int)
-    np.add.at(acc,  (ty_i, tx_i), col*w[:, None])
-    np.add.at(wsum, (ty_i, tx_i), w)
-    nbaked += 1
-    del photo, tri, bary, nrm, thit, hit, col; gc.collect()
-log("horneadas %d/%d camaras" % (nbaked, len(views)))
-if nbaked == 0:
-    log("ninguna camara horneada, abortando"); sys.exit(1)
+    if hit.sum() == 0: continue
+    ti = tri[hit]; b1 = bary[hit][:,0]; b2 = bary[hit][:,1]; b0 = 1-b1-b2
 
-# 6) normalizar (en LINEAL) + volver a sRGB + realce de brillo
-cov = wsum > 0
-tex = np.zeros((TEXSIZE, TEXSIZE, 3), np.float32)
-tex_lin = np.zeros((TEXSIZE, TEXSIZE, 3), np.float32)
-tex_lin[cov] = (acc[cov] / wsum[cov, None]).astype(np.float32)   # promedio en LINEAL
-tex[cov] = linear_to_srgb(tex_lin[cov])                          # de vuelta a sRGB
-tex[cov] = np.clip(tex[cov] ** 0.8, 0, 1)                        # gamma 0.8 = realce de brillo (anti-oscuro)
-log("cobertura textura %.1f%%" % (cov.mean()*100))
-mask = cov.copy()
-for _ in range(16):
-    if mask.all(): break
-    s = np.zeros_like(tex); c = np.zeros(mask.shape)
-    for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-        sh = np.roll(np.roll(tex, dy, 0), dx, 1)
-        mh = np.roll(np.roll(mask, dy, 0), dx, 1).astype(np.float64)
-        s += sh * mh[..., None]; c += mh
-    fill = (~mask) & (c > 0)
-    tex[fill] = (s[fill] / c[fill, None]).astype(np.float32)
-    mask = mask | fill
+    uvT = UV[Fu[ti]]                                       # (Nhit,3,2)
+    uv_pt = b0[:,None]*uvT[:,0] + b1[:,None]*uvT[:,1] + b2[:,None]*uvT[:,2]
+    tx = np.clip((uv_pt[:,0]*NT).astype(np.int64), 0, NT-1)
+    ty = np.clip((uv_pt[:,1]*NT).astype(np.int64), 0, NT-1)   # glTF: v=0 arriba, SIN flip
+    tflat = ty*NT + tx
 
-# 7) exportar .glb con la textura UV (color separado de la geometria)
-tex_img = Image.fromarray((np.clip(tex, 0, 1) * 255).astype(np.uint8))
-mesh_out = trimesh.Trimesh(vertices=Vn, faces=Fn, process=False)
-# ── ARREGLO 1 (anti-facetado): forzar NORMALES SUAVES. Sin esto el .glb sale SIN
-#    normales y el visor calcula caras planas → se ven los triangulos. Al acceder a
-#    vertex_normals, trimesh promedia las caras por vertice (suave) y las mete al .glb.
-_ = mesh_out.vertex_normals
-# ── ARREGLO 2 (anti-oscuro): material MATE NO-METALICO. Por defecto glTF asume
-#    metallic=1.0 → la superficie sale OSCURA sin reflejos de entorno. metallic=0 +
-#    roughness=1 = superficie mate que muestra bien la textura.
-_mat = trimesh.visual.material.PBRMaterial(
-    baseColorTexture=tex_img, metallicFactor=0.0, roughnessFactor=1.0)
-mesh_out.visual = trimesh.visual.TextureVisuals(uv=UV, image=tex_img, material=_mat)
-mesh_out.export(OUT_GLB)
+    Nt = VNu[Fu[ti]]
+    nrm = b0[:,None]*Nt[:,0] + b1[:,None]*Nt[:,1] + b2[:,None]*Nt[:,2]
+    nrm /= (np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-12)
+    P3 = b0[:,None]*Vu[Fu[ti,0]] + b1[:,None]*Vu[Fu[ti,1]] + b2[:,None]*Vu[Fu[ti,2]]
+    camC = -R.T @ t
+    vdir = camC[None,:] - P3
+    vdir /= (np.linalg.norm(vdir, axis=1, keepdims=True) + 1e-12)
+    cosang = np.abs((vdir*nrm).sum(1))
 
-# ── ARREGLO 3 (anti-oscuro, definitivo): marcar el material como KHR_materials_unlit.
-#    Las fotos YA traen la iluminacion real horneada, asi que NO queremos que el visor
-#    la re-ilumine. "unlit" = el visor muestra la textura tal cual (ni oscura ni quemada).
+    yy, xx = np.where(hit)                    # pixeles a BAKE_RES
+    fxc = xx/scl * (Wp/float(W))              # -> coordenada en la foto 12MP recortada
+    fyc = yy/scl * (Hp/float(H))
+    col = bilinear(photo_lin, fxc, fyc).astype(np.float32)
+    aoh = (b0*AOu[Fu[ti,0]] + b1*AOu[Fu[ti,1]] + b2*AOu[Fu[ti,2]]).astype(np.float32) \
+          if AOu is not None else np.zeros(len(ti), np.float32)
+
+    w = cosang.astype(np.float32)
+    w[cosang <= cos_min] = -1.0
+    good = w > -1.0
+    if not good.any(): continue
+    tflat = tflat[good]; col = col[good]; w = w[good]; aoh = aoh[good]
+
+    order = np.argsort(w)                     # ascendente -> mayor peso sobrescribe último
+    tfs = tflat[order]; cs = col[order]; ws = w[order]; aos = aoh[order]
+    uniq, inv = np.unique(tfs, return_inverse=True)
+    camw = np.full(len(uniq), -1.0, np.float32); np.maximum.at(camw, inv, ws)
+    camc = np.zeros((len(uniq),3), np.float32); camc[inv] = cs
+    camao = np.zeros(len(uniq), np.float32);    camao[inv] = aos
+    better = camw > texw[uniq]
+    sel = uniq[better]
+    tex[sel]   = camc[better]
+    texw[sel]  = camw[better]
+    texao[sel] = camao[better]
+    nuse += 1
+
+log("horneado: %d/%d camaras proyectadas" % (nuse, len(views)))
+filled = texw > -1.0
+log("cobertura: %.1f%% de texeles con color (%d de %d)"
+    % (100.0*filled.mean(), int(filled.sum()), NT*NT))
+if filled.sum() == 0:
+    log("ERROR: 0 texeles cubiertos, abortando textura"); sys.exit(2)
+
+# ── 6) rellenar huecos (dilatar color a texeles vacíos) ────────────────────
+tex2   = tex.reshape(NT, NT, 3)
+mask2  = (texw > -1.0).reshape(NT, NT)
+ao2    = texao.reshape(NT, NT)
+_it = 0
+for _it in range(HOLE_ITERS):
+    empty = ~mask2
+    if not empty.any(): break
+    mu=np.roll(mask2,1,0); md=np.roll(mask2,-1,0); ml=np.roll(mask2,1,1); mr=np.roll(mask2,-1,1)
+    cnt = mu.astype(np.float32)+md+ml+mr
+    su  = (np.roll(tex2,1,0)*mu[...,None] + np.roll(tex2,-1,0)*md[...,None]
+           + np.roll(tex2,1,1)*ml[...,None] + np.roll(tex2,-1,1)*mr[...,None])
+    sao = (np.roll(ao2,1,0)*mu + np.roll(ao2,-1,0)*md
+           + np.roll(ao2,1,1)*ml + np.roll(ao2,-1,1)*mr)
+    newm = empty & (cnt > 0)
+    denom = np.maximum(cnt, 1)[...,None]
+    tex2[newm] = (su/denom)[newm]
+    ao2[newm]  = (sao/np.maximum(cnt,1))[newm]
+    mask2 |= newm
+log("huecos rellenados en %d iteraciones (quedan %d vacios)" % (_it+1, int((~mask2).sum())))
+
+# ── 7) color final: LINEAL->sRGB, saturación, AO, gamma (igual que el pintor) ─
+tex_srgb = np.clip(linear_to_srgb(tex2), 0, 1).astype(np.float32)
+if abs(TEX_SAT-1.0) > 1e-3:
+    lum = (tex_srgb*np.array([0.2126,0.7152,0.0722],np.float32)).sum(2, keepdims=True)
+    tex_srgb = np.clip(lum + (tex_srgb-lum)*TEX_SAT, 0, 1)
+if AOu is not None and TEX_AO > 0:
+    tex_srgb = tex_srgb * (1.0 - TEX_AO*ao2)[...,None]
+tex_srgb = np.clip(tex_srgb, 0, 1) ** TEX_GAMMA
+tex_srgb = np.nan_to_num(tex_srgb, nan=0.5, posinf=1.0, neginf=0.0)
+tex_img = (np.clip(tex_srgb,0,1)*255).astype(np.uint8)
+# glTF baseColorTexture es sRGB -> se guarda sRGB DIRECTO (distinto del color por
+# vértice, que iba LINEAL). Por eso NO reconvierto a lineal aquí.
+
+# ── 8) exportar glTF con textura (trimesh) + material unlit ────────────────
 try:
-    _d = bytearray(open(OUT_GLB, "rb").read())
-    _jlen = struct.unpack("<I", _d[12:16])[0]
-    _g = json.loads(_d[20:20+_jlen].decode("utf-8"))
-    _g.setdefault("extensionsUsed", [])
-    if "KHR_materials_unlit" not in _g["extensionsUsed"]:
-        _g["extensionsUsed"].append("KHR_materials_unlit")
-    for _m in _g.get("materials", []):
+    import trimesh
+except Exception:
+    log("instalando trimesh (no viene en la imagen v4.2)...")
+    os.system(sys.executable + " -m pip install trimesh --quiet")
+    import trimesh
+mesh_uv = trimesh.Trimesh(vertices=Vu, faces=Fu, process=False)
+img = Image.fromarray(tex_img, "RGB")
+mat = trimesh.visual.material.PBRMaterial(
+    baseColorTexture=img, metallicFactor=0.0, roughnessFactor=1.0)
+# OJO (verificado LEYENDO el codigo fuente de trimesh 4.x, exchange/gltf.py):
+# trimesh VOLTEA la V al exportar glTF (uv[:,1] = 1.0 - uv[:,1]) porque el
+# guarda las UV con origen ABAJO-izquierda y glTF las quiere ARRIBA-izquierda.
+# La imagen ya se horneo en convencion glTF (fila = v*NT, v=0 arriba), asi
+# que se entrega la V PRE-VOLTEADA para que su flip la cancele exactamente.
+UV_tm = UV.copy(); UV_tm[:, 1] = 1.0 - UV_tm[:, 1]
+mesh_uv.visual = trimesh.visual.TextureVisuals(uv=UV_tm, image=img, material=mat)
+_fv = Vu[Fu]; _fn = np.cross(_fv[:,1]-_fv[:,0], _fv[:,2]-_fv[:,0])
+vn = np.zeros((len(Vu),3), np.float64)
+for _k in range(3): np.add.at(vn, Fu[:,_k], _fn)
+vn = np.nan_to_num(vn, nan=0.0, posinf=0.0, neginf=0.0)
+_bad = np.linalg.norm(vn,axis=1) < 1e-12; vn[_bad] = (0,0,1.0)
+vn /= np.linalg.norm(vn,axis=1,keepdims=True)
+mesh_uv.vertex_normals = vn
+mesh_uv.export(OUTGLB)
+
+try:
+    d = bytearray(open(OUTGLB,"rb").read())
+    jlen = struct.unpack("<I", d[12:16])[0]
+    g = json.loads(d[20:20+jlen].decode("utf-8"))
+    g.setdefault("extensionsUsed", [])
+    if "KHR_materials_unlit" not in g["extensionsUsed"]:
+        g["extensionsUsed"].append("KHR_materials_unlit")
+    for _m in g.get("materials", []):
         _m.setdefault("extensions", {})["KHR_materials_unlit"] = {}
-    _nj = json.dumps(_g, separators=(",", ":")).encode("utf-8")
-    while len(_nj) % 4:
-        _nj += b" "
-    _bin = _d[20+_jlen:]
-    _out = bytearray()
-    _out += _d[:12]
-    _out += struct.pack("<I", len(_nj)) + b"JSON" + _nj
-    _out += _bin
-    struct.pack_into("<I", _out, 8, len(_out))
-    open(OUT_GLB, "wb").write(_out)
-    log("material marcado unlit (textura sin re-iluminacion)")
-except Exception as _e:
-    log("no pude marcar unlit (%s); sigo con material mate" % _e)
-log("textura UV %dx%d exportada a .glb" % (TEXSIZE, TEXSIZE))
+        _pbr = _m.setdefault("pbrMetallicRoughness", {})
+        _pbr["metallicFactor"] = 0.0; _pbr["roughnessFactor"] = 1.0
+    nj = json.dumps(g, separators=(",",":"), allow_nan=False).encode("utf-8")
+    while len(nj) % 4: nj += b" "
+    out = bytearray(); out += d[:12]
+    out += struct.pack("<I", len(nj)) + b"JSON" + nj
+    out += d[20+jlen:]
+    out[8:12] = struct.pack("<I", len(out))
+    open(OUTGLB,"wb").write(bytes(out))
+    log("material unlit aplicado a la textura")
+except Exception as e:
+    log("(patch unlit fallo, sigo: %s)" % e)
+
+
+# ── 9) AUDITORIA de la TEXTURA (comparar con la linea del pintor en el log) ─
+try:
+    if os.environ.get("AUDIT", "1") == "1" and len(views) > 0:
+        _AW = int(os.environ.get("AUDIT_RES", "2600"))
+        def _gray8(a): return np.clip((a @ np.array([0.299,0.587,0.114]))*255.0, 0, 255)
+        def _lap(g):
+            return (-4.0*g + np.roll(g,1,0) + np.roll(g,-1,0)
+                    + np.roll(g,1,1) + np.roll(g,-1,1))
+        def _erode(mk, n=2):
+            mm = mk.copy()
+            for _ in range(n):
+                mm = mm & np.roll(mm,1,0) & np.roll(mm,-1,0) & np.roll(mm,1,1) & np.roll(mm,-1,1)
+            return mm
+        _tex01 = tex_img.astype(np.float32)/255.0
+        _Nv = min(12, len(views)); _selc = np.linspace(0, len(views)-1, _Nv).astype(int)
+        _ps=[]; _vrs=[]; _dr=[]; _df=[]
+        for _k in _selc:
+            cid2, name2, E2, R2, t2 = views[int(_k)]
+            if cid2 not in cams: continue
+            W2,H2,fx2,fy2,cx2,cy2 = cams[cid2]
+            _pth = os.path.join(IMGDIR, name2)
+            if not os.path.exists(_pth): continue
+            _im2 = Image.open(_pth).convert("RGB")
+            _Wo2,_Ho2 = _im2.size; _asp2 = W2/float(H2)
+            if (_Wo2/float(_Ho2)) > _asp2: _cw2=int(round(_Ho2*_asp2)); _ch2=_Ho2
+            else: _cw2=_Wo2; _ch2=int(round(_Wo2/_asp2))
+            _l2=(_Wo2-_cw2)//2; _t2=(_Ho2-_ch2)//2
+            _im2 = _im2.crop((_l2,_t2,_l2+_cw2,_t2+_ch2))
+            # medir a alta resolucion, pero SIN inflar la foto mas alla de su tamano real
+            _s2 = min(float(_AW), float(max(_im2.size))) / float(max(W2,H2))
+            _rw2 = max(1,int(round(W2*_s2))); _rh2 = max(1,int(round(H2*_s2)))
+            _im2 = _im2.resize((_rw2,_rh2), Image.LANCZOS)
+            _photo2 = np.asarray(_im2, np.float32)/255.0
+            _Ka = o3d.core.Tensor(np.array([[fx2*_s2,0,cx2*_s2],[0,fy2*_s2,cy2*_s2],[0,0,1.0]]))
+            _rays2 = scene.create_rays_pinhole(_Ka, o3d.core.Tensor(E2), _rw2, _rh2)
+            _ans2 = scene.cast_rays(_rays2)
+            _tri2 = _ans2['primitive_ids'].numpy().astype(np.int64)
+            _bb2  = _ans2['primitive_uvs'].numpy().astype(np.float64)
+            _th2  = _ans2['t_hit'].numpy()
+            _hit2 = np.isfinite(_th2) & (_tri2 != INVALID)
+            if _hit2.sum() < 1000: continue
+            _ti2=_tri2[_hit2]; _b1=_bb2[_hit2][:,0]; _b2=_bb2[_hit2][:,1]; _b0=1-_b1-_b2
+            _uvT2 = UV[Fu[_ti2]]
+            _uvp2 = _b0[:,None]*_uvT2[:,0] + _b1[:,None]*_uvT2[:,1] + _b2[:,None]*_uvT2[:,2]
+            _tx2 = np.clip((_uvp2[:,0]*NT).astype(np.int64), 0, NT-1)
+            _ty2 = np.clip((_uvp2[:,1]*NT).astype(np.int64), 0, NT-1)
+            _rend2 = np.zeros((_rh2,_rw2,3), np.float32)
+            _yy2,_xx2 = np.where(_hit2)
+            _rend2[_yy2,_xx2] = _tex01[_ty2,_tx2]
+            _msk2 = _erode(_hit2, 2)
+            if _msk2.sum() < 1000: _msk2 = _hit2
+            _gr2=_gray8(_rend2); _gf2=_gray8(_photo2)
+            _vr2=float(_lap(_gr2)[_msk2].var()); _vf2=float(_lap(_gf2)[_msk2].var())
+            _vrs.append(_vr2/max(_vf2,1e-9)); _dr.append(_vr2); _df.append(_vf2)
+            _mse2=float(((_rend2[_msk2]-_photo2[_msk2])**2).mean())
+            _ps.append(99.0 if _mse2 < 1e-12 else float(10*np.log10(1.0/_mse2)))
+        if _ps:
+            log("")
+            log("=== AUDITORIA (TEXTURA UV %dpx) vs %d fotos reales ===" % (NT, len(_ps)))
+            log("  NITIDEZ: %.0f%% del detalle de la foto real" % (float(np.mean(_vrs))*100))
+            log("     detalle_render=%.1f  detalle_foto=%.1f (escala 0-255, medida a %dpx)"
+                % (float(np.mean(_dr)), float(np.mean(_df)), _AW))
+            log("  FIDELIDAD: PSNR %.1f dB vs la realidad" % float(np.mean(_ps)))
+            log("  -> compara estas 2 lineas con las de (COLOR POR VERTICE) arriba")
+            log("======================================================")
+except Exception as _ae:
+    log("(auditoria de textura fallo, sigo: %s)" % _ae)
+
+log("textura %dx%d, %d caras — UV_TEXTURE_OK en %.1f min"
+    % (NT, NT, len(Fu), (time.time()-t0)/60.0))
 '''
 
 
@@ -770,7 +951,7 @@ except Exception as e:
 # Felipe pega el log y así yo "veo" objetivamente qué tan derretido está.
 try:
     if os.environ.get("AUDIT", "1") == "1" and len(views) > 0:
-        def _gray(a): return a @ np.array([0.299, 0.587, 0.114])
+        def _gray(a): return (a @ np.array([0.299, 0.587, 0.114])) * 255.0
         def _lap(g):
             return (-4.0*g + np.roll(g,1,0) + np.roll(g,-1,0)
                     + np.roll(g,1,1) + np.roll(g,-1,1))
@@ -780,6 +961,7 @@ try:
                 m = m & np.roll(m,1,0) & np.roll(m,-1,0) & np.roll(m,1,1) & np.roll(m,-1,1)
             return m
         _origd = os.environ.get("PAINT_ORIG_DIR", "")
+        _AW = int(os.environ.get("AUDIT_RES", "2600"))
         _Nv = min(12, len(views))
         _sel = np.linspace(0, len(views)-1, _Nv).astype(int)
         _psnrs=[]; _vratios=[]; _vr=[]; _vf=[]
@@ -799,17 +981,24 @@ try:
                 else: _cw=_Wo; _ch=int(round(_Wo/_asp))
                 _l=(_Wo-_cw)//2; _tp=(_Ho-_ch)//2
                 _im=_im.crop((_l,_tp,_l+_cw,_tp+_ch))
-            _im=_im.resize((W,H), Image.LANCZOS)
+            # v7: medir a ALTA resolucion. A ~1000px el ruido por-vertice del
+            # render se confunde con detalle real y la nitidez daba 103% falso
+            # (detalle=0.0). A 2600px la foto conserva las letras y el render
+            # derretido queda liso: la razon SI expone el efecto oleo.
+            # (sin inflar la foto mas alla de su tamano real)
+            _s = min(float(_AW), float(max(_im.size))) / float(max(W,H))
+            _rw = max(1,int(round(W*_s))); _rh = max(1,int(round(H*_s)))
+            _im=_im.resize((_rw,_rh), Image.LANCZOS)
             _photo=np.asarray(_im,np.float32)/255.0
-            _K=o3d.core.Tensor(np.array([[fx,0,cx],[0,fy,cy],[0,0,1]]))
-            _rays=scene.create_rays_pinhole(_K, o3d.core.Tensor(E), W, H)
+            _K=o3d.core.Tensor(np.array([[fx*_s,0,cx*_s],[0,fy*_s,cy*_s],[0,0,1.0]]))
+            _rays=scene.create_rays_pinhole(_K, o3d.core.Tensor(E), _rw, _rh)
             _ans=scene.cast_rays(_rays)
             _tri=_ans['primitive_ids'].numpy().astype(np.int64)
             _bb=_ans['primitive_uvs'].numpy().astype(np.float64)
             _th=_ans['t_hit'].numpy()
             _hit=np.isfinite(_th)&(_tri!=INVALID)
             if _hit.sum()<1000: continue
-            _rend=np.zeros((H,W,3),np.float32)
+            _rend=np.zeros((_rh,_rw,3),np.float32)
             _ti=_tri[_hit]; _b1=_bb[_hit][:,0]; _b2=_bb[_hit][:,1]; _b0=1-_b1-_b2
             _c3=_cols_display[F[_ti]]
             _rc=(_b0[:,None]*_c3[:,0]+_b1[:,None]*_c3[:,1]+_b2[:,None]*_c3[:,2])
@@ -824,10 +1013,11 @@ try:
         if _psnrs:
             _mp=float(np.mean(_psnrs)); _mv=float(np.mean(_vratios))
             log("")
-            log("=== AUDITORIA DE CALIDAD (malla vs %d fotos reales) ===" % len(_psnrs))
+            log("=== AUDITORIA (COLOR POR VERTICE) vs %d fotos reales ===" % len(_psnrs))
             log("  NITIDEZ (efecto derretido): %.0f%% del detalle de la foto real" % (_mv*100))
             log("     100%% = tan nitido como la foto ; <50%% = muy derretido/oleo")
-            log("     detalle_render=%.1f  detalle_foto=%.1f" % (float(np.mean(_vr)), float(np.mean(_vf))))
+            log("     detalle_render=%.1f  detalle_foto=%.1f (escala 0-255, medida a %dpx)"
+                % (float(np.mean(_vr)), float(np.mean(_vf)), _AW))
             log("  FIDELIDAD de la malla: PSNR %.1f dB vs la realidad" % _mp)
             log("     >28 muy bueno ; 24-28 aceptable ; <24 pobre")
             log("=======================================================")
@@ -1283,7 +1473,7 @@ def fase(p, msg):
     _estado["p"] = p; _estado["msg"] = msg
     log(msg)
 
-def run(cmd, cwd=None, env=None, fase_label=None, check=True):
+def run(cmd, cwd=None, env=None, fase_label=None, check=True, timeout=None):
     """Ejecuta un comando enviando su salida a un ARCHIVO (no a un pipe).
     Esto evita el deadlock que colgaba el proceso (con la GPU en 0%) cuando la
     salida llenaba el buffer del pipe y nadie lo leía hasta el final.
@@ -1298,6 +1488,13 @@ def run(cmd, cwd=None, env=None, fase_label=None, check=True):
         ultima = ""
         while proc.poll() is None:
             time.sleep(10)
+            if timeout and (time.time() - t0) > timeout:
+                try:
+                    proc.kill(); proc.wait(timeout=15)
+                except Exception:
+                    pass
+                log(f"   ⏱ paso cortado a los {int(timeout/60)} min (limite de seguridad); sigo con el respaldo")
+                break
             if fase_label:
                 mins = int((time.time() - t0) / 60)
                 _estado["msg"] = f"{fase_label} · {mins} min trabajando…"
@@ -1374,7 +1571,8 @@ def main():
         _bn_tr = int(os.environ.get("MESH_TRIS", "2500000")) // 1000
         _bn_st = os.environ.get("PAINT_STORE", "linear")
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
-        log(f"═══ render-gs-worker 2DGS · v6-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}"
+        _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
+        log(f"═══ render-gs-worker 2DGS · v7-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}-{_bn_uv}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -1953,11 +2151,15 @@ def main():
             "        # TODAS las paredes daban perif baja -> se descartaban (visto en\n"
             "        # produccion: 0.04, 0.28, 0.35...). AHORA: proyectamos TODOS los\n"
             "        # vertices sobre la normal y miramos en que PERCENTIL cae el plano.\n"
-            "        # Una pared/piso/techo real esta en el EXTREMO (percentil <12 o\n"
-            "        # >88); un mueble cae en el medio. No depende del centro del cuarto.\n"
+            "        # Una pared/piso/techo real esta en el EXTREMO (percentil <=20 o\n"
+            "        # >=80); un mueble cae en el medio. No depende del centro del cuarto.\n"
+            "        # v7: los limites 12/88 quedaron APRETADOS: en produccion rechazaban\n"
+            "        # paredes REALES en percentil 84/88/20 (la geometria flotante fuera\n"
+            "        # del cuarto ensancha la distribucion). Con 20/80 esas paredes entran\n"
+            "        # y los muebles (percentil 48 y 73) siguen afuera.\n"
             "        _sall = _V @ _nrm; _splane = -_d\n"
             "        _pct = float((_sall < _splane).mean()) * 100.0\n"
-            "        if 12.0 < _pct < 88.0:\n"
+            "        if 20.0 < _pct < 80.0:\n"
             "            print('PLANO descartado (percentil %.0f: en el MEDIO del'\n"
             "                  ' cuarto, probablemente un mueble)' % _pct, flush=True); continue\n"
             "        # CANDADO 3 — normal del vertice casi paralela al plano (<35 grados)\n"
@@ -2216,68 +2418,80 @@ def main():
             log(f"   (vista previa no subida: {_pe}; sigo)")
 
         # ══════════════════════════════════════════════════════════════════════
-        # PASO 4c: HORNEAR TEXTURA UV (estilo Polycam) — FASE 0 de validación
-        # ──────────────────────────────────────────────────────────────────────
-        # Separa el color de la geometría: hornea una imagen de alta resolución
-        # sobre la malla (en vez de color por vértice). PROMEDIA todas las fotos
-        # visibles por texel usando las MISMAS imágenes y poses del entrenamiento
-        # 2DGS → no se tuerce como OpenMVS. Si falla, se sube el .glb de color por
-        # vértice (no se pierde el render). Esta corrida valida si la textura ALINEA.
+        # ──────────────────────────────────────────────────────────────────
+        # PASO 4c: PINTAR VERTICES desde las fotos (SIEMPRE: es el respaldo
+        #          seguro y da la linea base de la auditoria en el log).
+        # PASO 4d: TEXTURA UV de MEJOR-VISTA — el arreglo REAL del efecto
+        #          oleo/acuarela. El color por vertice reparte ~1.1M colores en
+        #          el cuarto (texel ~5mm: no puede mostrar letras); la textura
+        #          4K da texel ~1mm tomando el color de la MEJOR camara por
+        #          punto (promediar 127 vistas emborrona — Waechter ECCV'14,
+        #          la base de OpenMVS). Si la textura falla por lo que sea, se
+        #          sube el pintado por vertice: el render NUNCA se pierde.
+        # ──────────────────────────────────────────────────────────────────
         glb_tex = WORK / "mesh_textured.glb"
-        # COLOR FINAL — por defecto: PINTADO POR VERTICE desde las fotos (~1-3 min,
-        # misma matematica validada de la textura pero SIN xatlas). La textura UV
-        # completa (xatlas, 25-90 min extra) queda como opcion: TEXTURE_BAKE=1.
-        if os.environ.get("TEXTURE_BAKE", "0") == "1":
+        glb_uv  = WORK / "mesh_uv.glb"
+        _paint_env = dict(os.environ)
+        try:
+            fase(0.94, "PASO 4c/5 — Pintando vértices desde las fotos")
+            paint_py = WORK / "vertex_paint.py"
+            paint_py.write_text(VERTEXPAINT_SCRIPT)
+            # Preparar las fotos ORIGINALES de 12MP con el nombre que usa el
+            # pintor (img_NNNN.*). MASt3R nombra sus imágenes img_0000, img_0001…
+            # en el MISMO orden en que copiamos las originales foto_0000,
+            # foto_0001… (ambos son sorted() del ZIP), así que el índice coincide.
+            # El pintor recorta cada original al aspecto de cameras.txt, así que
+            # solo importa el índice, no el tamaño.
             try:
-                fase(0.94, "PASO 4c/5 — Horneando textura UV (estilo Polycam)")
-                bake_py = WORK / "bake_texture.py"
-                bake_py.write_text(TEXTURE_SCRIPT)
-                run(["python", str(bake_py), str(malla), str(dataset / "images"),
-                     str(dataset / "sparse" / "0"), str(glb_tex), "2048"],
-                    fase_label="PASO 4c/5 — Horneando textura UV", check=False)
-                if glb_tex.exists() and glb_tex.stat().st_size > 1000:
-                    log(f"   ✓ textura UV horneada: {glb_tex.stat().st_size/1e6:.1f} MB")
+                _orig_src = sorted((WORK / "images").glob("foto_*"))
+                _dst = WORK / "orig12mp"; _dst.mkdir(exist_ok=True)
+                for _i, _op in enumerate(_orig_src):
+                    _lnk = _dst / ("img_%04d%s" % (_i, _op.suffix.lower()))
+                    if not _lnk.exists():
+                        shutil.copy(_op, _lnk)
+                _paint_env["PAINT_ORIG_DIR"] = str(_dst)
+                log(f"   pintaré desde las {len(_orig_src)} fotos ORIGINALES 12MP")
+            except Exception as _pe:
+                log(f"   (no pude preparar las 12MP: {_pe}; pinto desde 1000px)")
+            run(["python", str(paint_py), str(malla), str(dataset / "images"),
+                 str(dataset / "sparse" / "0"), str(glb_tex),
+                 str(WORK / "ao.npy")],   # AO -> devuelve profundidad al color
+                fase_label="PASO 4c/5 — Pintando vértices", check=False, env=_paint_env)
+            if glb_tex.exists() and glb_tex.stat().st_size > 1000:
+                log(f"   ✓ vértices pintados desde las FOTOS: {glb_tex.stat().st_size/1e6:.1f} MB")
+            else:
+                log("   ⚠ el pintado no produjo archivo; uso color por vértice del entrenamiento")
+        except Exception as e:
+            log(f"   ⚠ pintado falló ({e}); uso color por vértice del entrenamiento")
+
+        # ── PASO 4d: TEXTURA UV (UV_TEXTURE=1 por defecto; =0 la apaga) ──
+        if os.environ.get("UV_TEXTURE", "1") == "1":
+            try:
+                fase(0.945, "PASO 4d/5 — Horneando TEXTURA UV (mata el efecto óleo)")
+                uv_py = WORK / "uv_texture.py"
+                uv_py.write_text(UV_TEXTURE_SCRIPT)
+                _dir_uv = _paint_env.get("PAINT_ORIG_DIR", str(dataset / "images"))
+                run(["python", str(uv_py), str(malla), _dir_uv,
+                     str(dataset / "sparse" / "0"), str(glb_uv),
+                     str(WORK / "ao.npy")],
+                    fase_label="PASO 4d/5 — Horneando TEXTURA UV",
+                    check=False, env=_paint_env, timeout=1500)  # 25 min máx y corta
+                if glb_uv.exists() and glb_uv.stat().st_size > 2_000_000:
+                    log(f"   ✓ TEXTURA UV lista: {glb_uv.stat().st_size/1e6:.1f} MB — se sube ESTA (la nítida)")
                 else:
-                    log("   ⚠ el texturizado no produjo archivo; uso color por vértice")
+                    log("   ⚠ la textura UV no produjo archivo válido; subo el color por vértice (respaldo)")
             except Exception as e:
-                log(f"   ⚠ texturizado falló ({e}); uso color por vértice (.glb)")
+                log(f"   ⚠ textura UV falló ({e}); subo el color por vértice (respaldo)")
         else:
-            try:
-                fase(0.94, "PASO 4c/5 — Pintando vértices desde las fotos")
-                paint_py = WORK / "vertex_paint.py"
-                paint_py.write_text(VERTEXPAINT_SCRIPT)
-                # Preparar las fotos ORIGINALES de 12MP con el nombre que usa el
-                # pintor (img_NNNN.*). MASt3R nombra sus imágenes img_0000, img_0001…
-                # en el MISMO orden en que copiamos las originales foto_0000,
-                # foto_0001… (ambos son sorted() del ZIP), así que el índice coincide.
-                # El pintor recorta cada original al aspecto de cameras.txt, así que
-                # solo importa el índice, no el tamaño.
-                _paint_env = dict(os.environ)
-                try:
-                    _orig_src = sorted((WORK / "images").glob("foto_*"))
-                    _dst = WORK / "orig12mp"; _dst.mkdir(exist_ok=True)
-                    for _i, _op in enumerate(_orig_src):
-                        _lnk = _dst / ("img_%04d%s" % (_i, _op.suffix.lower()))
-                        if not _lnk.exists():
-                            shutil.copy(_op, _lnk)
-                    _paint_env["PAINT_ORIG_DIR"] = str(_dst)
-                    log(f"   pintaré desde las {len(_orig_src)} fotos ORIGINALES 12MP")
-                except Exception as _pe:
-                    log(f"   (no pude preparar las 12MP: {_pe}; pinto desde 1000px)")
-                run(["python", str(paint_py), str(malla), str(dataset / "images"),
-                     str(dataset / "sparse" / "0"), str(glb_tex),
-                     str(WORK / "ao.npy")],   # AO -> devuelve profundidad al color
-                    fase_label="PASO 4c/5 — Pintando vértices", check=False, env=_paint_env)
-                if glb_tex.exists() and glb_tex.stat().st_size > 1000:
-                    log(f"   ✓ vértices pintados desde las FOTOS: {glb_tex.stat().st_size/1e6:.1f} MB")
-                else:
-                    log("   ⚠ el pintado no produjo archivo; uso color por vértice del entrenamiento")
-            except Exception as e:
-                log(f"   ⚠ pintado falló ({e}); uso color por vértice del entrenamiento")
+            log("   PASO 4d saltado (UV_TEXTURE=0): se sube el color por vértice")
 
         # Archivo a subir (orden de preferencia):
-        #   1º textura UV (estilo Polycam)  2º color por vértice + AO  3º .ply crudo
-        if glb_tex.exists() and glb_tex.stat().st_size > 1000:
+        #   1º TEXTURA UV (nítida)   2º vértices pintados   3º color del
+        #   entrenamiento   4º .ply crudo
+        if glb_uv.exists() and glb_uv.stat().st_size > 2_000_000:
+            archivo_subir = glb_uv
+            ply_mb = glb_uv.stat().st_size / 1e6
+        elif glb_tex.exists() and glb_tex.stat().st_size > 1000:
             archivo_subir = glb_tex
             ply_mb = glb_tex.stat().st_size / 1e6
         elif glb_final.exists() and glb_final.stat().st_size > 1000:
