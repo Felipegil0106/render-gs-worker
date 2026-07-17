@@ -295,6 +295,17 @@ def srgb_to_linear(c):
 def linear_to_srgb(c):
     c = np.clip(c, 0, 1)
     return np.where(c <= 0.0031308, c*12.92, 1.055*(c**(1/2.4))-0.055)
+def find_photo(dirpath, name):
+    # v7.2: images.txt dice img_0000.png pero las fotos del celular son .jpg
+    # (esto dejo el horneado en 0/127 EN PRODUCCION). Se busca por NOMBRE BASE
+    # probando las extensiones conocidas.
+    p = os.path.join(dirpath, name)
+    if os.path.exists(p): return p
+    stem = os.path.splitext(name)[0]
+    for ext in (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"):
+        q = os.path.join(dirpath, stem + ext)
+        if os.path.exists(q): return q
+    return None
 
 # ── 1) cargar malla ────────────────────────────────────────────────────────
 m = o3d.io.read_triangle_mesh(MESH)
@@ -411,11 +422,15 @@ def bilinear(img, x, y):
             + img[y1,x0]*(1-wx)*wy + img[y1,x1]*wx*wy)
 
 nuse = 0
+_nf = 0
 for cid, name, E, R, t in views:
     if cid not in cams: continue
     W, H, fx, fy, cx, cy = cams[cid]
-    path = os.path.join(IMGDIR, name)
-    if not os.path.exists(path): continue
+    path = find_photo(IMGDIR, name)
+    if path is None:
+        _nf += 1
+        if _nf <= 3: log("FOTO NO ENCONTRADA para %s (probe .jpg/.jpeg/.png) en %s" % (name, IMGDIR))
+        continue
     _im = Image.open(path).convert("RGB")
     _Wo, _Ho = _im.size; _asp = W/float(H)
     if (_Wo/float(_Ho)) > _asp: _cw = int(round(_Ho*_asp)); _ch = _Ho
@@ -480,6 +495,8 @@ for cid, name, E, R, t in views:
     nuse += 1
 
 log("horneado: %d/%d camaras proyectadas" % (nuse, len(views)))
+if _nf:
+    log("OJO: %d fotos no encontradas por nombre/extension" % _nf)
 filled = texw > -1.0
 log("cobertura: %.1f%% de texeles con color (%d de %d)"
     % (100.0*filled.mean(), int(filled.sum()), NT*NT))
@@ -590,8 +607,8 @@ try:
             cid2, name2, E2, R2, t2 = views[int(_k)]
             if cid2 not in cams: continue
             W2,H2,fx2,fy2,cx2,cy2 = cams[cid2]
-            _pth = os.path.join(IMGDIR, name2)
-            if not os.path.exists(_pth): continue
+            _pth = find_photo(IMGDIR, name2)
+            if _pth is None: continue
             _im2 = Image.open(_pth).convert("RGB")
             _Wo2,_Ho2 = _im2.size; _asp2 = W2/float(H2)
             if (_Wo2/float(_Ho2)) > _asp2: _cw2=int(round(_Ho2*_asp2)); _ch2=_Ho2
@@ -1587,7 +1604,7 @@ def main():
         _bn_st = os.environ.get("PAINT_STORE", "linear")
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
-        log(f"═══ render-gs-worker 2DGS · v7.1-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}-{_bn_uv}"
+        log(f"═══ render-gs-worker 2DGS · v7.2-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}-{_bn_uv}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -2465,7 +2482,7 @@ def main():
                     if not _lnk.exists():
                         shutil.copy(_op, _lnk)
                 _paint_env["PAINT_ORIG_DIR"] = str(_dst)
-                log(f"   pintaré desde las {len(_orig_src)} fotos ORIGINALES 12MP")
+                log(f"   carpeta 12MP lista ({len(_orig_src)} fotos) — la usa la TEXTURA UV (el pintor usa 1000px: es solo el respaldo)")
             except Exception as _pe:
                 log(f"   (no pude preparar las 12MP: {_pe}; pinto desde 1000px)")
             run(["python", str(paint_py), str(malla), str(dataset / "images"),
