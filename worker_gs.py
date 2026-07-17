@@ -257,7 +257,7 @@ UV_TEXTURE_SCRIPT = r'''
 #
 # Perillas de entorno (sin tocar código):
 #   TEX_SIZE=4096        lado de la textura (4096 base; 8192 si el visor aguanta)
-#   UV_MESH_TRIS=500000  caras tras decimar antes del unwrap (xatlas se atasca >~500k)
+#   UV_MESH_TRIS=200000  caras antes del unwrap (a 500k xatlas tardo >13 min EN PRODUCCION)
 #   TEX_BAKE_RES=2600    resolución de raycast por cámara (cobertura de texeles)
 #   TEX_SAT=1.15         saturación (igual que el pintor)
 #   TEX_AO=0.40          fuerza del AO (igual que el pintor)
@@ -272,7 +272,7 @@ t0 = time.time()
 def log(m): print("   [uv] %s" % m, flush=True)
 
 TEX_SIZE      = int(os.environ.get("TEX_SIZE", "4096"))
-UV_MESH_TRIS  = int(os.environ.get("UV_MESH_TRIS", "500000"))
+UV_MESH_TRIS  = int(os.environ.get("UV_MESH_TRIS", "200000"))
 BAKE_RES      = int(os.environ.get("TEX_BAKE_RES", "2600"))
 TEX_SAT       = float(os.environ.get("TEX_SAT", "1.15"))
 TEX_AO        = float(os.environ.get("TEX_AO", "0.40"))
@@ -318,6 +318,19 @@ if len(np.asarray(m.triangles)) > UV_MESH_TRIS:
     m = m.simplify_quadric_decimation(target_number_of_triangles=UV_MESH_TRIS)
     m.remove_unreferenced_vertices()
     log("decimada a %d caras para el unwrap" % len(np.asarray(m.triangles)))
+# v7.1: LIMPIEZA ANTI-ATASCO para xatlas — las caras de area ~0 (colineales)
+# lo atascan o lo revientan. remove_degenerate_triangles NO las quita (solo
+# las de vertice repetido); aqui se filtran por AREA real.
+m.remove_duplicated_vertices()
+m.remove_degenerate_triangles()
+_Vt = np.asarray(m.vertices); _Ft = np.asarray(m.triangles)
+_a2 = np.linalg.norm(np.cross(_Vt[_Ft[:,1]]-_Vt[_Ft[:,0]],
+                              _Vt[_Ft[:,2]]-_Vt[_Ft[:,0]]), axis=1)
+_deg = _a2 < 1e-12
+if _deg.any():
+    m.remove_triangles_by_mask(_deg)
+    m.remove_unreferenced_vertices()
+    log("limpieza anti-atasco: quite %d caras de area cero" % int(_deg.sum()))
 m.compute_vertex_normals()
 V  = np.asarray(m.vertices)
 F  = np.asarray(m.triangles).astype(np.int64)
@@ -340,7 +353,8 @@ except Exception:
     log("instalando xatlas (no viene en la imagen v4.2)...")
     os.system(sys.executable + " -m pip install xatlas --quiet")
     import xatlas
-log("xatlas: desplegando UV (puede tardar)...")
+_t_x = time.time()
+log("xatlas: desplegando UV de %d caras (con 200k, tipico 1-5 min)..." % len(F))
 vmapping, indices, uvs = xatlas.parametrize(V, F)
 Vu  = V[vmapping]
 Fu  = indices.astype(np.int64)
@@ -348,7 +362,8 @@ UV  = uvs.astype(np.float64)
 VNu = VN[vmapping]
 AOu = ao_vert[vmapping] if ao_vert is not None else None
 UV[:, 0] = np.clip(UV[:, 0], 0, 1); UV[:, 1] = np.clip(UV[:, 1], 0, 1)
-log("xatlas OK: %d vert desplegados, %d caras" % (len(Vu), len(Fu)))
+log("xatlas OK en %.1f min: %d vert desplegados, %d caras"
+    % ((time.time()-_t_x)/60.0, len(Vu), len(Fu)))
 
 # ── 4) poses COLMAP (parseo IDÉNTICO al pintor) ────────────────────────────
 cams = {}
@@ -1572,7 +1587,7 @@ def main():
         _bn_st = os.environ.get("PAINT_STORE", "linear")
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
-        log(f"═══ render-gs-worker 2DGS · v7-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}-{_bn_uv}"
+        log(f"═══ render-gs-worker 2DGS · v7.1-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}-{_bn_uv}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
