@@ -264,6 +264,7 @@ UV_TEXTURE_SCRIPT = r'''
 #   TEX_GAMMA=1.0        gamma final
 #   TEX_ANGLE_MAX=75     descarta vistas más rasantes que esto (grados)
 #   TEX_HOLE_ITERS=128   iteraciones de relleno de huecos
+#   TEX_SEAM=1           igualar exposicion entre camaras (0=apagar; quita el mosaico)
 # ============================================================================
 import os, sys, json, struct, time
 import numpy as np
@@ -410,6 +411,9 @@ NT = TEX_SIZE
 tex   = np.zeros((NT*NT, 3), np.float32)     # color por texel (LINEAL mientras horneo)
 texw  = np.full(NT*NT, -1.0, np.float32)     # mejor peso visto por texel
 texao = np.zeros(NT*NT, np.float32)          # AO por texel
+texs  = np.zeros((NT*NT, 3), np.float32)     # v7.3: suma ponderada de TODAS las camaras
+texsw = np.zeros(NT*NT, np.float32)          #       (promedio -> el TONO sin costuras)
+texcam = np.full(NT*NT, -1, np.int16)        #       camara ganadora por texel (p/ igualar exposicion)
 cos_min = float(np.cos(np.deg2rad(TEX_ANGLE_MAX)))
 
 def bilinear(img, x, y):
@@ -423,7 +427,7 @@ def bilinear(img, x, y):
 
 nuse = 0
 _nf = 0
-for cid, name, E, R, t in views:
+for _ci, (cid, name, E, R, t) in enumerate(views):
     if cid not in cams: continue
     W, H, fx, fy, cx, cy = cams[cid]
     path = find_photo(IMGDIR, name)
@@ -487,11 +491,18 @@ for cid, name, E, R, t in views:
     camw = np.full(len(uniq), -1.0, np.float32); np.maximum.at(camw, inv, ws)
     camc = np.zeros((len(uniq),3), np.float32); camc[inv] = cs
     camao = np.zeros(len(uniq), np.float32);    camao[inv] = aos
-    better = camw > texw[uniq]
+    # v7.3: consenso con UNA contribucion por texel por camara (deduplicada
+    # IGUAL que la mejor-vista). Antes se sumaban TODOS los rayos y la resta
+    # texs - tex*texw NO excluia del todo a la propia camara: el consenso
+    # quedaba contaminado y las ganancias se quedaban cortas (medido en local).
+    texsw[uniq] += camw
+    texs[uniq]  += camc * camw[:, None]
+    better = camw > texw[uniq] + 0.02   # v7.3: margen anti-parpadeo (empates)
     sel = uniq[better]
     tex[sel]   = camc[better]
     texw[sel]  = camw[better]
     texao[sel] = camao[better]
+    texcam[sel] = _ci
     nuse += 1
 
 log("horneado: %d/%d camaras proyectadas" % (nuse, len(views)))
@@ -502,6 +513,41 @@ log("cobertura: %.1f%% de texeles con color (%d de %d)"
     % (100.0*filled.mean(), int(filled.sum()), NT*NT))
 if filled.sum() == 0:
     log("ERROR: 0 texeles cubiertos, abortando textura"); sys.exit(2)
+# ── 5b) NIVELACION DE COSTURAS (v7.3): IGUALAR LA EXPOSICION ENTRE CAMARAS ─
+# La mejor-vista pura dejo MOSAICO en produccion: cada parche viene de UNA foto
+# y el celular cambia exposicion/balance entre fotos -> parches del mismo color
+# con tonos distintos (NITIDEZ 883% = costuras; PSNR bajo a 19.2). Arreglo (el
+# "ajuste global de luminancia" de Waechter 2014, lo que hace Polycam): a cada
+# camara se le calcula una GANANCIA RGB que la alinea al CONSENSO (el promedio
+# de todas las camaras en los texeles que ella gano) y se aplica en LINEAL.
+# La exposicion automatica del celular es (casi) una ganancia global por foto,
+# asi que esto la deshace casi por completo. TEX_SEAM=0 lo apaga.
+if os.environ.get("TEX_SEAM", "1") == "1":
+    try:
+        _okw = texsw > 1e-8
+        _gan = np.ones((max(len(views), 1), 3), np.float32)
+        _napl = 0
+        for _c in range(len(views)):
+            _selc2 = (texcam == _c) & _okw
+            if int(_selc2.sum()) < 500: continue
+            # consenso EXCLUYENDO la propia camara (si no, se auto-contamina y
+            # la correccion queda corta: verificado con numeros en local)
+            _den = texsw[_selc2] - texw[_selc2]
+            _ok2 = _den > 1e-6                    # texeles vistos por >=2 camaras
+            if int(_ok2.sum()) < 500: continue
+            _mine = tex[_selc2][_ok2]
+            _ae = (texs[_selc2][_ok2] - _mine * texw[_selc2][_ok2][:, None]) \
+                  / _den[_ok2][:, None]
+            _ae = np.maximum(_ae, 0.0)
+            _r = np.clip(_ae / np.maximum(_mine, 1e-3), 0.25, 4.0)
+            _g = np.clip(np.median(_r, axis=0), 0.5, 2.0)
+            _gan[_c] = _g; _napl += 1
+        _cov = texcam >= 0
+        tex[_cov] = np.clip(tex[_cov] * _gan[texcam[_cov]], 0, 1)
+        log("costuras NIVELADAS: exposicion igualada en %d camaras "
+            "(ganancias %.2f-%.2f)" % (_napl, float(_gan.min()), float(_gan.max())))
+    except Exception as _se:
+        log("(nivelado de exposicion fallo, sigo sin el: %s)" % _se)
 
 # ── 6) rellenar huecos (dilatar color a texeles vacíos) ────────────────────
 tex2   = tex.reshape(NT, NT, 3)
@@ -649,6 +695,7 @@ try:
             log("  NITIDEZ: %.0f%% del detalle de la foto real" % (float(np.mean(_vrs))*100))
             log("     detalle_render=%.1f  detalle_foto=%.1f (escala 0-255, medida a %dpx)"
                 % (float(np.mean(_dr)), float(np.mean(_df)), _AW))
+            log("     (sano ~60-140%. MUY por encima de 100% = costuras/ruido, no nitidez real)")
             log("  FIDELIDAD: PSNR %.1f dB vs la realidad" % float(np.mean(_ps)))
             log("  -> compara estas 2 lineas con las de (COLOR POR VERTICE) arriba")
             log("======================================================")
@@ -1604,7 +1651,7 @@ def main():
         _bn_st = os.environ.get("PAINT_STORE", "linear")
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
-        log(f"═══ render-gs-worker 2DGS · v7.2-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}-{_bn_uv}"
+        log(f"═══ render-gs-worker 2DGS · v7.3-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}-{_bn_uv}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -2507,7 +2554,7 @@ def main():
                      str(dataset / "sparse" / "0"), str(glb_uv),
                      str(WORK / "ao.npy")],
                     fase_label="PASO 4d/5 — Horneando TEXTURA UV",
-                    check=False, env=_paint_env, timeout=1500)  # 25 min máx y corta
+                    check=False, env=_paint_env, timeout=2400)  # 25 min máx y corta
                 if glb_uv.exists() and glb_uv.stat().st_size > 2_000_000:
                     log(f"   ✓ TEXTURA UV lista: {glb_uv.stat().st_size/1e6:.1f} MB — se sube ESTA (la nítida)")
                 else:
