@@ -264,6 +264,7 @@ UV_TEXTURE_SCRIPT = r'''
 #   TEX_GAMMA=1.0        gamma final
 #   TEX_ANGLE_MAX=75     descarta vistas más rasantes que esto (grados)
 #   TEX_HOLE_ITERS=128   iteraciones de relleno de huecos
+#   TEX_MODE=best|avg     best=parches nivelados (nitido) | avg=mezcla sin parches
 #   TEX_SEAM=1           igualar exposicion entre camaras (0=apagar; quita el mosaico)
 # ============================================================================
 import os, sys, json, struct, time
@@ -313,7 +314,8 @@ m = o3d.io.read_triangle_mesh(MESH)
 m.remove_unreferenced_vertices()
 m.remove_degenerate_triangles()
 V0 = np.asarray(m.vertices).copy()
-log("malla: %d vert, %d caras" % (len(V0), len(np.asarray(m.triangles))))
+F0 = np.asarray(m.triangles).astype(np.int64).copy()   # v7.4: para la oclusion fina
+log("malla: %d vert, %d caras" % (len(V0), len(F0)))
 
 ao_src = None
 if AONPY and os.path.exists(AONPY):
@@ -376,6 +378,22 @@ AOu = ao_vert[vmapping] if ao_vert is not None else None
 UV[:, 0] = np.clip(UV[:, 0], 0, 1); UV[:, 1] = np.clip(UV[:, 1], 0, 1)
 log("xatlas OK en %.1f min: %d vert desplegados, %d caras"
     % ((time.time()-_t_x)/60.0, len(Vu), len(Fu)))
+# v7.4: identificar las ISLAS (charts) del atlas. El relleno de huecos dilataba
+# el color SIN mirar islas: pedazos de una superficie se copiaban al borde de
+# OTRA que solo es vecina en el atlas 2D -> "pedacitos donde no corresponden".
+try:
+    import scipy.sparse as _ssp
+    import scipy.sparse.csgraph as _csg
+    _e_a = np.concatenate([Fu[:,0], Fu[:,1], Fu[:,2]])
+    _e_b = np.concatenate([Fu[:,1], Fu[:,2], Fu[:,0]])
+    _adj = _ssp.csr_matrix((np.ones(len(_e_a), np.int8), (_e_a, _e_b)),
+                           shape=(len(Vu), len(Vu)))
+    _nch, _vlab = _csg.connected_components(_adj, directed=False)
+    CHART_F = _vlab[Fu[:,0]].astype(np.int32)
+    log("atlas: %d islas identificadas (el relleno respetara sus bordes)" % _nch)
+except Exception as _che:
+    CHART_F = None
+    log("(islas no identificadas, relleno clasico: %s)" % _che)
 
 # ── 4) poses COLMAP (parseo IDÉNTICO al pintor) ────────────────────────────
 cams = {}
@@ -406,6 +424,23 @@ um = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(Vu),
 scene = o3d.t.geometry.RaycastingScene()
 scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(um))
 INVALID = scene.INVALID_ID
+# v7.4: OCLUSION FINA — la decimacion a 200k borra objetos delgados; una camara
+# entonces "ve a traves" de ellos y pinta la pared de atras con pedazos de la
+# foto del objeto de adelante. Cada rayo se prueba TAMBIEN contra la malla
+# COMPLETA: si esta tiene un choque mas cercano, ese pixel NO pinta (otra
+# camara que si vea la pared la pintara).
+scene_full = None; OCC_DELTA = 0.0
+try:
+    _mf = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V0),
+                                    o3d.utility.Vector3iVector(F0))
+    scene_full = o3d.t.geometry.RaycastingScene()
+    scene_full.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(_mf))
+    OCC_DELTA = 0.004 * float(np.linalg.norm(V0.max(0) - V0.min(0)))
+    log("oclusion fina activa: malla completa %d caras (tolerancia %.3f unid.)"
+        % (len(F0), OCC_DELTA))
+except Exception as _oe:
+    scene_full = None
+    log("(oclusion fina no disponible: %s)" % _oe)
 
 NT = TEX_SIZE
 tex   = np.zeros((NT*NT, 3), np.float32)     # color por texel (LINEAL mientras horneo)
@@ -414,6 +449,7 @@ texao = np.zeros(NT*NT, np.float32)          # AO por texel
 texs  = np.zeros((NT*NT, 3), np.float32)     # v7.3: suma ponderada de TODAS las camaras
 texsw = np.zeros(NT*NT, np.float32)          #       (promedio -> el TONO sin costuras)
 texcam = np.full(NT*NT, -1, np.int16)        #       camara ganadora por texel (p/ igualar exposicion)
+textri = np.full(NT*NT, -1, np.int64)        # v7.4: cara ganadora por texel (relleno por islas)
 cos_min = float(np.cos(np.deg2rad(TEX_ANGLE_MAX)))
 
 def bilinear(img, x, y):
@@ -454,6 +490,9 @@ for _ci, (cid, name, E, R, t) in enumerate(views):
     bary = ans['primitive_uvs'].numpy().astype(np.float64)
     thit = ans['t_hit'].numpy()
     hit = np.isfinite(thit) & (tri != INVALID)
+    if scene_full is not None:
+        _tf = scene_full.cast_rays(rays)['t_hit'].numpy()
+        hit &= ~(_tf < (thit - OCC_DELTA))    # v7.4: un ocultador esta mas cerca
     if hit.sum() == 0: continue
     ti = tri[hit]; b1 = bary[hit][:,0]; b2 = bary[hit][:,1]; b0 = 1-b1-b2
 
@@ -483,14 +522,15 @@ for _ci, (cid, name, E, R, t) in enumerate(views):
     w[cosang <= cos_min] = -1.0
     good = w > -1.0
     if not good.any(): continue
-    tflat = tflat[good]; col = col[good]; w = w[good]; aoh = aoh[good]
+    tflat = tflat[good]; col = col[good]; w = w[good]; aoh = aoh[good]; ti = ti[good]
 
     order = np.argsort(w)                     # ascendente -> mayor peso sobrescribe último
-    tfs = tflat[order]; cs = col[order]; ws = w[order]; aos = aoh[order]
+    tfs = tflat[order]; cs = col[order]; ws = w[order]; aos = aoh[order]; tis = ti[order]
     uniq, inv = np.unique(tfs, return_inverse=True)
     camw = np.full(len(uniq), -1.0, np.float32); np.maximum.at(camw, inv, ws)
     camc = np.zeros((len(uniq),3), np.float32); camc[inv] = cs
     camao = np.zeros(len(uniq), np.float32);    camao[inv] = aos
+    camtri = np.zeros(len(uniq), np.int64);     camtri[inv] = tis
     # v7.3: consenso con UNA contribucion por texel por camara (deduplicada
     # IGUAL que la mejor-vista). Antes se sumaban TODOS los rayos y la resta
     # texs - tex*texw NO excluia del todo a la propia camara: el consenso
@@ -503,6 +543,7 @@ for _ci, (cid, name, E, R, t) in enumerate(views):
     texw[sel]  = camw[better]
     texao[sel] = camao[better]
     texcam[sel] = _ci
+    textri[sel] = camtri[better]
     nuse += 1
 
 log("horneado: %d/%d camaras proyectadas" % (nuse, len(views)))
@@ -549,24 +590,46 @@ if os.environ.get("TEX_SEAM", "1") == "1":
     except Exception as _se:
         log("(nivelado de exposicion fallo, sigo sin el: %s)" % _se)
 
+# ── 5c) MODO DE TEXTURA (v7.4) ─────────────────────────────────────────────
+# TEX_MODE=best (defecto): mejor camara por zona + exposicion nivelada (nitido;
+#   lo que hacen Polycam/RealityCapture). TEX_MODE=avg: MEZCLA ponderada de
+#   TODAS las camaras por texel — NO pega parches (cero costuras), a cambio de
+#   suavidad donde la geometria/poses no son perfectas.
+if os.environ.get("TEX_MODE", "best").lower() == "avg":
+    _mm = texsw > 1e-8
+    tex[_mm] = texs[_mm] / texsw[_mm][:, None]
+    log("modo PROMEDIO: mezcla de todas las camaras (sin parches; tono parejo)")
+
 # ── 6) rellenar huecos (dilatar color a texeles vacíos) ────────────────────
 tex2   = tex.reshape(NT, NT, 3)
 mask2  = (texw > -1.0).reshape(NT, NT)
 ao2    = texao.reshape(NT, NT)
+# v7.4: relleno POR ISLA — cada texel vacio hereda color SOLO de su misma isla
+# (o adopta la isla del primer vecino que llegue). Antes el color cruzaba entre
+# islas vecinas del atlas 2D y aparecian fragmentos fuera de lugar en 3D.
+if CHART_F is not None:
+    ch2 = np.full((NT, NT), -1, np.int32)
+    _pin = texw > -1.0
+    ch2.reshape(-1)[_pin] = CHART_F[textri[_pin]]
+else:
+    ch2 = np.zeros((NT, NT), np.int32)
 _it = 0
 for _it in range(HOLE_ITERS):
     empty = ~mask2
     if not empty.any(): break
-    mu=np.roll(mask2,1,0); md=np.roll(mask2,-1,0); ml=np.roll(mask2,1,1); mr=np.roll(mask2,-1,1)
-    cnt = mu.astype(np.float32)+md+ml+mr
-    su  = (np.roll(tex2,1,0)*mu[...,None] + np.roll(tex2,-1,0)*md[...,None]
-           + np.roll(tex2,1,1)*ml[...,None] + np.roll(tex2,-1,1)*mr[...,None])
-    sao = (np.roll(ao2,1,0)*mu + np.roll(ao2,-1,0)*md
-           + np.roll(ao2,1,1)*ml + np.roll(ao2,-1,1)*mr)
-    newm = empty & (cnt > 0)
-    denom = np.maximum(cnt, 1)[...,None]
-    tex2[newm] = (su/denom)[newm]
-    ao2[newm]  = (sao/np.maximum(cnt,1))[newm]
+    newm = np.zeros_like(mask2)
+    for _sh, _ax in ((1, 0), (-1, 0), (1, 1), (-1, 1)):
+        nm  = np.roll(mask2, _sh, _ax)
+        nch = np.roll(ch2,   _sh, _ax)
+        ntx = np.roll(tex2,  _sh, _ax)
+        nao = np.roll(ao2,   _sh, _ax)
+        toma = empty & (~newm) & nm
+        if CHART_F is not None:
+            toma &= (ch2 == -1) | (ch2 == nch)
+        if not toma.any(): continue
+        tex2[toma] = ntx[toma]; ao2[toma] = nao[toma]; ch2[toma] = nch[toma]
+        newm |= toma
+    if not newm.any(): break
     mask2 |= newm
 log("huecos rellenados en %d iteraciones (quedan %d vacios)" % (_it+1, int((~mask2).sum())))
 
@@ -1651,7 +1714,7 @@ def main():
         _bn_st = os.environ.get("PAINT_STORE", "linear")
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
-        log(f"═══ render-gs-worker 2DGS · v7.3-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}-{_bn_uv}"
+        log(f"═══ render-gs-worker 2DGS · v7.4-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-{_bn_au}-{_bn_uv}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
