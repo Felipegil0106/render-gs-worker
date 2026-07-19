@@ -406,11 +406,75 @@ def texcmd(max_tex, gseam):
     return c
 
 def obj_to_glb(objf, outglb):
-    """Convierte el OBJ texturizado de OpenMVS a un glb limpio (texturas dentro)."""
+    """Convierte el OBJ texturizado de OpenMVS a un glb limpio. Parseo yo mismo el
+    OBJ para: (a) parear cada textura con SUS caras, y (b) VOLTEAR la V (OBJ tiene
+    el origen de textura abajo; glTF arriba). Sin el volteo, cada cara muestrea el
+    parche espejado del atlas -> se ve como rompecabezas. Verificado con trimesh 4.0.5."""
     import trimesh
-    obj = trimesh.load(objf, process=False)
-    # trimesh puede devolver Trimesh o Scene (multi-material). Ambos exportan a glb.
-    obj.export(outglb)
+    from PIL import Image
+    objdir = os.path.dirname(objf)
+    objlines = open(objf).readlines()
+    # --- .mtl: material -> ruta de textura ---
+    mtl = {}; curm = None; mtlpath = None
+    for l in objlines:
+        if l.startswith("mtllib"):
+            mtlpath = os.path.join(objdir, l.split(None, 1)[1].strip())
+    if mtlpath and os.path.exists(mtlpath):
+        for l in open(mtlpath):
+            p = l.split()
+            if not p: continue
+            if p[0] == "newmtl": curm = p[1]; mtl[curm] = None
+            elif p[0] == "map_Kd" and curm is not None:
+                mtl[curm] = os.path.join(objdir, l.split(None, 1)[1].strip())
+    # --- .obj: posiciones, uvs, caras por material ---
+    V = []; VT = []; fbm = {}; cur = None
+    for l in objlines:
+        if l.startswith("v "):
+            q = l.split(); V.append((float(q[1]), float(q[2]), float(q[3])))
+        elif l.startswith("vt "):
+            q = l.split(); VT.append((float(q[1]), float(q[2]) if len(q) > 2 else 0.0))
+        elif l.startswith("usemtl"):
+            cur = l.split(None, 1)[1].strip(); fbm.setdefault(cur, [])
+        elif l.startswith("f "):
+            face = []
+            for t in l.split()[1:]:
+                a = (t.split("/") + ["", ""])[:2]
+                vi = int(a[0]) - 1
+                ti = int(a[1]) - 1 if a[1] else -1
+                face.append((vi, ti))
+            fbm.setdefault(cur, []).append(face)
+    V = np.array(V, dtype=np.float64)
+    VT = np.array(VT, dtype=np.float64) if VT else None
+    # --- un Trimesh por material, UV con la V volteada ---
+    scene = trimesh.Scene(); gi = 0; ntex = 0
+    for mat, faces in fbm.items():
+        if not faces: continue
+        vmap = {}; verts = []; uvs = []; tris = []
+        for face in faces:
+            idx = []
+            for (vi, ti) in face:
+                key = (vi, ti)
+                if key not in vmap:
+                    vmap[key] = len(verts); verts.append(V[vi])
+                    if VT is not None and 0 <= ti < len(VT):
+                        u, v = VT[ti]; uvs.append((u, 1.0 - v))   # VOLTEO V (OBJ->glTF)
+                    else:
+                        uvs.append((0.0, 0.0))
+                idx.append(vmap[key])
+            for k in range(1, len(idx) - 1):        # triangular en abanico
+                tris.append((idx[0], idx[k], idx[k + 1]))
+        if not tris: continue
+        mesh = trimesh.Trimesh(vertices=np.array(verts), faces=np.array(tris), process=False)
+        tp = mtl.get(mat)
+        if tp and os.path.exists(tp):
+            mesh.visual = trimesh.visual.TextureVisuals(
+                uv=np.array(uvs), image=Image.open(tp).convert("RGB"))
+            ntex += 1
+        scene.add_geometry(mesh, geom_name="m%d" % gi); gi += 1
+    log("glb: %d materiales, %d con textura (V volteada)" % (gi, ntex))
+    if gi == 0:
+        return False
+    scene.export(outglb)
     return os.path.exists(outglb) and os.path.getsize(outglb) > 200000
 
 # AUTO-SANADOR: intento bueno (4096); si se cae por RAM, uno mas liviano (2048).
