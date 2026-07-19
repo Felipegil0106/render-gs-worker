@@ -242,25 +242,28 @@ import numpy as np
 def log(s): print("   [omvs] " + s, flush=True)
 
 # Texturiza la malla con OpenMVS (metodo Polycam: mejor-vista por cara con
-# graph-cut + nivelado GLOBAL y LOCAL de costuras). Reemplaza al horneado propio
-# (mejor-vista + nivelacion casera) que dejaba mosaicos/costuras.
+# graph-cut + nivelado GLOBAL y LOCAL de costuras). Reemplaza al horneado propio.
 #
 #   python openmvs_texture.py  mesh.ply  ORIG12MP_DIR  SPARSE_DIR  out.glb  [ao.npy]
 #
-# ORIG12MP_DIR: fotos 12MP originales (nombres img_XXXX.jpg/.png).
-# SPARSE_DIR  : dataset/sparse/0 (cameras/images/points3D.txt a 1000px de MASt3R).
-# La malla y el sparse comparten el sistema de coordenadas COLMAP (misma corrida).
+# NOTA (v8.1): en el primer intento a 12MP + textura 8192, OpenMVS asignaba las
+# vistas OK y se caia sin RAM al generar la textura ("terminate called
+# recursively"). Aqui bajamos la resolucion de las fotos y el tam. de textura
+# para que quepa en memoria, y reintentamos con una config mas liviana si hace
+# falta. Sigue siendo MUCHO mas detalle que el pintor por vertice (1000px).
 MESH   = sys.argv[1]
 ORIGD  = sys.argv[2]
 SPARSE = sys.argv[3]
 OUTGLB = sys.argv[4]
 
-# Perillas (todas con valor por defecto seguro):
+# Perillas (defaults tuneados para NO reventar la RAM del pod):
 TEX_MESH_TRIS = int(os.environ.get("TEX_MESH_TRIS", "1100000"))  # caras del glb final
-MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "8192"))      # tam. de textura (parte en varias 8192 si hace falta)
-RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = fotos a maxima resolucion (NO subir: dispara el tiempo)
-OUTLIER       = os.environ.get("OMVS_OUTLIER", "0.06")           # descarta fotos inconsistentes (fragmentos fuera de lugar)
-SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "0.1")             # compacta parches (menos costuras)
+IMG_MAX       = int(os.environ.get("OMVS_IMG_MAX", "2000"))      # lado mayor de las fotos que ve OpenMVS (2000 = 2x el pintor)
+MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "4096"))      # tam. de textura (parte en varias si hace falta)
+RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso (ya bajadas)
+OUTLIER       = os.environ.get("OMVS_OUTLIER", "0.06")           # descarta fotos inconsistentes
+SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "0.1")             # compacta parches
+OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno (menos = menos RAM)
 
 t0 = time.time()
 WORK = os.path.dirname(os.path.abspath(OUTGLB))
@@ -289,15 +292,13 @@ cams = {}
 for line in open(os.path.join(SPARSE, "cameras.txt")):
     if line.startswith("#") or not line.strip(): continue
     e = line.split()
-    # ID PINHOLE W H fx fy cx cy
     cams[int(e[0])] = [int(e[2]), int(e[3]), float(e[4]), float(e[5]), float(e[6]), float(e[7])]
 
-# ── 2) armar el sparse a 12MP: recorto cada foto al MISMO aspecto de la pose
-#        (identico a mast3r_sfm) y escalo los intrinsecos (mismo FOV). Asi la
-#        proyeccion de OpenMVS cae exacta sobre las fotos de 12MP. ───────────
+# ── 2) sparse a las fotos: recorto al aspecto de la pose (identico a mast3r_sfm),
+#        BAJO a IMG_MAX px para no reventar la RAM, y escalo intrinsecos (mismo FOV) ─
 fcam = open(os.path.join(SPD, "cameras.txt"), "w"); fcam.write("# Camera list\n")
 fimg = open(os.path.join(SPD, "images.txt"), "w"); fimg.write("# Image list\n")
-n_ok = 0; n_miss = 0
+n_ok = 0; n_miss = 0; _res_ej = None
 raw = [l for l in open(os.path.join(SPARSE, "images.txt"))]
 i = 0
 while i < len(raw):
@@ -305,7 +306,7 @@ while i < len(raw):
     if l.startswith("#") or not l.strip():
         i += 1; continue
     e = l.split()
-    if len(e) < 10:                    # linea rara: salto ella + la de puntos 2D
+    if len(e) < 10:
         i += 2; continue
     cid = int(e[0]); name = e[9]
     path = find_photo(ORIGD, name)
@@ -320,29 +321,37 @@ while i < len(raw):
     else:                    cw = Wo; ch = int(round(Wo/asp))
     left = (Wo-cw)//2; top = (Ho-ch)//2
     im = im.crop((left, top, left+cw, top+ch))
-    s = cw / float(W1)                 # 1000px -> 12MP recortado
+    # bajar a IMG_MAX px de lado mayor (mismo FOV, solo menos pixeles -> menos RAM)
+    longe = max(cw, ch)
+    if longe > IMG_MAX:
+        r = IMG_MAX / float(longe)
+        rw = max(1, int(round(cw*r))); rh = max(1, int(round(ch*r)))
+        im = im.resize((rw, rh), Image.LANCZOS)
+    else:
+        rw, rh = cw, ch
+    s = rw / float(W1)                 # escala TOTAL 1000px-cam -> foto final (mismo FOV)
     fx, fy, cx, cy = fx1*s, fy1*s, cx1*s, cy1*s
     jpg = os.path.splitext(name)[0] + ".jpg"
-    im.save(os.path.join(IMGD, jpg), quality=95)
-    fcam.write("%d PINHOLE %d %d %.6f %.6f %.6f %.6f\n" % (cid, cw, ch, fx, fy, cx, cy))
-    # poses IDENTICAS (no dependen de la resolucion); solo cambia el nombre a .jpg
+    im.save(os.path.join(IMGD, jpg), quality=92)
+    if _res_ej is None: _res_ej = (rw, rh)
+    fcam.write("%d PINHOLE %d %d %.6f %.6f %.6f %.6f\n" % (cid, rw, rh, fx, fy, cx, cy))
     fimg.write("%d %s %s %s %s %s %s %s %d %s\n" %
                (cid, e[1], e[2], e[3], e[4], e[5], e[6], e[7], int(e[8]), jpg))
-    fimg.write("\n")                    # linea de puntos 2D (vacia, como MASt3R)
+    fimg.write("\n")
     n_ok += 1
     i += 2
 fcam.close(); fimg.close()
-# points3D.txt: copiar tal cual (coords en MUNDO, no dependen de la resolucion)
 try:
     shutil.copy(os.path.join(SPARSE, "points3D.txt"), os.path.join(SPD, "points3D.txt"))
 except Exception as _pe:
     open(os.path.join(SPD, "points3D.txt"), "w").write("# 3D point list\n")
-    log("(points3D.txt no copiado: %s; sigo con lista vacia)" % _pe)
-log("sparse 12MP listo: %d camaras usables (%d fotos no encontradas)" % (n_ok, n_miss))
+    log("(points3D.txt no copiado: %s)" % _pe)
+log("sparse listo: %d camaras a %s px (%d fotos no encontradas)"
+    % (n_ok, ("%dx%d" % _res_ej if _res_ej else "?"), n_miss))
 if n_ok == 0:
     log("ERROR: 0 camaras utilizables; no puedo texturizar"); sys.exit(3)
 
-# ── 3) decimar la malla al conteo del glb final (alta calidad, movil-friendly) ─
+# ── 3) decimar la malla al conteo del glb final ────────────────────────────
 import open3d as o3d
 m = o3d.io.read_triangle_mesh(MESH)
 nt0 = len(m.triangles)
@@ -351,11 +360,11 @@ if nt0 > TEX_MESH_TRIS:
     m.remove_unreferenced_vertices()
 m.remove_degenerate_triangles(); m.remove_duplicated_vertices()
 MFT = os.path.join(WORK, "mesh_for_tex.ply")
-m2 = o3d.geometry.TriangleMesh(m.vertices, m.triangles)   # sin color: OpenMVS hace su textura
+m2 = o3d.geometry.TriangleMesh(m.vertices, m.triangles)
 o3d.io.write_triangle_mesh(MFT, m2)
 log("malla para textura: %d -> %d caras" % (nt0, len(m2.triangles)))
 
-# ── 4) binarios de OpenMVS (vienen en la imagen v4.2) ──────────────────────
+# ── 4) binarios de OpenMVS ─────────────────────────────────────────────────
 def which(nm):
     p = shutil.which(nm)
     if p: return p
@@ -366,55 +375,65 @@ IFACE = which("InterfaceCOLMAP"); TEXM = which("TextureMesh")
 if not IFACE or not TEXM:
     log("ERROR: no encuentro InterfaceCOLMAP/TextureMesh en la imagen"); sys.exit(4)
 
-def run(cmd, tag):
+def run(cmd, tag, env=None):
     log("$ " + " ".join([os.path.basename(cmd[0])] + [str(a) for a in cmd[1:]]))
     t = time.time()
-    r = subprocess.run(cmd, cwd=MVS, capture_output=True, text=True)
+    r = subprocess.run(cmd, cwd=MVS, capture_output=True, text=True, env=env)
     for ln in ((r.stdout or "") + "\n" + (r.stderr or "")).strip().splitlines()[-8:]:
         log("  | " + ln[:170])
     log("%s en %.1f min (rc=%d)" % (tag, (time.time()-t)/60.0, r.returncode))
     return r.returncode
 
-# 4a) COLMAP -> .mvs (escena con camaras+imagenes; la malla va aparte con -m)
+# 4a) COLMAP -> .mvs
 SCENE = os.path.join(MVS, "scene.mvs")
 rc = run([IFACE, "-i", MVS, "-o", SCENE, "--image-folder", IMGD], "InterfaceCOLMAP")
 if rc != 0 or not os.path.exists(SCENE):
     log("ERROR: InterfaceCOLMAP no produjo scene.mvs"); sys.exit(5)
 
-# 4b) TextureMesh sobre la malla EXTERNA (-m). Costuras global+local ON por defecto.
+# 4b) TextureMesh — AUTO-SANADOR: intento bueno; si se cae, uno mas liviano.
 BASE = os.path.join(MVS, "textured")
-def texcmd(ext):
-    return [TEXM, "-i", SCENE, "-m", MFT, "-o", BASE + "." + ext,
-            "--export-type", ext,
-            "--resolution-level", str(RES_LEVEL),
-            "--max-texture-size", str(MAX_TEX),
-            "--outlier-threshold", str(OUTLIER),
-            "--cost-smoothness-ratio", str(SMOOTH_RATIO)]
+def texcmd(ext, max_tex, gseam):
+    c = [TEXM, "-i", SCENE, "-m", MFT, "-o", BASE + "." + ext,
+         "--export-type", ext,
+         "--resolution-level", str(RES_LEVEL),
+         "--max-texture-size", str(max_tex),
+         "--outlier-threshold", str(OUTLIER),
+         "--cost-smoothness-ratio", str(SMOOTH_RATIO)]
+    if gseam == 0:
+        c += ["--global-seam-leveling", "0"]   # apaga solo el nivelado GLOBAL (deja el local)
+    return c
 
+# (max_tex, global_seam, omp) — de mejor calidad a mas seguro en RAM
+CONFIGS = [(MAX_TEX, 1, OMP_HI), (2048, 0, "2")]
 final = None
-rc = run(texcmd("glb"), "TextureMesh(glb)")
-if rc == 0 and os.path.exists(BASE + ".glb") and os.path.getsize(BASE + ".glb") > 200000:
-    final = BASE + ".glb"
-else:
-    log("glb directo no salio; intento OBJ + conversion con trimesh")
+for ci, (mt, gs, omp) in enumerate(CONFIGS):
     for f in glob.glob(BASE + ".*"):
         try: os.remove(f)
         except Exception: pass
-    rc = run(texcmd("obj"), "TextureMesh(obj)")
-    if rc == 0 and os.path.exists(BASE + ".obj"):
-        try:
-            import trimesh
-            g = trimesh.load(BASE + ".obj", process=False)
-            g.export(OUTGLB)
-            if os.path.exists(OUTGLB) and os.path.getsize(OUTGLB) > 200000:
-                final = OUTGLB
-        except Exception as ce:
-            log("conversion OBJ->glb fallo: %s" % ce)
+    envt = dict(os.environ); envt["OMP_NUM_THREADS"] = str(omp)
+    tag = "TextureMesh cfg%d (tex=%d gseam=%d omp=%s)" % (ci+1, mt, gs, omp)
+    rc = run(texcmd("glb", mt, gs), tag, env=envt)
+    gp = BASE + ".glb"
+    if rc == 0 and os.path.exists(gp) and os.path.getsize(gp) > 200000:
+        final = gp; break
+    if rc == 0:            # corrio limpio pero sin glb -> pruebo OBJ (bug de export)
+        rc2 = run(texcmd("obj", mt, gs), tag + " obj", env=envt)
+        op = BASE + ".obj"
+        if rc2 == 0 and os.path.exists(op):
+            try:
+                import trimesh
+                trimesh.load(op, process=False).export(OUTGLB)
+                if os.path.exists(OUTGLB) and os.path.getsize(OUTGLB) > 200000:
+                    final = OUTGLB; break
+            except Exception as ce:
+                log("conversion OBJ->glb fallo: %s" % ce)
+    log("config %d no sirvio (rc=%d); %s"
+        % (ci+1, rc, "reintento mas liviano" if ci+1 < len(CONFIGS) else "sin mas intentos"))
 
 if final is None:
-    log("ERROR: OpenMVS no produjo una textura utilizable"); sys.exit(6)
+    log("ERROR: OpenMVS no produjo una textura utilizable (todas las configs)"); sys.exit(6)
 
-# ── 5) glb final en OUTGLB (re-export para normalizar) ─────────────────────
+# ── 5) glb final en OUTGLB ─────────────────────────────────────────────────
 if final != OUTGLB:
     try:
         import trimesh
