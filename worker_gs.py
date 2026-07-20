@@ -405,77 +405,82 @@ def texcmd(max_tex, gseam):
          "--global-seam-leveling", str(gseam)]
     return c
 
+def _patch_unlit_matte(glbpath):
+    """Parcha TODOS los materiales del glb a MATE + UNLIT: metallicFactor=0,
+    roughnessFactor=1 y KHR_materials_unlit. Sin esto, glTF asume metal=1.0 y el
+    visor pinta el cuarto como metal negro facetado -> aspecto de 'vidrio roto'."""
+    import json as _json, struct as _st
+    try:
+        _d = bytearray(open(glbpath, "rb").read())
+        _jlen = _st.unpack("<I", _d[12:16])[0]
+        _g = _json.loads(_d[20:20 + _jlen].decode("utf-8"))
+        _g.setdefault("extensionsUsed", [])
+        if "KHR_materials_unlit" not in _g["extensionsUsed"]:
+            _g["extensionsUsed"].append("KHR_materials_unlit")
+        if not _g.get("materials"):
+            _g["materials"] = [{}]
+        for _m in _g["materials"]:
+            _pbr = _m.setdefault("pbrMetallicRoughness", {})
+            _pbr["metallicFactor"] = 0.0
+            _pbr["roughnessFactor"] = 1.0
+            _m.setdefault("extensions", {})["KHR_materials_unlit"] = {}
+        _bin = _d[20 + _jlen:]
+        _nj = _json.dumps(_g, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        while len(_nj) % 4:
+            _nj += b" "
+        _out = bytearray(); _out += _d[:12]
+        _out += _st.pack("<I", len(_nj)) + b"JSON" + _nj + _bin
+        _out[8:12] = _st.pack("<I", len(_out))
+        open(glbpath, "wb").write(bytes(_out))
+        log("material -> MATE + UNLIT (%d materiales; quita el metal/vidrio roto)" % len(_g["materials"]))
+        return True
+    except Exception as e:
+        log("(no pude parchar material a unlit: %s)" % e); return False
+
+
 def obj_to_glb(objf, outglb):
-    """Convierte el OBJ texturizado de OpenMVS a un glb limpio. Parseo yo mismo el
-    OBJ para: (a) parear cada textura con SUS caras, y (b) VOLTEAR la V (OBJ tiene
-    el origen de textura abajo; glTF arriba). Sin el volteo, cada cara muestrea el
-    parche espejado del atlas -> se ve como rompecabezas. Verificado con trimesh 4.0.5."""
+    """OBJ texturizado de OpenMVS -> glb. (a) Recolorea el NARANJA de relleno de
+    OpenMVS (255,127,39; caras que ninguna foto vio) a gris DIRECTO en los archivos
+    de textura, antes de cargar. (b) Carga la Scene (varios materiales) y exporta
+    SIN concatenar (concatenar revienta la RAM de trimesh; trimesh.load ya orienta
+    bien las UV, verificado byte a byte en el archivo real). (c) Material MATE+UNLIT
+    para quitar el aspecto de metal/'vidrio roto'."""
     import trimesh
+    import numpy as _np
     from PIL import Image
     objdir = os.path.dirname(objf)
-    objlines = open(objf).readlines()
-    # --- .mtl: material -> ruta de textura ---
-    mtl = {}; curm = None; mtlpath = None
-    for l in objlines:
+    # (a) recolorear el naranja en los ARCHIVOS de textura (via el .mtl)
+    mtlpath = None
+    for l in open(objf):
         if l.startswith("mtllib"):
-            mtlpath = os.path.join(objdir, l.split(None, 1)[1].strip())
+            mtlpath = os.path.join(objdir, l.split(None, 1)[1].strip()); break
+    texfiles = []
     if mtlpath and os.path.exists(mtlpath):
         for l in open(mtlpath):
             p = l.split()
-            if not p: continue
-            if p[0] == "newmtl": curm = p[1]; mtl[curm] = None
-            elif p[0] == "map_Kd" and curm is not None:
-                mtl[curm] = os.path.join(objdir, l.split(None, 1)[1].strip())
-    # --- .obj: posiciones, uvs, caras por material ---
-    V = []; VT = []; fbm = {}; cur = None
-    for l in objlines:
-        if l.startswith("v "):
-            q = l.split(); V.append((float(q[1]), float(q[2]), float(q[3])))
-        elif l.startswith("vt "):
-            q = l.split(); VT.append((float(q[1]), float(q[2]) if len(q) > 2 else 0.0))
-        elif l.startswith("usemtl"):
-            cur = l.split(None, 1)[1].strip(); fbm.setdefault(cur, [])
-        elif l.startswith("f "):
-            face = []
-            for t in l.split()[1:]:
-                a = (t.split("/") + ["", ""])[:2]
-                vi = int(a[0]) - 1
-                ti = int(a[1]) - 1 if a[1] else -1
-                face.append((vi, ti))
-            fbm.setdefault(cur, []).append(face)
-    V = np.array(V, dtype=np.float64)
-    VT = np.array(VT, dtype=np.float64) if VT else None
-    # --- un Trimesh por material, UV con la V volteada ---
-    scene = trimesh.Scene(); gi = 0; ntex = 0
-    for mat, faces in fbm.items():
-        if not faces: continue
-        vmap = {}; verts = []; uvs = []; tris = []
-        for face in faces:
-            idx = []
-            for (vi, ti) in face:
-                key = (vi, ti)
-                if key not in vmap:
-                    vmap[key] = len(verts); verts.append(V[vi])
-                    if VT is not None and 0 <= ti < len(VT):
-                        u, v = VT[ti]; uvs.append((u, 1.0 - v))   # VOLTEO V (OBJ->glTF)
-                    else:
-                        uvs.append((0.0, 0.0))
-                idx.append(vmap[key])
-            for k in range(1, len(idx) - 1):        # triangular en abanico
-                tris.append((idx[0], idx[k], idx[k + 1]))
-        if not tris: continue
-        mesh = trimesh.Trimesh(vertices=np.array(verts), faces=np.array(tris), process=False)
-        tp = mtl.get(mat)
-        if tp and os.path.exists(tp):
-            mesh.visual = trimesh.visual.TextureVisuals(
-                uv=np.array(uvs), image=Image.open(tp).convert("RGB"))
-            ntex += 1
-        scene.add_geometry(mesh, geom_name="m%d" % gi); gi += 1
-    log("glb: %d materiales, %d con textura (V volteada)" % (gi, ntex))
-    if gi == 0:
-        return False
-    scene.export(outglb)
+            if p and p[0] == "map_Kd":
+                tf = os.path.join(objdir, l.split(None, 1)[1].strip())
+                if os.path.exists(tf): texfiles.append(tf)
+    _norange = 0
+    for tf in texfiles:
+        try:
+            a = _np.asarray(Image.open(tf).convert("RGB")).copy()
+            fill = (a[:, :, 0] > 235) & (a[:, :, 1] > 105) & (a[:, :, 1] < 150) & (a[:, :, 2] < 70)
+            if fill.any():
+                a[fill] = (128, 128, 128); _norange += int(fill.sum())
+                Image.fromarray(a).save(tf)
+        except Exception as _te:
+            log("(no pude recolorear %s: %s)" % (os.path.basename(tf), _te))
+    if _norange:
+        log("relleno naranja de OpenMVS -> gris: %d pixeles en %d texturas" % (_norange, len(texfiles)))
+    log("glb: %d texturas" % len(texfiles))
+    # (b) cargar la Scene (texturas ya corregidas) y exportar SIN concatenar
+    obj = trimesh.load(objf, process=False)
+    obj.export(outglb)
+    # (c) material MATE + UNLIT
+    _patch_unlit_matte(outglb)
     return os.path.exists(outglb) and os.path.getsize(outglb) > 200000
+
 
 # AUTO-SANADOR: intento bueno (4096); si se cae por RAM, uno mas liviano (2048).
 CONFIGS = [(MAX_TEX, GLOBAL_SEAM, OMP_HI), (2048, GLOBAL_SEAM, "2")]
