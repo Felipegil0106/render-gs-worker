@@ -250,10 +250,21 @@ def log(s): print("   [omvs] " + s, flush=True)
 #  v8.0: sparse+poses+coords OK, pero glb 12MP+8192 reventaba la RAM.
 #  v8.1: baje fotos/textura -> OpenMVS texturizo OK (23 tex 2048, 11.6 GB),
 #        PERO el glb PROPIO de OpenMVS sale mal formado -> se veia BLANCO.
-#  v8.2 (esta): pido OBJ (que OpenMVS escribe perfecto) y lo convierto a glb
+#  v8.2: pido OBJ (que OpenMVS escribe perfecto) y lo convierto a glb
 #        limpio con trimesh (texturas bien incrustadas). Ademas: el "nivelado
 #        GLOBAL de costuras" de OpenMVS tiene un bug (_Map_base::at) que
 #        crashea con esta malla -> lo dejo APAGADO por defecto (queda el local).
+#  v8.5 (esta, tras investigacion a fondo del codigo fuente de OpenMVS):
+#        el "vitral" = ~54k micro-parches con banda NEGRA interna. Confirmado:
+#        (a) cost-smoothness-ratio va AL REVES (hacia 0 = parches grandes) y
+#        casi no influye; (b) las bandas negras las escriben el nivelado LOCAL
+#        de costuras (Poisson sin base global) y el sharpen (default 0.5);
+#        (c) el crash _Map_base::at del nivelado GLOBAL viene de malla
+#        NO-manifold (el mantenedor lo confirmo). ARREGLOS v8.5: reparar la
+#        malla a manifold + --virtual-face-images 3 (agrupa triangulos
+#        coplanares en parches GRANDES: el arreglo real) + nivelado local y
+#        sharpen APAGADOS. Respaldo cfg2 con SOLO banderas viejas probadas,
+#        por si el binario del pod no conoce las nuevas.
 MESH   = sys.argv[1]
 ORIGD  = sys.argv[2]
 SPARSE = sys.argv[3]
@@ -265,8 +276,11 @@ IMG_MAX       = int(os.environ.get("OMVS_IMG_MAX", "2000"))      # lado mayor de
 MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "4096"))      # tam. de textura (agrupa mejor -> menos archivos)
 RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso
 OUTLIER       = os.environ.get("OMVS_OUTLIER", "0.06")           # descarta fotos inconsistentes
-SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "1.5")             # ALTO = islas GRANDES (menos fragmentacion; mata el vitral)
-GLOBAL_SEAM   = os.environ.get("OMVS_GLOBAL_SEAM", "0")          # 0 = apagado (su version global tiene un bug)
+SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "0.02")            # hacia 0 = parches GRANDES (investigacion: la escala va AL REVES; 1=mas fragmentado)
+GLOBAL_SEAM   = os.environ.get("OMVS_GLOBAL_SEAM", "0")          # 0 = apagado (su crash _Map_base::at viene de mallas no-manifold; ya reparamos la malla, pero este render va apagado)
+LOCAL_SEAM    = os.environ.get("OMVS_LOCAL_SEAM", "0")           # 0 = apagado: escribia las BANDAS NEGRAS del borde de cada isla (Poisson sin base global)
+SHARP         = os.environ.get("OMVS_SHARP", "0")                # 0 = apagado: el enfoque (default 0.5) crea halos oscuros en bordes de parches
+VFACES        = os.environ.get("OMVS_VFACES", "3")               # caras virtuales coplanares: agrupa triangulos del mismo plano en parches GRANDES (el arreglo real de la fragmentacion)
 OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno
 
 t0 = time.time()
@@ -353,7 +367,10 @@ log("sparse listo: %d camaras a %s px (%d fotos no encontradas)"
 if n_ok == 0:
     log("ERROR: 0 camaras utilizables; no puedo texturizar"); sys.exit(3)
 
-# ── 3) decimar la malla al conteo del glb final ────────────────────────────
+# ── 3) decimar la malla + REPARARLA A MANIFOLD ─────────────────────────────
+#   (Stage 0 de la investigacion: el crash del nivelado global y parte del dano
+#   en los parches vienen de aristas/vertices NO-manifold, tipicos de una malla
+#   TSDF decimada. Se limpian ANTES de texturizar.)
 import open3d as o3d
 m = o3d.io.read_triangle_mesh(MESH)
 nt0 = len(m.triangles)
@@ -361,6 +378,39 @@ if nt0 > TEX_MESH_TRIS:
     m = m.simplify_quadric_decimation(target_number_of_triangles=TEX_MESH_TRIS)
     m.remove_unreferenced_vertices()
 m.remove_degenerate_triangles(); m.remove_duplicated_vertices()
+m.remove_duplicated_triangles()
+_qe = _qv = 0
+for _rep in range(4):
+    try:
+        _e = np.asarray(m.get_non_manifold_edges())
+    except Exception:
+        _e = np.zeros((0, 2))
+    try:
+        _v = np.asarray(m.get_non_manifold_vertices())
+    except Exception:
+        _v = np.zeros(0)
+    if len(_e) == 0 and len(_v) == 0:
+        break
+    if len(_e):
+        try:
+            m.remove_non_manifold_edges(); _qe += len(_e)
+        except Exception:
+            pass
+    try:
+        _v = np.asarray(m.get_non_manifold_vertices())
+        if len(_v):
+            m.remove_vertices_by_index([int(i) for i in _v]); _qv += len(_v)
+    except Exception:
+        pass
+    m.remove_degenerate_triangles(); m.remove_duplicated_vertices()
+    m.remove_duplicated_triangles(); m.remove_unreferenced_vertices()
+try:
+    _re = len(np.asarray(m.get_non_manifold_edges()))
+    _rv = len(np.asarray(m.get_non_manifold_vertices()))
+except Exception:
+    _re = _rv = -1
+log("malla reparada a MANIFOLD: quite %d aristas + %d vertices no-manifold (quedan %d aristas / %d vertices)"
+    % (_qe, _qv, _re, _rv))
 MFT = os.path.join(WORK, "mesh_for_tex.ply")
 m2 = o3d.geometry.TriangleMesh(m.vertices, m.triangles)
 o3d.io.write_triangle_mesh(MFT, m2)
@@ -395,15 +445,14 @@ if rc != 0 or not os.path.exists(SCENE):
 # 4b) TextureMesh -> OBJ (el glb propio de OpenMVS sale roto). OBJ = malla+mtl+
 #     imagenes, que trimesh convierte a un glb limpio con texturas incrustadas.
 BASE = os.path.join(MVS, "textured")
-def texcmd(max_tex, gseam):
+def texcmd(max_tex, extra):
     c = [TEXM, "-i", SCENE, "-m", MFT, "-o", BASE + ".obj",
          "--export-type", "obj",
          "--resolution-level", str(RES_LEVEL),
          "--max-texture-size", str(max_tex),
          "--outlier-threshold", str(OUTLIER),
-         "--cost-smoothness-ratio", str(SMOOTH_RATIO),
-         "--global-seam-leveling", str(gseam)]
-    return c
+         "--cost-smoothness-ratio", str(SMOOTH_RATIO)]
+    return c + list(extra)
 
 def _patch_unlit_matte(glbpath):
     """Parcha TODOS los materiales del glb a MATE + UNLIT: metallicFactor=0,
@@ -482,16 +531,26 @@ def obj_to_glb(objf, outglb):
     return os.path.exists(outglb) and os.path.getsize(outglb) > 200000
 
 
-# AUTO-SANADOR: intento bueno (4096); si se cae por RAM, uno mas liviano (2048).
-CONFIGS = [(MAX_TEX, GLOBAL_SEAM, OMP_HI), (2048, GLOBAL_SEAM, "2")]
+# AUTO-SANADOR (2 configs):
+#  cfg1 = la de la INVESTIGACION: caras virtuales coplanares (mata la
+#         fragmentacion usando las paredes/piso ya aplanados) + nivelado local
+#         y sharpen APAGADOS (los que escribian las bandas negras).
+#  cfg2 = respaldo con SOLO banderas viejas ya probadas en produccion, por si
+#         el binario del pod fuera anterior y abortara con "unrecognised option".
+CFG1 = ["--virtual-face-images", str(VFACES),
+        "--local-seam-leveling", str(LOCAL_SEAM),
+        "--sharpness-weight", str(SHARP),
+        "--global-seam-leveling", str(GLOBAL_SEAM)]
+CFG2 = ["--global-seam-leveling", "0"]
+CONFIGS = [(MAX_TEX, CFG1, OMP_HI), (2048, CFG2, "2")]
 final = None
-for ci, (mt, gs, omp) in enumerate(CONFIGS):
+for ci, (mt, extra, omp) in enumerate(CONFIGS):
     for f in glob.glob(BASE + ".*"):
         try: os.remove(f)
         except Exception: pass
     envt = dict(os.environ); envt["OMP_NUM_THREADS"] = str(omp)
-    tag = "TextureMesh cfg%d (tex=%d gseam=%s omp=%s)" % (ci+1, mt, gs, omp)
-    rc = run(texcmd(mt, gs), tag, env=envt)
+    tag = "TextureMesh cfg%d (tex=%s %s omp=%s)" % (ci+1, mt, " ".join(extra), omp)
+    rc = run(texcmd(mt, extra), tag, env=envt)
     objf = BASE + ".obj"
     if rc == 0 and os.path.exists(objf):
         try:
