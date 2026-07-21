@@ -271,6 +271,16 @@ def log(s): print("   [omvs] " + s, flush=True)
 #        (la config de diseno del algoritmo) para emparejar el tono. Respaldo
 #        cfg2 = la config exacta de v8.5 que acaba de funcionar: si el global
 #        crashara, se cae a lo de hoy, nunca peor.
+#  v8.7 (esta): el nivelado global crasheo (rc=-6) INCLUSO con la malla ya
+#        manifold -> investigacion 2: el crash es un mapa de parches sin fila
+#        en GlobalSeamLeveling (probable choque con las caras virtuales, que
+#        NO podemos quitar porque matan el vitral). Solucion: NIVELAR LA
+#        EXPOSICION NOSOTROS (Plan B1) = resolver una ganancia por canal por
+#        foto (minimos cuadrados en log, espacio LINEAL, mediana por par,
+#        ancla sum(log g)=0, tope +-1 stop) usando puntos de la malla vistos
+#        en varias fotos, y corregir las fotos ANTES de texturizar. Es lo que
+#        hacen AliceVision ("correct exposure in linear") y Metashape
+#        ("Calibrate colors"). Niveladores de OpenMVS: apagados otra vez.
 MESH   = sys.argv[1]
 ORIGD  = sys.argv[2]
 SPARSE = sys.argv[3]
@@ -283,10 +293,12 @@ MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "4096"))      # tam. de textu
 RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso
 OUTLIER       = os.environ.get("OMVS_OUTLIER", "0.06")           # descarta fotos inconsistentes
 SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "0.02")            # hacia 0 = parches GRANDES (investigacion: la escala va AL REVES; 1=mas fragmentado)
-GLOBAL_SEAM   = os.environ.get("OMVS_GLOBAL_SEAM", "1")          # 1 = ON: empareja el TONO entre parches (los "escalones"). Seguro ahora: la malla ya va reparada a manifold (su crash venia de eso)
-LOCAL_SEAM    = os.environ.get("OMVS_LOCAL_SEAM", "1")           # 1 = ON: difumina el borde de cada costura. Con la base GLOBAL activa ya no escribe bandas negras
+GLOBAL_SEAM   = os.environ.get("OMVS_GLOBAL_SEAM", "0")          # 0 = apagado: crashea (rc=-6) INCLUSO con malla manifold (probable choque con las caras virtuales). La nivelacion la hacemos nosotros (EXPO abajo)
+LOCAL_SEAM    = os.environ.get("OMVS_LOCAL_SEAM", "0")           # 0 = apagado: sin base global escribe bandas negras (comprobado byte a byte)
 SHARP         = os.environ.get("OMVS_SHARP", "0")                # 0 = apagado: el enfoque (default 0.5) crea halos oscuros en bordes de parches
 VFACES        = os.environ.get("OMVS_VFACES", "3")               # caras virtuales coplanares: agrupa triangulos del mismo plano en parches GRANDES (el arreglo real de la fragmentacion)
+EXPOCOMP      = os.environ.get("OMVS_EXPOCOMP", "1") == "1"     # nivelacion de exposicion PROPIA entre las 127 fotos (Plan B1: lo que hacen AliceVision/Metashape)
+EXPO_SAMPLES  = int(os.environ.get("OMVS_EXPO_SAMPLES", "40000"))# puntos de la malla muestreados para medir las ganancias
 OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno
 
 t0 = time.time()
@@ -421,6 +433,124 @@ MFT = os.path.join(WORK, "mesh_for_tex.ply")
 m2 = o3d.geometry.TriangleMesh(m.vertices, m.triangles)
 o3d.io.write_triangle_mesh(MFT, m2)
 log("malla para textura: %d -> %d caras" % (nt0, len(m2.triangles)))
+
+# ── 3b) NIVELACION DE EXPOSICION entre las fotos (Plan B1 de la investigacion) ──
+#   El nivelador de OpenMVS crashea (rc=-6), asi que nivelamos NOSOTROS antes de
+#   texturizar: puntos de la malla visibles en varias fotos -> una GANANCIA por
+#   canal por foto (minimos cuadrados en log, espacio LINEAL, mediana por par =
+#   robusto, ancla sum(log g)=0, tope +-1 stop) -> fotos corregidas en disco.
+#   Si algo falla, se sigue con las fotos originales: el render nunca se pierde.
+if EXPOCOMP:
+  try:
+    _te = time.time()
+    def _s2l(c):
+        return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    def _l2s(c):
+        c = np.clip(c, 0.0, 1.0)
+        return np.where(c <= 0.0031308, c * 12.92, 1.055 * (c ** (1.0 / 2.4)) - 0.055)
+    def _q2R(qw, qx, qy, qz):
+        n = (qw*qw + qx*qx + qy*qy + qz*qz) ** 0.5
+        qw, qx, qy, qz = qw/n, qx/n, qy/n, qz/n
+        return np.array([
+            [1-2*(qy*qy+qz*qz), 2*(qx*qy-qw*qz),   2*(qx*qz+qw*qy)],
+            [2*(qx*qy+qw*qz),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx)],
+            [2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx),   1-2*(qx*qx+qy*qy)]])
+    _ec = {}
+    for _l in open(os.path.join(SPD, "cameras.txt")):
+        if _l.startswith("#") or not _l.strip(): continue
+        _p = _l.split()
+        _ec[int(_p[0])] = (int(_p[2]), int(_p[3]), float(_p[4]), float(_p[5]), float(_p[6]), float(_p[7]))
+    _ev = []
+    for _l in open(os.path.join(SPD, "images.txt")):
+        if _l.startswith("#") or not _l.strip(): continue
+        _p = _l.split()
+        if len(_p) >= 10 and _p[9].endswith(".jpg"):
+            _ev.append((int(_p[0]), _p[9],
+                        _q2R(float(_p[1]), float(_p[2]), float(_p[3]), float(_p[4])),
+                        np.array([float(_p[5]), float(_p[6]), float(_p[7])])))
+    _scn = o3d.t.geometry.RaycastingScene()
+    _scn.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(m2))
+    m.compute_vertex_normals()
+    _P = np.asarray(m2.vertices); _NRM = np.asarray(m.vertex_normals)
+    np.random.seed(42)
+    _S = min(EXPO_SAMPLES, len(_P))
+    _sel = np.random.choice(len(_P), _S, replace=False)
+    _Ps = _P[_sel]; _Ns = _NRM[_sel]
+    _NC = len(_ev)
+    _O = np.full((_NC, _S, 3), np.nan, np.float32)
+    for _k, (_cid, _nm, _R, _t) in enumerate(_ev):
+        if _cid not in _ec: continue
+        _W, _H, _fx, _fy, _cx, _cy = _ec[_cid]
+        _pth = os.path.join(IMGD, _nm)
+        if not os.path.exists(_pth): continue
+        _Xc = (_R @ _Ps.T).T + _t
+        _z = _Xc[:, 2]
+        _u = _fx * _Xc[:, 0] / np.maximum(_z, 1e-9) + _cx
+        _v = _fy * _Xc[:, 1] / np.maximum(_z, 1e-9) + _cy
+        _in = (_z > 0.05) & (_u >= 2) & (_u <= _W - 3) & (_v >= 2) & (_v <= _H - 3)
+        _C = -_R.T @ _t
+        _dir = _Ps - _C[None, :]
+        _dst = np.linalg.norm(_dir, axis=1)
+        _dirn = _dir / np.maximum(_dst[:, None], 1e-9)
+        _in &= np.abs((_Ns * (-_dirn)).sum(1)) > 0.25    # sin angulos rasantes
+        _idx = np.where(_in)[0]
+        if len(_idx) < 50: continue
+        _rays = np.concatenate([np.repeat(_C[None, :], len(_idx), 0), _dirn[_idx]], 1).astype(np.float32)
+        _th = _scn.cast_rays(o3d.core.Tensor(_rays))["t_hit"].numpy()
+        _eps = np.maximum(0.02, 0.01 * _dst[_idx])
+        _keep = np.isfinite(_th) & (_th >= _dst[_idx] - _eps)   # sin oclusion
+        _vis = _idx[_keep]
+        if len(_vis) < 50: continue
+        _im = np.asarray(Image.open(_pth).convert("RGB"))
+        _xi = np.clip(np.round(_u[_vis]).astype(int), 0, _W - 1)
+        _yi = np.clip(np.round(_v[_vis]).astype(int), 0, _H - 1)
+        _px = _im[_yi, _xi].astype(np.float32)
+        _ok = ((_px > 6) & (_px < 250)).all(1)           # sin pixeles recortados
+        _vis = _vis[_ok]; _px = _px[_ok]
+        if len(_vis) < 50: continue
+        _O[_k, _vis] = _s2l(_px / 255.0)
+    _V = np.isfinite(_O[:, :, 0])
+    _rows = []; _rhs = [[], [], []]; _w = []
+    for _i in range(_NC):
+        for _j in range(_i + 1, _NC):
+            _mij = _V[_i] & _V[_j]
+            _n = int(_mij.sum())
+            if _n < 20: continue
+            _li = np.log(np.maximum(_O[_i, _mij], 1e-4))
+            _lj = np.log(np.maximum(_O[_j, _mij], 1e-4))
+            _d = np.median(_lj - _li, axis=0)            # a_i - a_j = log(Ij/Ii)
+            _rows.append((_i, _j)); _w.append(min(_n, 500) ** 0.5)
+            for _c in range(3): _rhs[_c].append(float(_d[_c]))
+    if len(_rows) < _NC:
+        log("EXPO: solo %d pares de fotos con puntos comunes; NO nivelo (sigo con las fotos originales)" % len(_rows))
+    else:
+        _A = np.zeros((len(_rows) + 1, _NC))
+        for _r, (_i, _j) in enumerate(_rows):
+            _A[_r, _i] = _w[_r]; _A[_r, _j] = -_w[_r]
+        _A[-1, :] = (10.0 * max(_w)) / _NC               # ancla: sum(log g) = 0
+        _G = np.ones((_NC, 3))
+        for _c in range(3):
+            _b = np.array([_rhs[_c][_r] * _w[_r] for _r in range(len(_rows))] + [0.0])
+            _a = np.linalg.lstsq(_A, _b, rcond=None)[0]
+            _G[:, _c] = np.exp(_a)
+        _G[_V.sum(1) < 50] = 1.0                         # camaras sin datos: no tocar
+        _nclamp = int(((_G < 0.5) | (_G > 2.0)).sum())
+        _G = np.clip(_G, 0.5, 2.0)                       # tope +-1 stop
+        for _k, (_cid, _nm, _R, _t) in enumerate(_ev):
+            _pth = os.path.join(IMGD, _nm)
+            if not os.path.exists(_pth): continue
+            _im = np.asarray(Image.open(_pth).convert("RGB"), np.float32) / 255.0
+            _out = (_l2s(_s2l(_im) * _G[_k][None, None, :]) * 255.0 + 0.5).astype(np.uint8)
+            Image.fromarray(_out).save(_pth, quality=92)
+        log("EXPO: exposicion nivelada en %d fotos (%d pares, %d muestras) en %.1f min"
+            % (_NC, len(_rows), _S, (time.time() - _te) / 60.0))
+        log("EXPO: ganancias medianas R %.3f G %.3f B %.3f | rango %.2f-%.2f | %d en tope (muchos en tope = correspondencias ruidosas)"
+            % (float(np.median(_G[:, 0])), float(np.median(_G[:, 1])), float(np.median(_G[:, 2])),
+               float(_G.min()), float(_G.max()), _nclamp))
+  except Exception as _ee:
+    log("EXPO: nivelacion fallo (%s); sigo con las fotos originales" % _ee)
+else:
+    log("EXPO: nivelacion de exposicion APAGADA (OMVS_EXPOCOMP=0)")
 
 # ── 4) binarios de OpenMVS ─────────────────────────────────────────────────
 def which(nm):
