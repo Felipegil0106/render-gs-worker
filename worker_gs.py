@@ -265,6 +265,12 @@ def log(s): print("   [omvs] " + s, flush=True)
 #        coplanares en parches GRANDES: el arreglo real) + nivelado local y
 #        sharpen APAGADOS. Respaldo cfg2 con SOLO banderas viejas probadas,
 #        por si el binario del pod no conoce las nuevas.
+#  v8.6 (esta): el vitral MURIO con v8.5 (confirmado por Felipe); quedaron
+#        escalones de tono entre parches (esperado: niveladores apagados).
+#        Ahora que la malla va manifold, se REACTIVAN nivelado GLOBAL+LOCAL
+#        (la config de diseno del algoritmo) para emparejar el tono. Respaldo
+#        cfg2 = la config exacta de v8.5 que acaba de funcionar: si el global
+#        crashara, se cae a lo de hoy, nunca peor.
 MESH   = sys.argv[1]
 ORIGD  = sys.argv[2]
 SPARSE = sys.argv[3]
@@ -277,8 +283,8 @@ MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "4096"))      # tam. de textu
 RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso
 OUTLIER       = os.environ.get("OMVS_OUTLIER", "0.06")           # descarta fotos inconsistentes
 SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "0.02")            # hacia 0 = parches GRANDES (investigacion: la escala va AL REVES; 1=mas fragmentado)
-GLOBAL_SEAM   = os.environ.get("OMVS_GLOBAL_SEAM", "0")          # 0 = apagado (su crash _Map_base::at viene de mallas no-manifold; ya reparamos la malla, pero este render va apagado)
-LOCAL_SEAM    = os.environ.get("OMVS_LOCAL_SEAM", "0")           # 0 = apagado: escribia las BANDAS NEGRAS del borde de cada isla (Poisson sin base global)
+GLOBAL_SEAM   = os.environ.get("OMVS_GLOBAL_SEAM", "1")          # 1 = ON: empareja el TONO entre parches (los "escalones"). Seguro ahora: la malla ya va reparada a manifold (su crash venia de eso)
+LOCAL_SEAM    = os.environ.get("OMVS_LOCAL_SEAM", "1")           # 1 = ON: difumina el borde de cada costura. Con la base GLOBAL activa ya no escribe bandas negras
 SHARP         = os.environ.get("OMVS_SHARP", "0")                # 0 = apagado: el enfoque (default 0.5) crea halos oscuros en bordes de parches
 VFACES        = os.environ.get("OMVS_VFACES", "3")               # caras virtuales coplanares: agrupa triangulos del mismo plano en parches GRANDES (el arreglo real de la fragmentacion)
 OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno
@@ -535,14 +541,17 @@ def obj_to_glb(objf, outglb):
 #  cfg1 = la de la INVESTIGACION: caras virtuales coplanares (mata la
 #         fragmentacion usando las paredes/piso ya aplanados) + nivelado local
 #         y sharpen APAGADOS (los que escribian las bandas negras).
-#  cfg2 = respaldo con SOLO banderas viejas ya probadas en produccion, por si
-#         el binario del pod fuera anterior y abortara con "unrecognised option".
+#  cfg2 = respaldo: la config EXACTA de v8.5 que ya funciono en produccion
+#         (sin niveladores). Si el nivelado global crashara, caes a lo de hoy.
 CFG1 = ["--virtual-face-images", str(VFACES),
         "--local-seam-leveling", str(LOCAL_SEAM),
         "--sharpness-weight", str(SHARP),
         "--global-seam-leveling", str(GLOBAL_SEAM)]
-CFG2 = ["--global-seam-leveling", "0"]
-CONFIGS = [(MAX_TEX, CFG1, OMP_HI), (2048, CFG2, "2")]
+CFG2 = ["--virtual-face-images", str(VFACES),
+        "--local-seam-leveling", "0",
+        "--sharpness-weight", "0",
+        "--global-seam-leveling", "0"]
+CONFIGS = [(MAX_TEX, CFG1, OMP_HI), (MAX_TEX, CFG2, OMP_HI)]
 final = None
 for ci, (mt, extra, omp) in enumerate(CONFIGS):
     for f in glob.glob(BASE + ".*"):
