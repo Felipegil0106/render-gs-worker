@@ -1812,7 +1812,8 @@ def main():
         _bn_st = os.environ.get("PAINT_STORE", "linear")
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
-        log(f"═══ render-gs-worker 2DGS · v8-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-openmvs"
+        log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
+            f"{'openmvs' if os.environ.get('UV_TEXTURE','0')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -2704,8 +2705,15 @@ def main():
         except Exception as e:
             log(f"   ⚠ pintado falló ({e}); uso color por vértice del entrenamiento")
 
-        # ── PASO 4d: TEXTURA UV (UV_TEXTURE=1 por defecto; =0 la apaga) ──
-        if os.environ.get("UV_TEXTURE", "1") == "1":
+        # ── PASO 4d: TEXTURA UV (OPCION B: apagada por defecto) ──
+        #   Comparado byte a byte contra Polycam: OpenMVS parte la textura en
+        #   ~81.000 parches (mediana 1 triangulo, 48% de los vertices sobre una
+        #   costura) y elige UNA foto por cara -> escalones de tono inevitables.
+        #   Polycam usa 2.530 parches grandes y MEZCLA todas las fotos por texel.
+        #   Decision de Felipe: entregar el color por vertice (tono uniforme,
+        #   cero costuras, menos detalle fino). UV_TEXTURE=1 lo reactiva; el
+        #   plan futuro es repintar el atlas mezclando fotos (metodo Polycam).
+        if os.environ.get("UV_TEXTURE", "0") == "1":
             try:
                 fase(0.945, "PASO 4d/5 - Texturizando con OpenMVS (fotos 12MP, metodo Polycam)")
                 omvs_py = WORK / "openmvs_texture.py"
@@ -2723,7 +2731,7 @@ def main():
             except Exception as e:
                 log(f"   textura OpenMVS fallo ({e}); subo el color por vertice (respaldo)")
         else:
-            log("   PASO 4d saltado (UV_TEXTURE=0): se sube el color por vertice")
+            log("   PASO 4d saltado (OPCION B, UV_TEXTURE=0): se entrega el COLOR POR VERTICE (tono uniforme, sin costuras)")
 
         # Archivo a subir (orden de preferencia):
         #   1º TEXTURA UV (nítida)   2º vértices pintados   3º color del
