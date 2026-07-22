@@ -311,11 +311,21 @@ LOCAL_SEAM    = os.environ.get("OMVS_LOCAL_SEAM", "0")           # 0 = apagado: 
 SHARP         = os.environ.get("OMVS_SHARP", "0")                # 0 = apagado: el enfoque (default 0.5) crea halos oscuros en bordes de parches
 VFACES        = os.environ.get("OMVS_VFACES", "3")               # caras virtuales coplanares: agrupa triangulos del mismo plano en parches GRANDES (el arreglo real de la fragmentacion)
 EXPOCOMP      = os.environ.get("OMVS_EXPOCOMP", "0") == "1"     # 0 = APAGADO: medido sobre el .glb real, EMPEORO el tono (dispersion 21.6 -> 34.0). Se deja por si acaso
-TONE_LEVEL    = os.environ.get("OMVS_TONE", "1") == "1"          # NIVELADO DE TONO POR PARCHE (Opcion C): iguala el tono entre islas vecinas del atlas
+TONE_LEVEL    = os.environ.get("OMVS_TONE", "0") == "1"          # SUPERADO por el horneador (v9.1): la mezcla multi-vista iguala el tono por construccion
 TONE_CLAMP    = float(os.environ.get("OMVS_TONE_CLAMP", "1.35")) # tope de la correccion por isla (1.35 = +-35%): solo mueve el TONO, nunca el detalle
 TONE_MINF     = int(os.environ.get("OMVS_TONE_MINF", "3"))       # caras minimas por costura para creerle
 EXPO_SAMPLES  = int(os.environ.get("OMVS_EXPO_SAMPLES", "40000"))# puntos de la malla muestreados para medir las ganancias
 OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno
+# ── HORNEADOR MULTI-VISTA (v9.1; plan P1 de la investigacion, estilo Polycam) ──
+BAKE          = os.environ.get("OMVS_BAKE", "1") == "1"          # repinta cada texel MEZCLANDO todas las fotos que lo ven
+BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "2"))      # atlas x2 (4096->8192): ~0.075 cm/texel (UV viejo 0.15, vertice 0.84)
+BAKE_DS       = int(os.environ.get("OMVS_BAKE_DS", "8"))         # banda baja = foto reducida /8 y devuelta (multiBandDownscale de AliceVision)
+BAKE_COSK     = float(os.environ.get("OMVS_BAKE_COSK", "2"))     # peso angular cos^k (k=2 recomendado por la investigacion)
+BAKE_TOL      = float(os.environ.get("OMVS_BAKE_TOL", "0.006"))  # tolerancia de visibilidad = 0.6% de la profundidad
+BAKE_DILA     = int(os.environ.get("OMVS_BAKE_DILA", "6"))       # dilatacion del borde horneado (px) para mipmaps
+POSE_OPT      = os.environ.get("OMVS_POSEOPT", "0") == "1"       # Zhou-Koltun rigido (P2): OFF hasta medir su costo en el pod
+POSE_ITERS    = int(os.environ.get("OMVS_POSE_ITERS", "60"))     # iteraciones si se enciende
+POSE_VERTS    = int(os.environ.get("OMVS_POSE_VERTS", "400000")) # malla reducida para el optimizador (CPU)
 
 t0 = time.time()
 WORK = os.path.dirname(os.path.abspath(OUTGLB))
@@ -350,6 +360,7 @@ for line in open(os.path.join(SPARSE, "cameras.txt")):
 fcam = open(os.path.join(SPD, "cameras.txt"), "w"); fcam.write("# Camera list\n")
 fimg = open(os.path.join(SPD, "images.txt"), "w"); fimg.write("# Image list\n")
 n_ok = 0; n_miss = 0; _res_ej = None
+CROPS = {}   # nombre.jpg -> (ruta_original_12MP, left, top, cw, ch, rw, rh): mismo recorte del paso 2, SIN reducir
 raw = [l for l in open(os.path.join(SPARSE, "images.txt"))]
 i = 0
 while i < len(raw):
@@ -383,6 +394,7 @@ while i < len(raw):
     fx, fy, cx, cy = fx1*s, fy1*s, cx1*s, cy1*s
     jpg = os.path.splitext(name)[0] + ".jpg"
     im.save(os.path.join(IMGD, jpg), quality=92)
+    CROPS[jpg] = (path, left, top, cw, ch, rw, rh)
     if _res_ej is None: _res_ej = (rw, rh)
     fcam.write("%d PINHOLE %d %d %.6f %.6f %.6f %.6f\n" % (cid, rw, rh, fx, fy, cx, cy))
     fimg.write("%d %s %s %s %s %s %s %s %d %s\n" %
@@ -590,6 +602,101 @@ def run(cmd, tag, env=None):
 
 # 4a) COLMAP -> .mvs
 SCENE = os.path.join(MVS, "scene.mvs")
+def _leer_sparse(spd):
+    """Lee el sparse REESCALADO (cameras.txt PINHOLE + images.txt) -> camaras listas."""
+    import numpy as _np
+    cams2 = {}
+    for l in open(os.path.join(spd, "cameras.txt")):
+        if l.startswith("#") or not l.strip(): continue
+        p = l.split()
+        cams2[int(p[0])] = (int(p[2]), int(p[3]), float(p[4]), float(p[5]), float(p[6]), float(p[7]))
+    vistas = []
+    for l in open(os.path.join(spd, "images.txt")):
+        if l.startswith("#") or len(l.split()) < 10: continue
+        p = l.split()
+        qw, qx, qy, qz = [float(x) for x in p[1:5]]
+        t = _np.array([float(p[5]), float(p[6]), float(p[7])], _np.float64)
+        cid = int(p[8]); nom = p[9]
+        R = _np.array([
+            [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw),   2*(qx*qz+qy*qw)],
+            [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+            [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)]], _np.float64)
+        vistas.append([nom, cid, R, t])
+    return cams2, vistas
+
+def _pose_opt_zhou():
+    """P2 (Zhou-Koltun rigido, Open3D color_map): afina las poses ANTES de
+    texturizar para enderezar las juntas onduladas. Reescribe images.txt con
+    las poses refinadas. CPU; costo sin medir en el pod -> OFF por defecto."""
+    import numpy as _np, open3d as _o3
+    t0 = time.time()
+    cams2, vistas = _leer_sparse(SPD)
+    mm = _o3.io.read_triangle_mesh(MESH)
+    if len(mm.triangles) > POSE_VERTS:
+        mm = mm.simplify_quadric_decimation(target_number_of_triangles=POSE_VERTS)
+    mm.compute_vertex_normals()
+    scn = _o3.t.geometry.RaycastingScene()
+    scn.add_triangles(_o3.t.geometry.TriangleMesh.from_legacy(mm))
+    tray = _o3.camera.PinholeCameraTrajectory(); params = []
+    rgbds = []
+    DS2 = 3   # depth+color a 1/3 (480x640): suficiente y rapido
+    for nom, cid, R, t in vistas:
+        w, h, fx, fy, cx, cy = cams2[cid]
+        w2, h2 = w//DS2, h//DS2
+        fx2, fy2, cx2, cy2 = fx/DS2, fy/DS2, cx/DS2, cy/DS2
+        C = -R.T @ t
+        xs = (_np.arange(w2)+0.5-cx2)/fx2; ys = (_np.arange(h2)+0.5-cy2)/fy2
+        gx, gy = _np.meshgrid(xs, ys)
+        dirs_c = _np.stack([gx, gy, _np.ones_like(gx)], -1).reshape(-1,3)
+        dirs_w = dirs_c @ R
+        rays = _np.concatenate([_np.broadcast_to(C, dirs_w.shape), dirs_w], 1).astype(_np.float32)
+        th = scn.cast_rays(_o3.core.Tensor(rays))["t_hit"].numpy().reshape(h2, w2)
+        depth = _np.where(_np.isfinite(th), th, 0.0).astype(_np.float32)
+        col = Image.open(os.path.join(IMGD, nom)).convert("RGB").resize((w2, h2), Image.BILINEAR)
+        rgbds.append(_o3.geometry.RGBDImage.create_from_color_and_depth(
+            _o3.geometry.Image(_np.asarray(col)),
+            _o3.geometry.Image(depth), depth_scale=1.0,
+            depth_trunc=50.0, convert_rgb_to_intensity=False))
+        pc = _o3.camera.PinholeCameraParameters()
+        pc.intrinsic = _o3.camera.PinholeCameraIntrinsic(w2, h2, fx2, fy2, cx2, cy2)
+        E = _np.eye(4); E[:3,:3] = R; E[:3,3] = t
+        pc.extrinsic = E
+        params.append(pc)
+    tray.parameters = params
+    opt = _o3.pipelines.color_map.RigidOptimizerOption(
+        maximum_iteration=POSE_ITERS,
+        maximum_allowable_depth=50.0,
+        depth_threshold_for_visibility_check=0.03)
+    _, tray2 = _o3.pipelines.color_map.run_rigid_optimizer(mm, rgbds, tray, opt)
+    # reescribir images.txt con las poses refinadas
+    lineas = ["# Image list (poses refinadas Zhou-Koltun)\n"]
+    for (nom, cid, _R, _t), pc in zip(vistas, tray2.parameters):
+        E = _np.asarray(pc.extrinsic); R2 = E[:3,:3]; t2 = E[:3,3]
+        tr = _np.trace(R2)
+        if tr > 0:
+            S = (tr+1.0)**0.5*2; qw=0.25*S; qx=(R2[2,1]-R2[1,2])/S; qy=(R2[0,2]-R2[2,0])/S; qz=(R2[1,0]-R2[0,1])/S
+        else:
+            i0 = int(_np.argmax([R2[0,0],R2[1,1],R2[2,2]]))
+            if i0==0:
+                S=(1+R2[0,0]-R2[1,1]-R2[2,2])**0.5*2; qw=(R2[2,1]-R2[1,2])/S; qx=0.25*S; qy=(R2[0,1]+R2[1,0])/S; qz=(R2[0,2]+R2[2,0])/S
+            elif i0==1:
+                S=(1-R2[0,0]+R2[1,1]-R2[2,2])**0.5*2; qw=(R2[0,2]-R2[2,0])/S; qx=(R2[0,1]+R2[1,0])/S; qy=0.25*S; qz=(R2[1,2]+R2[2,1])/S
+            else:
+                S=(1-R2[0,0]-R2[1,1]+R2[2,2])**0.5*2; qw=(R2[1,0]-R2[0,1])/S; qx=(R2[0,2]+R2[2,0])/S; qy=(R2[1,2]+R2[2,1])/S; qz=0.25*S
+        lineas.append("%d %.9f %.9f %.9f %.9f %.7f %.7f %.7f %d %s\n\n"
+                      % (cid, qw, qx, qy, qz, t2[0], t2[1], t2[2], cid, nom))
+    open(os.path.join(SPD, "images.txt"), "w").writelines(lineas)
+    log("POSE-OPT Zhou-Koltun: %d vistas refinadas en %.1f min (iters=%d)"
+        % (len(vistas), (time.time()-t0)/60.0, POSE_ITERS))
+
+if POSE_OPT:
+    try:
+        _pose_opt_zhou()
+    except Exception as _po:
+        log("POSE-OPT fallo (%s): sigo con las poses de MASt3R" % _po)
+else:
+    log("POSE-OPT apagado (OMVS_POSEOPT=0): poses de MASt3R tal cual")
+
 rc = run([IFACE, "-i", MVS, "-o", SCENE, "--image-folder", IMGD], "InterfaceCOLMAP")
 if rc != 0 or not os.path.exists(SCENE):
     log("ERROR: InterfaceCOLMAP no produjo scene.mvs"); sys.exit(5)
@@ -840,6 +947,261 @@ def tone_level(objf, texfiles, mtl2tex):
     return True
 
 
+def bake_multiview(objf, texfiles, mtl2tex):
+    """HORNEADOR MULTI-VISTA v9.1 (plan P1 de la investigacion; el metodo Polycam).
+
+    Cada texel del atlas se repinta MEZCLANDO todas las fotos que lo ven:
+        salida = BAJA + ALTA
+        BAJA = promedio ponderado (cos^k/d^2, con oclusion) de TODAS las fotos
+               en version borrosa  -> los escalones de tono desaparecen por
+               construccion (ambos lados de cualquier costura reciben lo mismo)
+        ALTA = mejor foto nitida - mejor foto borrosa -> el detalle fino viene
+               de UNA sola foto: nitido y sin fantasmas aunque las poses tengan
+               error de 1-3 px (Baumberg 2002 / Metashape Mosaic / AliceVision)
+    Muestrea las fotos 12MP originales (mismo recorte del paso 2) y hornea el
+    atlas a BAKE_SCALE x -> ~0.075 cm/texel. Los texeles que ninguna foto ve
+    conservan el pixel de OpenMVS (nunca peor). Si algo falla: False y los
+    atlas quedan intactos."""
+    import numpy as _np
+    from scipy import ndimage as _ndi
+    _t0 = time.time()
+
+    def _s2l(c): return _np.where(c <= 0.04045, c/12.92, ((c+0.055)/1.055)**2.4)
+    def _l2s(c):
+        c = _np.clip(c, 0.0, 1.0)
+        return _np.where(c <= 0.0031308, c*12.92, 1.055*(c**(1.0/2.4)) - 0.055)
+
+    # ── 1) leer el OBJ ──
+    Vn=[]; Tn=[]; F=[]; FT=[]; FM=[]; cur=-1
+    with open(objf) as fh:
+        for ln in fh:
+            if ln.startswith("v "):
+                p=ln.split(); Vn.append((float(p[1]),float(p[2]),float(p[3])))
+            elif ln.startswith("vt "):
+                p=ln.split(); Tn.append((float(p[1]),float(p[2])))
+            elif ln.startswith("usemtl"):
+                cur=mtl2tex.get(ln.split(None,1)[1].strip(),-1)
+            elif ln.startswith("f "):
+                p=ln.split()
+                if len(p)<4: continue
+                a=[];b=[]
+                for c in p[1:4]:
+                    q=c.split("/"); a.append(int(q[0])-1)
+                    b.append(int(q[1])-1 if len(q)>1 and q[1] else -1)
+                F.append(a); FT.append(b); FM.append(cur)
+    V=_np.asarray(Vn,_np.float64); F=_np.asarray(F,_np.int64)
+    FT=_np.asarray(FT,_np.int64); FM=_np.asarray(FM,_np.int64); Tn=_np.asarray(Tn,_np.float64)
+    NF=len(F)
+    if NF<1000 or len(Tn)==0 or (FT<0).any() or (FM<0).any():
+        log("BAKE: OBJ sin UVs utilizables o muy chico; no horneo"); return False
+    e1=V[F[:,1]]-V[F[:,0]]; e2=V[F[:,2]]-V[F[:,0]]
+    FN=_np.cross(e1,e2); FN/= (_np.linalg.norm(FN,axis=1,keepdims=True)+1e-12)
+    FN=FN.astype(_np.float32)
+
+    # ── 2) camaras del sparse reescalado (con pose-opt si corrio) ──
+    cams2, vistas = _leer_sparse(SPD)
+    if not vistas:
+        log("BAKE: sin camaras en el sparse; no horneo"); return False
+
+    # ── 3) voto de orientacion V del OBJ contra el relleno gris ──
+    votes=[0,0]; cuv=Tn[FT].mean(1)
+    for ti in range(len(texfiles)):
+        m=FM==ti
+        if not m.any(): continue
+        a=_np.asarray(Image.open(texfiles[ti]).convert("RGB"))
+        H0,W0=a.shape[:2]
+        fill=(_np.abs(a[:,:,0].astype(_np.int16)-128)<6)&(_np.abs(a[:,:,1].astype(_np.int16)-128)<6)&(_np.abs(a[:,:,2].astype(_np.int16)-128)<6)
+        px=_np.clip((cuv[m,0]*(W0-1)).astype(int),0,W0-1)
+        for fl in (0,1):
+            vv=(1.0-cuv[m,1]) if fl==0 else cuv[m,1]
+            py=_np.clip((vv*(H0-1)).astype(int),0,H0-1)
+            votes[fl]+=int((~fill[py,px]).sum())
+    flip=0 if votes[0]>=votes[1] else 1
+
+    # ── 4) tabla de texeles por splat vectorizado (pos 3D + normal por texel) ──
+    SC=max(1,BAKE_SCALE)
+    at_lin=[]; at_pos=[]; at_nrm=[]; at_id=[]; at_dims=[]
+    for ti in range(len(texfiles)):
+        with Image.open(texfiles[ti]) as _im0: W0,H0=_im0.size
+        W2,H2=W0*SC,H0*SC; at_dims.append((W2,H2))
+        m=_np.flatnonzero(FM==ti)
+        if len(m)==0: continue
+        u=Tn[FT[m]]                                   # (n,3,2)
+        pu=u[:,:,0]*(W2-1)
+        pv=((1.0-u[:,:,1]) if flip==0 else u[:,:,1])*(H2-1)
+        area2=_np.abs((pu[:,1]-pu[:,0])*(pv[:,2]-pv[:,0])-(pu[:,2]-pu[:,0])*(pv[:,1]-pv[:,0]))
+        ns=_np.clip((area2*2.0).astype(_np.int64)+3,3,6000)
+        CHF=150000
+        for f0 in range(0,len(m),CHF):
+            sl=slice(f0,min(f0+CHF,len(m)))
+            nrep=ns[sl]; fid=_np.repeat(_np.arange(sl.start,sl.stop),nrep)
+            S=len(fid)
+            r1=_np.random.rand(S); r2=_np.random.rand(S)
+            sq=_np.sqrt(r1); ba=1-sq; bb=sq*(1-r2); bc=sq*r2
+            ix=_np.clip((ba*pu[fid,0]+bb*pu[fid,1]+bc*pu[fid,2]+0.5).astype(_np.int64),0,W2-1)
+            iy=_np.clip((ba*pv[fid,0]+bb*pv[fid,1]+bc*pv[fid,2]+0.5).astype(_np.int64),0,H2-1)
+            lin=iy*W2+ix
+            uq,first=_np.unique(lin,return_index=True)
+            gf=m[fid[first]]
+            P=(ba[first,None]*V[F[gf,0]]+bb[first,None]*V[F[gf,1]]+bc[first,None]*V[F[gf,2]])
+            at_lin.append(uq.astype(_np.int64)); at_pos.append(P.astype(_np.float32))
+            at_nrm.append(FN[gf]); at_id.append(_np.full(len(uq),ti,_np.uint8))
+    if not at_lin:
+        log("BAKE: no pude rasterizar texeles; no horneo"); return False
+    LIN=_np.concatenate(at_lin); POS=_np.concatenate(at_pos)
+    NRM=_np.concatenate(at_nrm); AID=_np.concatenate(at_id)
+    # dedupe global por (atlas,lin): distintos chunks pudieron repetir texel
+    gkey=AID.astype(_np.int64)*(max(w*h for w,h in at_dims)+1)+LIN
+    _,keep=_np.unique(gkey,return_index=True)
+    LIN=LIN[keep]; POS=POS[keep]; NRM=NRM[keep]; AID=AID[keep]
+    NT=len(LIN)
+    log("BAKE: %d texeles con superficie (atlas x%d) en %.1f min de rasterizado"
+        % (NT, SC, (time.time()-_t0)/60.0))
+
+    # ── 5) mapas de profundidad por camara (media resolucion) ──
+    import open3d as _o3
+    scn=_o3.t.geometry.RaycastingScene()
+    _mm=_o3.geometry.TriangleMesh(_o3.utility.Vector3dVector(V),_o3.utility.Vector3iVector(F.astype(_np.int32)))
+    scn.add_triangles(_o3.t.geometry.TriangleMesh.from_legacy(_mm))
+    DSD=2
+    deps={}
+    for nom,cid,R,t in vistas:
+        w14,h14,fx,fy,cx,cy=cams2[cid]
+        wD,hD=max(2,w14//DSD),max(2,h14//DSD)
+        C=(-R.T@t)
+        xs=(_np.arange(wD)+0.5-cx/DSD)/(fx/DSD); ys=(_np.arange(hD)+0.5-cy/DSD)/(fy/DSD)
+        gx,gy=_np.meshgrid(xs,ys)
+        dc=_np.stack([gx,gy,_np.ones_like(gx)],-1).reshape(-1,3)
+        dw=dc@R
+        rays=_np.concatenate([_np.broadcast_to(C,dw.shape),dw],1).astype(_np.float32)
+        th=scn.cast_rays(_o3.core.Tensor(rays))["t_hit"].numpy().reshape(hD,wD)
+        deps[nom]=_np.where(_np.isfinite(th),th,0.0).astype(_np.float32)
+
+    # ── 6) acumulacion (torch-CUDA si hay; si no numpy) ──
+    usa_gpu=False
+    try:
+        import torch as _th
+        usa_gpu=_th.cuda.is_available() and os.environ.get("OMVS_BAKE_CPU","0")!="1"
+    except Exception:
+        _th=None
+    if usa_gpu:
+        dev="cuda"
+        sumL=_th.zeros((NT,3),dtype=_th.float32,device=dev)
+        sumW=_th.zeros(NT,dtype=_th.float32,device=dev)
+        bestW=_th.zeros(NT,dtype=_th.float32,device=dev)
+        bestS=_th.zeros((NT,3),dtype=_th.float16,device=dev)
+        bestL=_th.zeros((NT,3),dtype=_th.float16,device=dev)
+        cnt=_th.zeros(NT,dtype=_th.uint8,device=dev)
+        POSg=_th.from_numpy(POS).to(dev); NRMg=_th.from_numpy(NRM).to(dev)
+    else:
+        sumL=_np.zeros((NT,3),_np.float32); sumW=_np.zeros(NT,_np.float32)
+        bestW=_np.zeros(NT,_np.float32)
+        bestS=_np.zeros((NT,3),_np.float16); bestL=_np.zeros((NT,3),_np.float16)
+        cnt=_np.zeros(NT,_np.uint8); POSg=POS; NRMg=NRM
+    CH=20_000_000 if usa_gpu else 4_000_000
+    for nom,cid,Rc,tc in vistas:
+        w14,h14,fx,fy,cx,cy=cams2[cid]
+        cr=CROPS.get(nom)
+        try:
+            if cr:
+                pth,left,top,cw,ch_,rw,rh=cr
+                im=Image.open(pth).convert("RGB").crop((left,top,left+cw,top+ch_))
+            else:
+                im=Image.open(os.path.join(IMGD,nom)).convert("RGB")
+        except Exception:
+            im=Image.open(os.path.join(IMGD,nom)).convert("RGB")
+        W12,H12=im.size; s12=W12/float(w14)
+        low_im=im.resize((max(1,W12//BAKE_DS),max(1,H12//BAKE_DS)),Image.LANCZOS).resize((W12,H12),Image.BILINEAR)
+        sharp=_s2l(_np.asarray(im,_np.float32)/255.0)
+        low=_s2l(_np.asarray(low_im,_np.float32)/255.0)
+        dep=deps[nom]; hD,wD=dep.shape; sD=wD/float(w14)
+        Cc=(-Rc.T@tc).astype(_np.float32)
+        if usa_gpu:
+            Rg=_th.from_numpy(Rc.astype(_np.float32)).to(dev); tg=_th.from_numpy(tc.astype(_np.float32)).to(dev)
+            Cg=_th.from_numpy(Cc).to(dev)
+            shg=_th.from_numpy(sharp).to(dev).half(); log_=_th.from_numpy(low).to(dev).half()
+            dpg=_th.from_numpy(dep).to(dev)
+            for c0 in range(0,NT,CH):
+                sl=slice(c0,min(c0+CH,NT))
+                P=POSg[sl]; N=NRMg[sl]
+                Xc=P@Rg.T+tg; z=Xc[:,2]
+                ok=z>0.05
+                u=fx*Xc[:,0]/z+cx; v=fy*Xc[:,1]/z+cy
+                ok&=(u>=0)&(u<w14-1)&(v>=0)&(v<h14-1)
+                iu=_th.clamp((u*sD).long(),0,wD-1); iv=_th.clamp((v*sD).long(),0,hD-1)
+                d=dpg[iv,iu]
+                ok&=(d>0)&((z-d).abs()<BAKE_TOL*z)
+                dv=P-Cg; dv=dv/_th.clamp(dv.norm(dim=1,keepdim=True),min=1e-9)
+                cosv=(dv*N).sum(1).abs()
+                w=_th.where(ok,(cosv**BAKE_COSK)/(z*z+1e-6),_th.zeros_like(z))
+                i12u=_th.clamp((u*s12).long(),0,W12-1); i12v=_th.clamp((v*s12).long(),0,H12-1)
+                cS=shg[i12v,i12u].float(); cL=log_[i12v,i12u].float()
+                sumL[sl]+=w[:,None]*cL; sumW[sl]+=w
+                cnt[sl]+= (w>0).to(_th.uint8)*(cnt[sl]<250).to(_th.uint8)
+                mej=w>bestW[sl]
+                bestW[sl]=_th.where(mej,w,bestW[sl])
+                bestS[sl]=_th.where(mej[:,None],cS.half(),bestS[sl])
+                bestL[sl]=_th.where(mej[:,None],cL.half(),bestL[sl])
+        else:
+            for c0 in range(0,NT,CH):
+                sl=slice(c0,min(c0+CH,NT))
+                P=POSg[sl]; N=NRMg[sl]
+                Xc=P@Rc.T.astype(_np.float32)+tc.astype(_np.float32)
+                z=Xc[:,2]; ok=z>0.05
+                u=fx*Xc[:,0]/_np.maximum(z,1e-6)+cx; v=fy*Xc[:,1]/_np.maximum(z,1e-6)+cy
+                ok&=(u>=0)&(u<w14-1)&(v>=0)&(v<h14-1)
+                iu=_np.clip((u*sD).astype(_np.int64),0,wD-1); iv=_np.clip((v*sD).astype(_np.int64),0,hD-1)
+                d=dep[iv,iu]
+                ok&=(d>0)&(_np.abs(z-d)<BAKE_TOL*z)
+                dv=P-Cc; dv/= (_np.linalg.norm(dv,axis=1,keepdims=True)+1e-9)
+                cosv=_np.abs((dv*N).sum(1))
+                w=_np.where(ok,(cosv**BAKE_COSK)/(z*z+1e-6),0.0).astype(_np.float32)
+                i12u=_np.clip((u*s12).astype(_np.int64),0,W12-1); i12v=_np.clip((v*s12).astype(_np.int64),0,H12-1)
+                cS=sharp[i12v,i12u]; cL=low[i12v,i12u]
+                sumL[sl]+=w[:,None]*cL; sumW[sl]+=w
+                cnt[sl]=_np.minimum(cnt[sl].astype(_np.int32)+(w>0),250).astype(_np.uint8)
+                mej=w>bestW[sl]
+                bestW[sl]=_np.where(mej,w,bestW[sl])
+                bestS[sl]=_np.where(mej[:,None],cS,bestS[sl].astype(_np.float32)).astype(_np.float16)
+                bestL[sl]=_np.where(mej[:,None],cL,bestL[sl].astype(_np.float32)).astype(_np.float16)
+    if usa_gpu:
+        sumL=sumL.cpu().numpy(); sumW=sumW.cpu().numpy(); bestW=bestW.cpu().numpy()
+        bestS=bestS.cpu().numpy(); bestL=bestL.cpu().numpy(); cnt=cnt.cpu().numpy()
+
+    seen=(cnt>=1)&(sumW>1e-9)
+    cov1=100.0*seen.mean(); cov3=100.0*(cnt>=3).mean()
+    if cov1<30.0:
+        log("BAKE: cobertura muy baja (%.0f%% con >=1 foto); no toco los atlas" % cov1); return False
+    lowb=sumL/_np.maximum(sumW,1e-9)[:,None]
+    outl=_np.clip(lowb+(bestS.astype(_np.float32)-bestL.astype(_np.float32)),0.0,1.0)
+    outs=(_np.clip(_l2s(outl),0,1)*255.0+0.5).astype(_np.uint8)
+
+    # ── 7) escribir atlas: base = OpenMVS upscaleado; horneado encima; dilatar ──
+    for ti,tf in enumerate(texfiles):
+        W2,H2=at_dims[ti]
+        base=_np.asarray(Image.open(tf).convert("RGB").resize((W2,H2),Image.BILINEAR)).copy()
+        m=(AID==ti)&seen
+        if m.any():
+            lin=LIN[m]; iy=(lin//W2).astype(_np.int64); ix=(lin%W2).astype(_np.int64)
+            base[iy,ix]=outs[m]
+            filled=_np.zeros((H2,W2),bool); filled[iy,ix]=True
+            for _ in range(BAKE_DILA):
+                nb=_ndi.binary_dilation(filled)
+                nuevo=nb&~filled
+                if not nuevo.any(): break
+                idx=_ndi.distance_transform_edt(~filled,return_distances=False,return_indices=True)
+                base[nuevo]=base[idx[0][nuevo],idx[1][nuevo]]
+                filled=nb
+        if tf.lower().endswith((".jpg",".jpeg")):
+            Image.fromarray(base).save(tf,quality=92,subsampling=0)
+        else:
+            Image.fromarray(base).save(tf)
+    log("BAKE listo: %.1fM texeles horneados | cobertura >=1 foto %.0f%%, >=3 fotos %.0f%% | "
+        "%s | atlas x%d en %.1f min"
+        % (NT/1e6, cov1, cov3, "GPU" if usa_gpu else "CPU", SC, (time.time()-_t0)/60.0))
+    return True
+
+
 def obj_to_glb(objf, outglb):
     """OBJ texturizado de OpenMVS -> glb. (a) Recolorea el NARANJA de relleno de
     OpenMVS (255,127,39; caras que ninguna foto vio) a gris DIRECTO en los archivos
@@ -888,7 +1250,16 @@ def obj_to_glb(objf, outglb):
         except Exception as _tl:
             log("TONO: nivelado fallo (%s); la textura queda igual que antes" % _tl)
     elif not TONE_LEVEL:
-        log("TONO: nivelado por parche APAGADO (OMVS_TONE=0)")
+        log("TONO: superado por el horneador (OMVS_TONE=0)")
+    # (a3) HORNEADOR MULTI-VISTA v9.1 — repinta los atlas mezclando las fotos
+    if BAKE and texfiles and mtl2tex:
+        try:
+            if not bake_multiview(objf, texfiles, mtl2tex):
+                log("BAKE: no se aplico (los atlas de OpenMVS quedan como estaban)")
+        except Exception as _bk:
+            log("BAKE: horneador fallo (%s); los atlas de OpenMVS quedan" % _bk)
+    elif not BAKE:
+        log("BAKE apagado (OMVS_BAKE=0): atlas de OpenMVS tal cual")
     # (b) cargar la Scene (texturas ya corregidas) y exportar SIN concatenar
     obj = trimesh.load(objf, process=False)
     obj.export(outglb)
@@ -1813,7 +2184,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'openmvs' if os.environ.get('UV_TEXTURE','0')=='1' else 'vertexB'}"
+            f"{'bake91' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -2705,15 +3076,18 @@ def main():
         except Exception as e:
             log(f"   ⚠ pintado falló ({e}); uso color por vértice del entrenamiento")
 
-        # ── PASO 4d: TEXTURA UV (OPCION B: apagada por defecto) ──
-        #   Comparado byte a byte contra Polycam: OpenMVS parte la textura en
-        #   ~81.000 parches (mediana 1 triangulo, 48% de los vertices sobre una
-        #   costura) y elige UNA foto por cara -> escalones de tono inevitables.
-        #   Polycam usa 2.530 parches grandes y MEZCLA todas las fotos por texel.
-        #   Decision de Felipe: entregar el color por vertice (tono uniforme,
-        #   cero costuras, menos detalle fino). UV_TEXTURE=1 lo reactiva; el
-        #   plan futuro es repintar el atlas mezclando fotos (metodo Polycam).
-        if os.environ.get("UV_TEXTURE", "0") == "1":
+        # ── PASO 4d: TEXTURA UV + HORNEADOR v9.1 (plan P1 de la investigacion) ──
+        #   OpenMVS solo pone el MAPA UV; luego el horneador repinta cada texel
+        #   MEZCLANDO todas las fotos 12MP que lo ven (oclusion + peso angular),
+        #   en dos bandas: baja=promedio (tono parejo por construccion, adios
+        #   escalones) + alta=mejor foto (nitidez sin fantasmas). Atlas x2 ->
+        #   ~0.075 cm/texel (UV viejo 0.15, vertice 0.84; Polycam 0.05).
+        #   Probado en sintetico con camaras a exposiciones 0.75/1.0/1.3:
+        #   salto de tono en costura 1.8 niveles (mejor-vista daria 20-36).
+        #   Si el horneado falla -> atlas OpenMVS quedan; si todo el paso UV
+        #   falla -> se sube el color por vertice (vertexB) como siempre.
+        #   OMVS_POSEOPT=1 enciende el refinador Zhou-Koltun (P2) sin tocar codigo.
+        if os.environ.get("UV_TEXTURE", "1") == "1":
             try:
                 fase(0.945, "PASO 4d/5 - Texturizando con OpenMVS (fotos 12MP, metodo Polycam)")
                 omvs_py = WORK / "openmvs_texture.py"
