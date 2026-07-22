@@ -325,6 +325,7 @@ BAKE_TOL      = float(os.environ.get("OMVS_BAKE_TOL", "0.010"))  # tolerancia de
 BAKE_BILIN    = os.environ.get("OMVS_BAKE_BILIN", "1") == "1"    # muestreo BILINEAL de las fotos (bordes de letras suaves, sin dientes)
 BAKE_JQ       = int(os.environ.get("OMVS_BAKE_JQ", "85"))        # JPEG q85 + croma 4:2:0 (como Polycam): ~3x mas liviano que q92 4:4:4
 BAKE_DILA     = int(os.environ.get("OMVS_BAKE_DILA", "6"))       # dilatacion del borde horneado (px) para mipmaps
+BAKE_EXPO     = os.environ.get("OMVS_BAKE_EXPO", "1") == "1"     # normaliza la exposicion de cada foto a la mediana global antes de mezclar (mata el "distintos tonos" del auto-exposicion del celular)
 POSE_OPT      = os.environ.get("OMVS_POSEOPT", "0") == "1"       # Zhou-Koltun rigido (P2): OFF hasta medir su costo en el pod
 POSE_ITERS    = int(os.environ.get("OMVS_POSE_ITERS", "60"))     # iteraciones si se enciende
 POSE_VERTS    = int(os.environ.get("OMVS_POSE_VERTS", "400000")) # malla reducida para el optimizador (CPU)
@@ -780,6 +781,8 @@ def tone_level(objf, texfiles, mtl2tex):
     def _l2s(c):
         c = _np.clip(c, 0.0, 1.0)
         return _np.where(c <= 0.0031308, c*12.92, 1.055*(c**(1.0/2.4)) - 0.055)
+    def _absxp(a, gpu):
+        return a.abs() if gpu else _np.abs(a)
     def _fillmask(a):
         return (_np.abs(a[:, :, 0].astype(_np.int16) - 128) < 6) & \
                (_np.abs(a[:, :, 1].astype(_np.int16) - 128) < 6) & \
@@ -981,6 +984,8 @@ def bake_multiview(objf, texfiles, mtl2tex):
     def _l2s(c):
         c = _np.clip(c, 0.0, 1.0)
         return _np.where(c <= 0.0031308, c*12.92, 1.055*(c**(1.0/2.4)) - 0.055)
+    def _absxp(a, gpu):
+        return a.abs() if gpu else _np.abs(a)
 
     # ── 1) leer el OBJ ──
     Vn=[]; Tn=[]; F=[]; FT=[]; FM=[]; cur=-1
@@ -1032,7 +1037,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
         del a,fill
     flip=0 if votes[0]>=votes[1] else 1
     del cuv; _gc.collect()
-    log("BAKE v9.2: arranque | RAM %.1f GB" % _rss())
+    log("BAKE: arranque (v9.4 loop unificado) | RAM %.1f GB" % _rss())
 
     # ── 4) tabla de texeles por splat (trozos por PRESUPUESTO de muestras) ──
     SC=max(1,BAKE_SCALE)
@@ -1106,30 +1111,84 @@ def bake_multiview(objf, texfiles, mtl2tex):
     log("BAKE: profundidades de %d camaras listas | RAM %.1f GB | %.1f min"
         % (len(vistas),_rss(),(time.time()-_t0)/60.0))
 
-    # ── 6) acumulacion (GPU si hay; reintenta con trozos menores si se llena) ──
+    # ── 6) acumulacion UNIFICADA (un solo cuerpo; adaptador GPU/CPU) ──
+    # Una sola implementacion corre en GPU (torch) o CPU (numpy) via un
+    # adaptador minimo. El test local en CPU ejercita EXACTAMENTE estas
+    # lineas -> se acaba la clase de bug "la rama GPU no estaba probada"
+    # (que costo 2 renders: el OOM silencioso y el 'i12u before assignment').
     usa_gpu=False
     try:
         import torch as _th
         usa_gpu=_th.cuda.is_available() and os.environ.get("OMVS_BAKE_CPU","0")!="1"
     except Exception:
         _th=None
-    if usa_gpu:
-        dev="cuda"
-        sumL=_th.zeros((NT,3),dtype=_th.float32,device=dev)
-        sumW=_th.zeros(NT,dtype=_th.float32,device=dev)
-        bestW=_th.zeros(NT,dtype=_th.float32,device=dev)
-        bestS=_th.zeros((NT,3),dtype=_th.float16,device=dev)
-        bestL=_th.zeros((NT,3),dtype=_th.float16,device=dev)
-        cnt=_th.zeros(NT,dtype=_th.uint8,device=dev)
-        POSg=_th.from_numpy(POS).to(dev); NRMg=_th.from_numpy(NRM).to(dev)
-        del POS,NRM; _gc.collect()
-    else:
-        sumL=_np.zeros((NT,3),_np.float32); sumW=_np.zeros(NT,_np.float32)
-        bestW=_np.zeros(NT,_np.float32)
-        bestS=_np.zeros((NT,3),_np.float16); bestL=_np.zeros((NT,3),_np.float16)
-        cnt=_np.zeros(NT,_np.uint8); POSg=POS; NRMg=NRM
+
+    class _XPnp:                      # adaptador NumPy (CPU)
+        name="CPU"
+        def zeros(self,shp,f16=False): return _np.zeros(shp,_np.float16 if f16 else _np.float32)
+        def zc(self,n): return _np.zeros(n,_np.uint8)
+        def put(self,a): return a     # ya es numpy
+        def get(self,a): return a
+        def idx(self,a): return a.astype(_np.int64)
+        def clipi(self,a,hi): return _np.clip(a.astype(_np.int64),0,hi)
+        def where(self,c,a,b): return _np.where(c,a,b)
+        def zeros_like(self,a): return _np.zeros_like(a)
+        def col(self,a): return a[:,None]
+        def af(self,a): return a.astype(_np.float32)
+        def norm1(self,v): return _np.linalg.norm(v,axis=1,keepdims=True)
+        def u8add(self,c,m): return _np.minimum(c.astype(_np.int32)+m,250).astype(_np.uint8)
+        def f16(self,a): return a.astype(_np.float16)
+
+    class _XPth:                      # adaptador Torch (GPU)
+        name="GPU"
+        def __init__(self,dev): self.d=dev
+        def zeros(self,shp,f16=False): return _th.zeros(shp,dtype=_th.float16 if f16 else _th.float32,device=self.d)
+        def zc(self,n): return _th.zeros(n,dtype=_th.uint8,device=self.d)
+        def put(self,a): return _th.from_numpy(_np.ascontiguousarray(a)).to(self.d)
+        def get(self,a): return a.detach().cpu().numpy()
+        def idx(self,a): return a.long()
+        def clipi(self,a,hi): return _th.clamp(a.long(),0,hi)
+        def where(self,c,a,b): return _th.where(c,a,b)
+        def zeros_like(self,a): return _th.zeros_like(a)
+        def col(self,a): return a.unsqueeze(1)
+        def af(self,a): return a.float()
+        def norm1(self,v): return _th.clamp(v.norm(dim=1,keepdim=True),min=1e-9)
+        def u8add(self,c,m): return c+(m.to(_th.uint8)*(c<250).to(_th.uint8))
+        def f16(self,a): return a.half()
+
+    xp = _XPth("cuda") if usa_gpu else _XPnp()
+    sumL=xp.zeros((NT,3)); sumW=xp.zeros(NT); bestW=xp.zeros(NT)
+    bestS=xp.zeros((NT,3),f16=True); bestL=xp.zeros((NT,3),f16=True); cnt=xp.zc(NT)
+    POSg=xp.put(POS); NRMg=xp.put(NRM)
+    if usa_gpu: del POS,NRM; _gc.collect()
     CH=[20_000_000 if usa_gpu else 4_000_000]
-    log("BAKE: mezclando %d camaras en %s | RAM %.1f GB" % (len(vistas),"GPU" if usa_gpu else "CPU",_rss()))
+    log("BAKE: mezclando %d camaras en %s | RAM %.1f GB" % (len(vistas),xp.name,_rss()))
+
+    # ── NORMALIZACION DE EXPOSICION por foto (BAKE_EXPO): el Xiaomi cambia la
+    #    auto-exposicion foto a foto (medido: hasta 4x en este set). Antes de
+    #    mezclar, se lleva cada foto a la MEDIANA global de luminancia lineal.
+    #    Ataca "no hay armonia / distintos tonos" en la RAIZ, no solo tapa. ──
+    _gain={}
+    if BAKE_EXPO:
+        _ms=[]
+        for nom,cid,_Rc,_tc in vistas:
+            cr=CROPS.get(nom)
+            try:
+                if cr:
+                    _p,_l,_t,_cw,_ch,_rw,_rh=cr
+                    _q=Image.open(_p).convert("RGB").crop((_l,_t,_l+_cw,_t+_ch)).resize((160,213),Image.BILINEAR)
+                else:
+                    _q=Image.open(os.path.join(IMGD,nom)).convert("RGB").resize((160,213),Image.BILINEAR)
+            except Exception:
+                _q=Image.open(os.path.join(IMGD,nom)).convert("RGB").resize((160,213),Image.BILINEAR)
+            _ms.append((nom,float(_np.median(_s2l(_np.asarray(_q,_np.float32)/255.0)))))
+        _med=_np.median([x[1] for x in _ms])
+        for nom,mi in _ms:
+            _gain[nom]=float(_np.clip(_med/max(mi,1e-4),0.7,1.4))
+        _sp=_np.array([_gain[n] for n,_ in _ms])
+        log("BAKE: exposicion normalizada a mediana global | ganancias %.2f-%.2f (1.0=sin cambio)"
+            % (_sp.min(),_sp.max()))
+
     for ki,(nom,cid,Rc,tc) in enumerate(vistas):
         if ki % 16 == 0 and ki:
             log("BAKE: camara %d/%d | RAM %.1f GB | %.1f min"
@@ -1146,91 +1205,61 @@ def bake_multiview(objf, texfiles, mtl2tex):
             im=Image.open(os.path.join(IMGD,nom)).convert("RGB")
         W12,H12=im.size; s12=W12/float(w14)
         low_im=im.resize((max(1,W12//BAKE_DS),max(1,H12//BAKE_DS)),Image.LANCZOS).resize((W12,H12),Image.BILINEAR)
-        sharp=_s2l(_np.asarray(im,_np.float32)/255.0); del im
-        low=_s2l(_np.asarray(low_im,_np.float32)/255.0); del low_im
+        g_i=_gain.get(nom,1.0)
+        sharp=_s2l(_np.asarray(im,_np.float32)/255.0)*g_i; del im
+        low=_s2l(_np.asarray(low_im,_np.float32)/255.0)*g_i; del low_im
         dep=deps[nom].astype(_np.float32); hD,wD=dep.shape; sD=wD/float(w14)
         Cc=(-Rc.T@tc).astype(_np.float32)
-        if usa_gpu:
-            Rg=_th.from_numpy(Rc.astype(_np.float32)).to(dev); tg=_th.from_numpy(tc.astype(_np.float32)).to(dev)
-            Cg=_th.from_numpy(Cc).to(dev)
-            shg=_th.from_numpy(sharp).to(dev).half(); lwg=_th.from_numpy(low).to(dev).half()
-            dpg=_th.from_numpy(dep).to(dev)
-            del sharp,low,dep
-            c0=0
-            while c0<NT:
-                sl=slice(c0,min(c0+CH[0],NT))
-                try:
-                    P=POSg[sl]; N=NRMg[sl].float()
-                    Xc=P@Rg.T+tg; z=Xc[:,2]
-                    ok=z>0.05
-                    u=fx*Xc[:,0]/z+cx; v=fy*Xc[:,1]/z+cy
-                    ok&=(u>=0)&(u<w14-1)&(v>=0)&(v<h14-1)
-                    iu=_th.clamp((u*sD).long(),0,wD-1); iv=_th.clamp((v*sD).long(),0,hD-1)
-                    d=dpg[iv,iu]
-                    ok&=(d>0)&((z-d).abs()<BAKE_TOL*z)
-                    dv=P-Cg; dv=dv/_th.clamp(dv.norm(dim=1,keepdim=True),min=1e-9)
-                    cosv=(dv*N).sum(1).abs()
-                    w=_th.where(ok,(cosv**BAKE_COSK)/(z*z+1e-6),_th.zeros_like(z))
-                    fu=_th.clamp(u*s12,0.0,W12-1.001); fv=_th.clamp(v*s12,0.0,H12-1.001)
-                    if BAKE_BILIN:
-                        x0=fu.long(); y0=fv.long(); ax=(fu-x0).unsqueeze(1); ay=(fv-y0).unsqueeze(1)
-                        x1=_th.clamp(x0+1,max=W12-1); y1=_th.clamp(y0+1,max=H12-1)
-                        cS=((shg[y0,x0].float()*(1-ax)+shg[y0,x1].float()*ax)*(1-ay)
-                            +(shg[y1,x0].float()*(1-ax)+shg[y1,x1].float()*ax)*ay)
-                        cL=((lwg[y0,x0].float()*(1-ax)+lwg[y0,x1].float()*ax)*(1-ay)
-                            +(lwg[y1,x0].float()*(1-ax)+lwg[y1,x1].float()*ax)*ay)
-                        del x0,y0,x1,y1,ax,ay
-                    else:
-                        i12u=fu.long(); i12v=fv.long()
-                        cS=shg[i12v,i12u].float(); cL=lwg[i12v,i12u].float()
-                    del fu,fv
-                    sumL[sl]+=w[:,None]*cL; sumW[sl]+=w
-                    cnt[sl]+=(w>0).to(_th.uint8)*(cnt[sl]<250).to(_th.uint8)
-                    mej=w>bestW[sl]
-                    bestW[sl]=_th.where(mej,w,bestW[sl])
-                    bestS[sl]=_th.where(mej[:,None],cS.half(),bestS[sl])
-                    bestL[sl]=_th.where(mej[:,None],cL.half(),bestL[sl])
-                    del P,N,Xc,z,ok,u,v,iu,iv,d,dv,cosv,w,i12u,i12v,cS,cL,mej
-                    c0=sl.stop
-                except RuntimeError as _oe:
-                    if "out of memory" in str(_oe).lower() and CH[0]>2_000_000:
-                        _th.cuda.empty_cache(); CH[0]//=2
-                        log("BAKE: GPU corta de memoria -> trozos a %.0fM" % (CH[0]/1e6))
-                    else:
-                        raise
-            del Rg,tg,Cg,shg,lwg,dpg
-        else:
-            for c0 in range(0,NT,CH[0]):
-                sl=slice(c0,min(c0+CH[0],NT))
-                P=POSg[sl]; N=NRMg[sl].astype(_np.float32)
-                Xc=P@Rc.T.astype(_np.float32)+tc.astype(_np.float32)
-                z=Xc[:,2]; ok=z>0.05
-                u=fx*Xc[:,0]/_np.maximum(z,1e-6)+cx; v=fy*Xc[:,1]/_np.maximum(z,1e-6)+cy
-                ok&=(u>=0)&(u<w14-1)&(v>=0)&(v<h14-1)
-                iu=_np.clip((u*sD).astype(_np.int64),0,wD-1); iv=_np.clip((v*sD).astype(_np.int64),0,hD-1)
-                d=dep[iv,iu]
-                ok&=(d>0)&(_np.abs(z-d)<BAKE_TOL*z)
-                dv=P-Cc; dv/= (_np.linalg.norm(dv,axis=1,keepdims=True)+1e-9)
-                cosv=_np.abs((dv*N).sum(1))
-                w=_np.where(ok,(cosv**BAKE_COSK)/(z*z+1e-6),0.0).astype(_np.float32)
-                fu=_np.clip(u*s12,0.0,W12-1.001); fv=_np.clip(v*s12,0.0,H12-1.001)
-                if BAKE_BILIN:
-                    x0=fu.astype(_np.int64); y0=fv.astype(_np.int64)
-                    ax=(fu-x0)[:,None].astype(_np.float32); ay=(fv-y0)[:,None].astype(_np.float32)
-                    x1=_np.minimum(x0+1,W12-1); y1=_np.minimum(y0+1,H12-1)
-                    cS=((sharp[y0,x0]*(1-ax)+sharp[y0,x1]*ax)*(1-ay)
-                        +(sharp[y1,x0]*(1-ax)+sharp[y1,x1]*ax)*ay)
-                    cL=((low[y0,x0]*(1-ax)+low[y0,x1]*ax)*(1-ay)
-                        +(low[y1,x0]*(1-ax)+low[y1,x1]*ax)*ay)
+        # subir esta camara al backend
+        Rq=xp.put(Rc.astype(_np.float32)); tq=xp.put(tc.astype(_np.float32)); Cq=xp.put(Cc)
+        shq=xp.f16(xp.put(sharp)); lwq=xp.f16(xp.put(low)); dpq=xp.put(dep)
+        del sharp,low,dep
+        c0=0
+        while c0<NT:
+            sl=slice(c0,min(c0+CH[0],NT))
+            try:
+                P=POSg[sl]; N=xp.af(NRMg[sl])
+                Xc=P@Rq.T+tq; z=Xc[:,2]
+                zc=z if usa_gpu else _np.maximum(z,1e-6)
+                ok=z>0.05
+                u=fx*Xc[:,0]/zc+cx; v=fy*Xc[:,1]/zc+cy
+                ok=ok&(u>=0)&(u<w14-1)&(v>=0)&(v<h14-1)
+                iu=xp.clipi(u*sD,wD-1); iv=xp.clipi(v*sD,hD-1)
+                d=dpq[iv,iu]
+                ok=ok&(d>0)&(xp.af(_absxp(z-d,usa_gpu))<BAKE_TOL*z)
+                dv=P-Cq; dv=dv/xp.norm1(dv)
+                cosv=_absxp((dv*N).sum(1),usa_gpu)
+                w=xp.where(ok,(cosv**BAKE_COSK)/(z*z+1e-6),xp.zeros_like(z))
+                # muestreo (bilineal por defecto) de las fotos 12MP
+                fu=u*s12; fv=v*s12
+                if usa_gpu:
+                    fu=_th.clamp(fu,0.0,W12-1.001); fv=_th.clamp(fv,0.0,H12-1.001)
                 else:
-                    cS=sharp[fv.astype(_np.int64),fu.astype(_np.int64)]
-                    cL=low[fv.astype(_np.int64),fu.astype(_np.int64)]
-                sumL[sl]+=w[:,None]*cL; sumW[sl]+=w
-                cnt[sl]=_np.minimum(cnt[sl].astype(_np.int32)+(w>0),250).astype(_np.uint8)
+                    fu=_np.clip(fu,0.0,W12-1.001); fv=_np.clip(fv,0.0,H12-1.001)
+                x0=xp.idx(fu); y0=xp.idx(fv)
+                if BAKE_BILIN:
+                    ax=xp.col(fu-xp.af(x0)); ay=xp.col(fv-xp.af(y0))
+                    x1=xp.clipi(x0+1,W12-1); y1=xp.clipi(y0+1,H12-1)
+                    cS=((xp.af(shq[y0,x0])*(1-ax)+xp.af(shq[y0,x1])*ax)*(1-ay)
+                        +(xp.af(shq[y1,x0])*(1-ax)+xp.af(shq[y1,x1])*ax)*ay)
+                    cL=((xp.af(lwq[y0,x0])*(1-ax)+xp.af(lwq[y0,x1])*ax)*(1-ay)
+                        +(xp.af(lwq[y1,x0])*(1-ax)+xp.af(lwq[y1,x1])*ax)*ay)
+                else:
+                    cS=xp.af(shq[y0,x0]); cL=xp.af(lwq[y0,x0])
+                sumL[sl]=sumL[sl]+xp.col(w)*cL; sumW[sl]=sumW[sl]+w
+                cnt[sl]=xp.u8add(cnt[sl],(w>0))
                 mej=w>bestW[sl]
-                bestW[sl]=_np.where(mej,w,bestW[sl])
-                bestS[sl]=_np.where(mej[:,None],cS,bestS[sl].astype(_np.float32)).astype(_np.float16)
-                bestL[sl]=_np.where(mej[:,None],cL,bestL[sl].astype(_np.float32)).astype(_np.float16)
+                bestW[sl]=xp.where(mej,w,bestW[sl])
+                bestS[sl]=xp.where(xp.col(mej),xp.f16(cS),bestS[sl])
+                bestL[sl]=xp.where(xp.col(mej),xp.f16(cL),bestL[sl])
+                c0=sl.stop
+            except RuntimeError as _oe:
+                if usa_gpu and "out of memory" in str(_oe).lower() and CH[0]>2_000_000:
+                    _th.cuda.empty_cache(); CH[0]//=2
+                    log("BAKE: GPU corta de memoria -> trozos a %.0fM" % (CH[0]/1e6))
+                else:
+                    raise
+        del Rq,tq,Cq,shq,lwq,dpq
     del deps; _gc.collect()
     if usa_gpu:
         sumL=sumL.cpu().numpy(); sumW=sumW.cpu().numpy(); bestW=bestW.cpu().numpy()
@@ -1365,20 +1394,32 @@ def obj_to_glb(objf, outglb):
                         _q=_c.split("/"); _tri.append((int(_q[0])-1, int(_q[1])-1))
                     _Fs[_cur].append(_tri)
         _V=_np.asarray(_Vs,_np.float64); _T=_np.asarray(_Ts,_np.float64)
-        _NT_=len(_T)+1
+        # soldar por (vertice, VALOR de UV redondeado) — NO por indice de vt:
+        # OpenMVS le da un indice de vt DISTINTO a cada esquina aunque el uv
+        # sea identico, asi que agrupar por indice no soldaba nada (leccion
+        # v8.9). Redondeamos el uv a ~1/8000 (un texel de 8192) y agrupamos
+        # por (indice de vertice, uv_x_red, uv_y_red): dos esquinas que
+        # comparten posicion Y uv se funden en un vertice.
+        _uvq=_np.round(_T*8000).astype(_np.int64)          # cuantizar uv
+        _uvmap={}                                          # uv_red -> id compacto
         _esc=trimesh.Scene(); _tot_v=0; _tot_c=0
         for _mtl,_caras in _Fs.items():
             if not _caras or _mtl not in mtl2tex: continue
             _fa=_np.asarray(_caras,_np.int64)              # (n,3,2) = (vi,ti)
-            _clave=_fa[:,:,0]*_NT_+_fa[:,:,1]
-            _uq,_inv=_np.unique(_clave.reshape(-1),return_inverse=True)
-            _vi=(_uq//_NT_); _ti=(_uq%_NT_)
-            _mesh=trimesh.Trimesh(vertices=_V[_vi], faces=_inv.reshape(-1,3),
+            _vig=_fa[:,:,0].reshape(-1)                    # indice de vertice
+            _tig=_fa[:,:,1].reshape(-1)                    # indice de vt
+            _uvk=_uvq[_tig]                                # (M,2) uv cuantizado
+            # clave = vertice * BIG + hash(uv cuantizado)
+            _BIGU=16000                                    # rango de uv cuantizado (0..8000)
+            _clave=_vig.astype(_np.int64)*(_BIGU*_BIGU) + _uvk[:,0]*_BIGU + _uvk[:,1]
+            _uq,_first,_inv=_np.unique(_clave,return_index=True,return_inverse=True)
+            _vsel=_vig[_first]; _tsel=_tig[_first]   # vertice y vt representativo por clave
+            _mesh=trimesh.Trimesh(vertices=_V[_vsel], faces=_inv.reshape(-1,3),
                                   process=False)
             _mesh.visual=trimesh.visual.TextureVisuals(
-                uv=_T[_ti], image=Image.open(texfiles[mtl2tex[_mtl]]))
+                uv=_T[_tsel], image=Image.open(texfiles[mtl2tex[_mtl]]))
             _esc.add_geometry(_mesh, geom_name=_mtl)
-            _tot_v+=len(_vi); _tot_c+=len(_fa)
+            _tot_v+=len(_vsel); _tot_c+=len(_fa)
         _esc.export(outglb)
         log("export SOLDADO: %d vertices para %d caras (antes: %d)"
             % (_tot_v,_tot_c,_tot_c*3))
@@ -2307,7 +2348,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'bake93' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{'bake94' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
