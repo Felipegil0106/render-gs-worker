@@ -640,37 +640,44 @@ def _patch_unlit_matte(glbpath):
 
 
 def tone_level(objf, texfiles, mtl2tex):
-    """NIVELADO DE TONO POR PARCHE (Opcion C).
+    """NIVELADO DE TONO POR PARCHE (Opcion C) — v8.9.
 
-    El escalon de tono NO esta entre los 6 materiales (medido: ya balanceados),
-    sino entre los miles de PARCHES (islas del atlas) dentro de cada material:
-    cada parche viene de una foto distinta. Aqui, en el atlas, SI conozco las
-    islas, asi que:
-      1) cada isla = un componente conexo de pixeles NO-relleno del atlas;
-      2) dos islas son VECINAS si comparten un vertice 3D de la malla;
+    v8.8 FALLO: identificaba los parches por pixeles conectados del atlas, pero
+    OpenMVS los empaca PEGADOS -> 69.319 parches se fundian en 8.300 manchones y
+    solo aparecian 189 costuras (de decenas de miles). El nivelado tocaba casi
+    nada y la metrica del log, medida solo sobre esas 189, enganaba.
+
+    v8.9: los parches se identifican por su GEOMETRIA UV (exacto): dos caras son
+    del mismo parche si comparten un indice de UV. Un vertice no puede estar en
+    dos parches (tendria dos UV), asi que la conectividad UV ES el parche.
+      1) parches = componentes conexas de caras que comparten indice UV;
+      2) dos parches son VECINOS si comparten un VERTICE 3D de la malla;
       3) por cada costura mido la diferencia de tono entre los dos lados;
-      4) resuelvo UNA ganancia por canal por isla (minimos cuadrados en log,
-         luz LINEAL, con prior hacia 1) para que las vecinas queden iguales;
-      5) aplico la ganancia a los pixeles de esa isla.
-    Como es UNA ganancia por isla, solo mueve el TONO: el detalle fino de la
-    textura queda intacto (verificado en el archivo real: detalle 13.2 -> 13.6).
-    Si algo falla, devuelve False y la textura queda como estaba.
+      4) resuelvo UNA ganancia por canal por parche (minimos cuadrados en log,
+         luz LINEAL, prior hacia 1) para que los vecinos queden iguales;
+      5) pinto: cada pixel del atlas toma la ganancia de su cara mas cercana.
+    Como es UNA ganancia por parche, solo mueve el TONO; el detalle fino queda
+    intacto. Si algo falla, devuelve False y la textura queda como estaba.
     """
     import numpy as _np
     from PIL import Image
-    from scipy import ndimage as _ndi
     import scipy.sparse as _sp
     import scipy.sparse.linalg as _spl
+    from scipy.sparse.csgraph import connected_components as _cc
+    from scipy.spatial import cKDTree as _KDT
     _t = time.time()
 
     def _s2l(c): return _np.where(c <= 0.04045, c/12.92, ((c+0.055)/1.055)**2.4)
     def _l2s(c):
         c = _np.clip(c, 0.0, 1.0)
         return _np.where(c <= 0.0031308, c*12.92, 1.055*(c**(1.0/2.4)) - 0.055)
+    def _fillmask(a):
+        return (_np.abs(a[:, :, 0].astype(_np.int16) - 128) < 6) & \
+               (_np.abs(a[:, :, 1].astype(_np.int16) - 128) < 6) & \
+               (_np.abs(a[:, :, 2].astype(_np.int16) - 128) < 6)
 
-    # ── leer el OBJ: vertices 3D, UVs, caras y a que textura va cada cara ──
-    Vn = []; Tn = []; F = []; FT = []; FM = []
-    cur = -1
+    # ── leer el OBJ ──
+    Vn = []; Tn = []; F = []; FT = []; FM = []; cur = -1
     with open(objf) as fh:
         for ln in fh:
             if ln.startswith("v "):
@@ -691,123 +698,128 @@ def tone_level(objf, texfiles, mtl2tex):
     F = _np.asarray(F, _np.int64); FT = _np.asarray(FT, _np.int64)
     FM = _np.asarray(FM, _np.int64); Tn = _np.asarray(Tn, _np.float64)
     NF = len(F)
-    if NF < 1000 or len(Tn) == 0 or (FT < 0).any():
-        log("TONO: el OBJ no trae UVs utilizables; dejo la textura como esta"); return False
+    if NF < 1000 or len(Tn) == 0 or (FT < 0).any() or (FM < 0).any():
+        log("TONO: el OBJ no trae UVs/materiales utilizables; textura sin tocar"); return False
 
-    # ── islas del atlas: componentes conexos de pixeles NO-relleno ──
-    labs = []; ncomp = []; imgs_lin = []
-    for tf in texfiles:
-        a = _np.asarray(Image.open(tf).convert("RGB"))
-        fill = (_np.abs(a[:, :, 0].astype(_np.int16) - 128) < 6) & \
-               (_np.abs(a[:, :, 1].astype(_np.int16) - 128) < 6) & \
-               (_np.abs(a[:, :, 2].astype(_np.int16) - 128) < 6)
-        lb, nc = _ndi.label(~fill)
-        labs.append(lb.astype(_np.int32)); ncomp.append(int(nc))
-        imgs_lin.append(_s2l(a.astype(_np.float32) / 255.0))
-    off = _np.cumsum([0] + [n + 1 for n in ncomp])       # id global de isla
-    NISL = int(off[-1])
+    # ── 1) PARCHES = componentes conexas por indice de UV ──
+    vt = FT.reshape(-1); ff = _np.repeat(_np.arange(NF), 3)
+    o = _np.argsort(vt, kind="stable"); vt = vt[o]; ff = ff[o]
+    st = _np.r_[0, _np.flatnonzero(_np.diff(vt)) + 1]
+    msk = _np.ones(len(ff), bool); msk[st] = False
+    pos = _np.flatnonzero(msk)
+    e0 = ff[pos]; e1 = ff[pos - 1]
+    NISL, isl = _cc(_sp.coo_matrix((_np.ones(len(e0), _np.int8), (e0, e1)),
+                                   shape=(NF, NF)), directed=False)
+    isl = isl.astype(_np.int64)
 
-    # ── a que isla y con que color cae cada cara (centro del triangulo) ──
+    # ── 2) color de cada cara en el atlas (una textura a la vez) ──
     cuv = Tn[FT].mean(axis=1)
-    isl = _np.full(NF, -1, _np.int64)
-    col = _np.zeros((NF, 3), _np.float32)
-    _flip_votes = [0, 0]
+    col = _np.zeros((NF, 3), _np.float64); okf = _np.zeros(NF, bool)
+    votes = [0, 0]
     for ti in range(len(texfiles)):
         m = FM == ti
         if not m.any(): continue
-        H, W = labs[ti].shape
+        a = _np.asarray(Image.open(texfiles[ti]).convert("RGB"))
+        H, W = a.shape[:2]; fm = _fillmask(a)
         px = _np.clip((cuv[m, 0] * (W - 1)).astype(_np.int64), 0, W - 1)
-        for _fl in (0, 1):                                # auto-detectar el sentido de V
-            vv = (1.0 - cuv[m, 1]) if _fl == 0 else cuv[m, 1]
+        for fl in (0, 1):
+            vv = (1.0 - cuv[m, 1]) if fl == 0 else cuv[m, 1]
             py = _np.clip((vv * (H - 1)).astype(_np.int64), 0, H - 1)
-            _flip_votes[_fl] += int((labs[ti][py, px] > 0).sum())
-    _flip = 0 if _flip_votes[0] >= _flip_votes[1] else 1
+            votes[fl] += int((~fm[py, px]).sum())
+    flip = 0 if votes[0] >= votes[1] else 1
     for ti in range(len(texfiles)):
         m = FM == ti
         if not m.any(): continue
-        H, W = labs[ti].shape
+        a = _np.asarray(Image.open(texfiles[ti]).convert("RGB"))
+        H, W = a.shape[:2]; fm = _fillmask(a)
         px = _np.clip((cuv[m, 0] * (W - 1)).astype(_np.int64), 0, W - 1)
-        vv = (1.0 - cuv[m, 1]) if _flip == 0 else cuv[m, 1]
+        vv = (1.0 - cuv[m, 1]) if flip == 0 else cuv[m, 1]
         py = _np.clip((vv * (H - 1)).astype(_np.int64), 0, H - 1)
-        lb = labs[ti][py, px]
-        isl[m] = _np.where(lb > 0, off[ti] + lb, -1)
-        col[m] = imgs_lin[ti][py, px]
-    ok = (isl >= 0) & (col.min(1) > 0.002)
-    if ok.sum() < 1000:
-        log("TONO: no pude ubicar las caras en el atlas; dejo la textura como esta"); return False
+        col[m] = _s2l(a[py, px].astype(_np.float64) / 255.0)
+        okf[m] = ~fm[py, px]
+    okf &= col.min(1) > 0.002
+    if okf.sum() < 1000:
+        log("TONO: no pude leer el color de las caras; textura sin tocar"); return False
 
-    # ── costuras: vertices 3D donde se tocan DOS islas distintas ──
+    # ── 3) costuras: vertices 3D donde se tocan DOS parches ──
     vi = F.reshape(-1); fi = _np.repeat(_np.arange(NF), 3)
-    good = ok[fi]
-    vi = vi[good]; fi = fi[good]
+    g = okf[fi]; vi = vi[g]; fi = fi[g]
     o = _np.argsort(vi, kind="stable"); vi = vi[o]; fi = fi[o]
     isf = isl[fi]
-    starts = _np.r_[0, _np.flatnonzero(_np.diff(vi)) + 1]
-    mn = _np.minimum.reduceat(isf, starts); mx = _np.maximum.reduceat(isf, starts)
-    seamg = _np.flatnonzero(mn != mx)
-    ends = _np.r_[starts[1:], len(vi)]
+    st = _np.r_[0, _np.flatnonzero(_np.diff(vi)) + 1]
+    en = _np.r_[st[1:], len(vi)]
+    mn = _np.minimum.reduceat(isf, st); mx = _np.maximum.reduceat(isf, st)
+    seam = _np.flatnonzero(mn != mx)
     lg = _np.log(_np.maximum(col, 1e-4))
-    acc = {}
-    for gi in seamg:
-        a, b = starts[gi], ends[gi]
-        ii = isf[a:b]; ff = fi[a:b]
+    acc = {}; tocadas = set()
+    for gi in seam:
+        s0, s1 = st[gi], en[gi]
+        ii = isf[s0:s1]; fj = fi[s0:s1]
         uq = _np.unique(ii)
         if len(uq) < 2: continue
-        med = {int(u): lg[ff[ii == u]].mean(0) for u in uq}
+        med = {}
+        for u in uq:
+            sel = fj[ii == u]; med[int(u)] = lg[sel].mean(0); tocadas.update(sel.tolist())
         for x in range(len(uq)):
             for y in range(x + 1, len(uq)):
                 A, B = int(uq[x]), int(uq[y])
                 d = _np.clip(med[B] - med[A], -0.7, 0.7)
-                k = (A, B)
+                k = (A, B) if A < B else (B, A)
+                if A > B: d = -d
                 if k in acc: acc[k][0] += d; acc[k][1] += 1
                 else: acc[k] = [d.copy(), 1]
     pairs = [(k, v) for k, v in acc.items() if v[1] >= TONE_MINF]
-    if len(pairs) < 50:
-        log("TONO: solo %d costuras utiles; dejo la textura como esta" % len(pairs)); return False
+    cover = 100.0 * len(tocadas) / NF
+    log("TONO: %d parches (OpenMVS empaco los suyos), %d costuras, tocan el %.0f%% de las caras"
+        % (NISL, len(pairs), cover))
+    if len(pairs) < 500 or cover < 5.0:
+        log("TONO: muy pocas costuras utiles -> NO nivelo (textura sin tocar)"); return False
 
-    # ── resolver UNA ganancia por canal por isla (minimos cuadrados) ──
+    # ── 4) una ganancia por canal por parche ──
     NP = len(pairs)
     ri = _np.repeat(_np.arange(NP), 2)
     ci = _np.empty(NP * 2, _np.int64); dv = _np.empty(NP * 2, _np.float64)
     w = _np.empty(NP); rhs = _np.empty((NP, 3))
     for i, ((A, B), (sd, n)) in enumerate(pairs):
         ww = min(n, 60) ** 0.5
-        ci[2*i] = A; ci[2*i+1] = B
-        dv[2*i] = ww; dv[2*i+1] = -ww
+        ci[2*i] = A; ci[2*i+1] = B; dv[2*i] = ww; dv[2*i+1] = -ww
         w[i] = ww; rhs[i] = sd / n
-    lam = 0.10                                            # prior: ganancia ~ 1
-    M = _sp.vstack([
-        _sp.coo_matrix((dv, (ri, ci)), shape=(NP, NISL)),
-        _sp.identity(NISL, format="coo") * lam]).tocsr()
+    lam = 0.05
+    M = _sp.vstack([_sp.coo_matrix((dv, (ri, ci)), shape=(NP, NISL)),
+                    _sp.identity(NISL, format="coo") * lam]).tocsr()
     G = _np.ones((NISL, 3))
     for c in range(3):
         b = _np.r_[rhs[:, c] * w, _np.zeros(NISL)]
-        x = _spl.lsqr(M, b, atol=1e-6, btol=1e-6, iter_lim=400)[0]
-        G[:, c] = _np.exp(x)
+        G[:, c] = _np.exp(_spl.lsqr(M, b, atol=1e-7, btol=1e-7, iter_lim=800)[0])
     lo, hi = 1.0 / TONE_CLAMP, TONE_CLAMP
     nclamp = int(((G < lo) | (G > hi)).sum()); G = _np.clip(G, lo, hi)
-
-    # ── cuanto baja el escalon (medido sobre las mismas costuras) ──
-    dif0 = _np.array([abs(float((sd / n).mean())) for (_k, (sd, n)) in pairs])
     lgG = _np.log(G).mean(1)
-    dif1 = _np.array([abs(float((sd / n).mean()) - (lgG[A] - lgG[B]))
-                      for ((A, B), (sd, n)) in pairs])
-    red = 100.0 * (1.0 - (dif1.mean() / max(dif0.mean(), 1e-9)))
+    d0 = _np.array([abs(float((sd/n).mean())) for (_k, (sd, n)) in pairs])
+    d1 = _np.array([abs(float((sd/n).mean()) - (lgG[A]-lgG[B])) for ((A, B), (sd, n)) in pairs])
+    red = 100.0 * (1.0 - d1.mean()/max(d0.mean(), 1e-9))
 
-    # ── aplicar la ganancia a los pixeles de cada isla y guardar ──
+    # ── 5) pintar: cada pixel toma la ganancia de su cara mas cercana ──
     for ti, tf in enumerate(texfiles):
-        g = _np.ones((ncomp[ti] + 1, 3))
-        g[1:] = G[off[ti] + 1: off[ti] + ncomp[ti] + 1]
-        out = _l2s(imgs_lin[ti] * g[labs[ti]])
-        out = (_np.clip(out, 0, 1) * 255.0 + 0.5).astype(_np.uint8)
+        m = _np.flatnonzero(FM == ti)
+        if len(m) == 0: continue
+        a = _np.asarray(Image.open(tf).convert("RGB"))
+        H, W = a.shape[:2]; fm = _fillmask(a)
+        ys, xs = _np.nonzero(~fm)
+        if len(ys) == 0: continue
+        cx = cuv[m, 0] * (W - 1)
+        cy = ((1.0 - cuv[m, 1]) if flip == 0 else cuv[m, 1]) * (H - 1)
+        tree = _KDT(_np.c_[cy, cx])
+        try: _, nn = tree.query(_np.c_[ys, xs], workers=-1)
+        except TypeError: _, nn = tree.query(_np.c_[ys, xs])
+        gpx = G[isl[m[nn]]]
+        lin = _s2l(a.astype(_np.float64) / 255.0)
+        lin[ys, xs] *= gpx
+        out = (_np.clip(_l2s(lin), 0, 1) * 255.0 + 0.5).astype(_np.uint8)
         im = Image.fromarray(out)
         if tf.lower().endswith((".jpg", ".jpeg")): im.save(tf, quality=95)
         else: im.save(tf)
-    log("TONO: %d islas, %d costuras -> nivelado por parche en %.1f min"
-        % (NISL, NP, (time.time() - _t) / 60.0))
-    log("TONO: escalon medio en costuras BAJO %.0f%% | ganancias %.2f-%.2f "
-        "(%d en tope; solo mueve el tono, el detalle queda intacto)"
-        % (red, float(G.min()), float(G.max()), nclamp))
+    log("TONO: escalon medio en costuras BAJO %.0f%% | ganancias %.2f-%.2f (%d en tope) "
+        "en %.1f min" % (red, float(G.min()), float(G.max()), nclamp, (time.time()-_t)/60.0))
     return True
 
 
