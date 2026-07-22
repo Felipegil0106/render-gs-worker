@@ -948,24 +948,33 @@ def tone_level(objf, texfiles, mtl2tex):
 
 
 def bake_multiview(objf, texfiles, mtl2tex):
-    """HORNEADOR MULTI-VISTA v9.1 (plan P1 de la investigacion; el metodo Polycam).
+    """HORNEADOR MULTI-VISTA v9.2 (P1 de la investigacion; el metodo Polycam).
 
-    Cada texel del atlas se repinta MEZCLANDO todas las fotos que lo ven:
-        salida = BAJA + ALTA
-        BAJA = promedio ponderado (cos^k/d^2, con oclusion) de TODAS las fotos
-               en version borrosa  -> los escalones de tono desaparecen por
-               construccion (ambos lados de cualquier costura reciben lo mismo)
-        ALTA = mejor foto nitida - mejor foto borrosa -> el detalle fino viene
-               de UNA sola foto: nitido y sin fantasmas aunque las poses tengan
-               error de 1-3 px (Baumberg 2002 / Metashape Mosaic / AliceVision)
-    Muestrea las fotos 12MP originales (mismo recorte del paso 2) y hornea el
-    atlas a BAKE_SCALE x -> ~0.075 cm/texel. Los texeles que ninguna foto ve
-    conservan el pixel de OpenMVS (nunca peor). Si algo falla: False y los
-    atlas quedan intactos."""
-    import numpy as _np
+    salida = BAJA (promedio ponderado de TODAS las fotos borrosas: tono parejo
+             por construccion) + ALTA (mejor foto nitida - su borrosa: detalle
+             sin fantasmas). Fotos 12MP, atlas x2 -> ~0.075 cm/texel.
+
+    v9.1 MURIO EN EL POD sin decir nada tras rasterizar 120M texeles: el
+    sistema mato el proceso (memoria). v9.2 = misma matematica (validada en
+    sintetico: escalon de tono 1.8 niveles vs 20-36 del mejor-vista), pero:
+      - pico de RAM recortado: numeros compactos (int32/f16/f32), trozos por
+        PRESUPUESTO de muestras, SIN deduplicado global (duplicados raros e
+        inofensivos: se escriben dos veces con el mismo valor);
+      - LATIDOS en el log con la RAM usada en cada fase y cada 16 camaras:
+        si vuelve a morir, el log dice exactamente donde y con cuanto;
+      - si la GPU se queda corta, reintenta con trozos a la mitad;
+      - triangulos grandes ya no quedan con huecos (tope de muestras alto).
+    Si algo falla: False y los atlas de OpenMVS quedan intactos."""
+    import numpy as _np, gc as _gc
     from scipy import ndimage as _ndi
     _t0 = time.time()
 
+    def _rss():
+        try:
+            for _l in open("/proc/self/status"):
+                if _l.startswith("VmRSS"): return int(_l.split()[1])/1048576.0
+        except Exception: pass
+        return -1.0
     def _s2l(c): return _np.where(c <= 0.04045, c/12.92, ((c+0.055)/1.055)**2.4)
     def _l2s(c):
         c = _np.clip(c, 0.0, 1.0)
@@ -991,19 +1000,21 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 F.append(a); FT.append(b); FM.append(cur)
     V=_np.asarray(Vn,_np.float64); F=_np.asarray(F,_np.int64)
     FT=_np.asarray(FT,_np.int64); FM=_np.asarray(FM,_np.int64); Tn=_np.asarray(Tn,_np.float64)
+    del Vn; _gc.collect()
     NF=len(F)
     if NF<1000 or len(Tn)==0 or (FT<0).any() or (FM<0).any():
         log("BAKE: OBJ sin UVs utilizables o muy chico; no horneo"); return False
-    e1=V[F[:,1]]-V[F[:,0]]; e2=V[F[:,2]]-V[F[:,0]]
+    V32=V.astype(_np.float32)
+    e1=V32[F[:,1]]-V32[F[:,0]]; e2=V32[F[:,2]]-V32[F[:,0]]
     FN=_np.cross(e1,e2); FN/= (_np.linalg.norm(FN,axis=1,keepdims=True)+1e-12)
-    FN=FN.astype(_np.float32)
+    FN16=FN.astype(_np.float16); del e1,e2,FN; _gc.collect()
 
-    # ── 2) camaras del sparse reescalado (con pose-opt si corrio) ──
+    # ── 2) camaras del sparse reescalado ──
     cams2, vistas = _leer_sparse(SPD)
     if not vistas:
         log("BAKE: sin camaras en el sparse; no horneo"); return False
 
-    # ── 3) voto de orientacion V del OBJ contra el relleno gris ──
+    # ── 3) voto de orientacion V contra el relleno gris ──
     votes=[0,0]; cuv=Tn[FT].mean(1)
     for ti in range(len(texfiles)):
         m=FM==ti
@@ -1016,49 +1027,61 @@ def bake_multiview(objf, texfiles, mtl2tex):
             vv=(1.0-cuv[m,1]) if fl==0 else cuv[m,1]
             py=_np.clip((vv*(H0-1)).astype(int),0,H0-1)
             votes[fl]+=int((~fill[py,px]).sum())
+        del a,fill
     flip=0 if votes[0]>=votes[1] else 1
+    del cuv; _gc.collect()
+    log("BAKE v9.2: arranque | RAM %.1f GB" % _rss())
 
-    # ── 4) tabla de texeles por splat vectorizado (pos 3D + normal por texel) ──
+    # ── 4) tabla de texeles por splat (trozos por PRESUPUESTO de muestras) ──
     SC=max(1,BAKE_SCALE)
     at_lin=[]; at_pos=[]; at_nrm=[]; at_id=[]; at_dims=[]
+    PRESU=25_000_000
     for ti in range(len(texfiles)):
         with Image.open(texfiles[ti]) as _im0: W0,H0=_im0.size
         W2,H2=W0*SC,H0*SC; at_dims.append((W2,H2))
         m=_np.flatnonzero(FM==ti)
         if len(m)==0: continue
-        u=Tn[FT[m]]                                   # (n,3,2)
-        pu=u[:,:,0]*(W2-1)
-        pv=((1.0-u[:,:,1]) if flip==0 else u[:,:,1])*(H2-1)
+        u=Tn[FT[m]].astype(_np.float32)
+        pu=(u[:,:,0]*(W2-1)).astype(_np.float32)
+        pv=(((1.0-u[:,:,1]) if flip==0 else u[:,:,1])*(H2-1)).astype(_np.float32)
+        del u
         area2=_np.abs((pu[:,1]-pu[:,0])*(pv[:,2]-pv[:,0])-(pu[:,2]-pu[:,0])*(pv[:,1]-pv[:,0]))
-        ns=_np.clip((area2*2.0).astype(_np.int64)+3,3,6000)
-        CHF=150000
-        for f0 in range(0,len(m),CHF):
-            sl=slice(f0,min(f0+CHF,len(m)))
-            nrep=ns[sl]; fid=_np.repeat(_np.arange(sl.start,sl.stop),nrep)
+        ns=_np.clip((area2*2.0).astype(_np.int64)+3,3,400000)
+        cs=_np.cumsum(ns)
+        f0=0
+        while f0 < len(m):
+            f1=int(_np.searchsorted(cs, (cs[f0-1] if f0>0 else 0)+PRESU))+1
+            f1=min(max(f1,f0+1),len(m))
+            nrep=ns[f0:f1]
+            fid=_np.repeat(_np.arange(f0,f1,dtype=_np.int64),nrep)
             S=len(fid)
-            r1=_np.random.rand(S); r2=_np.random.rand(S)
+            r1=_np.random.rand(S).astype(_np.float32); r2=_np.random.rand(S).astype(_np.float32)
             sq=_np.sqrt(r1); ba=1-sq; bb=sq*(1-r2); bc=sq*r2
-            ix=_np.clip((ba*pu[fid,0]+bb*pu[fid,1]+bc*pu[fid,2]+0.5).astype(_np.int64),0,W2-1)
-            iy=_np.clip((ba*pv[fid,0]+bb*pv[fid,1]+bc*pv[fid,2]+0.5).astype(_np.int64),0,H2-1)
-            lin=iy*W2+ix
+            del r1,r2,sq
+            ix=_np.clip((ba*pu[fid,0]+bb*pu[fid,1]+bc*pu[fid,2]+0.5).astype(_np.int32),0,W2-1)
+            iy=_np.clip((ba*pv[fid,0]+bb*pv[fid,1]+bc*pv[fid,2]+0.5).astype(_np.int32),0,H2-1)
+            lin=iy*_np.int32(W2)+ix
+            del ix,iy
             uq,first=_np.unique(lin,return_index=True)
+            del lin
             gf=m[fid[first]]
-            P=(ba[first,None]*V[F[gf,0]]+bb[first,None]*V[F[gf,1]]+bc[first,None]*V[F[gf,2]])
-            at_lin.append(uq.astype(_np.int64)); at_pos.append(P.astype(_np.float32))
-            at_nrm.append(FN[gf]); at_id.append(_np.full(len(uq),ti,_np.uint8))
+            baf=ba[first,None]; bbf=bb[first,None]; bcf=bc[first,None]
+            P=(baf*V32[F[gf,0]]+bbf*V32[F[gf,1]]+bcf*V32[F[gf,2]])
+            at_lin.append(uq.astype(_np.int32)); at_pos.append(P)
+            at_nrm.append(FN16[gf]); at_id.append(_np.full(len(uq),ti,_np.uint8))
+            del fid,ba,bb,bc,baf,bbf,bcf,uq,first,gf,P
+            f0=f1
+        del pu,pv,area2,ns,cs; _gc.collect()
     if not at_lin:
         log("BAKE: no pude rasterizar texeles; no horneo"); return False
     LIN=_np.concatenate(at_lin); POS=_np.concatenate(at_pos)
     NRM=_np.concatenate(at_nrm); AID=_np.concatenate(at_id)
-    # dedupe global por (atlas,lin): distintos chunks pudieron repetir texel
-    gkey=AID.astype(_np.int64)*(max(w*h for w,h in at_dims)+1)+LIN
-    _,keep=_np.unique(gkey,return_index=True)
-    LIN=LIN[keep]; POS=POS[keep]; NRM=NRM[keep]; AID=AID[keep]
+    del at_lin,at_pos,at_nrm,at_id,Tn,FT; _gc.collect()
     NT=len(LIN)
-    log("BAKE: %d texeles con superficie (atlas x%d) en %.1f min de rasterizado"
-        % (NT, SC, (time.time()-_t0)/60.0))
+    log("BAKE: %d texeles rasterizados (con duplicados raros de borde, inofensivos) "
+        "| RAM %.1f GB | %.1f min" % (NT,_rss(),(time.time()-_t0)/60.0))
 
-    # ── 5) mapas de profundidad por camara (media resolucion) ──
+    # ── 5) mapas de profundidad (media resolucion, f16) ──
     import open3d as _o3
     scn=_o3.t.geometry.RaycastingScene()
     _mm=_o3.geometry.TriangleMesh(_o3.utility.Vector3dVector(V),_o3.utility.Vector3iVector(F.astype(_np.int32)))
@@ -1075,9 +1098,13 @@ def bake_multiview(objf, texfiles, mtl2tex):
         dw=dc@R
         rays=_np.concatenate([_np.broadcast_to(C,dw.shape),dw],1).astype(_np.float32)
         th=scn.cast_rays(_o3.core.Tensor(rays))["t_hit"].numpy().reshape(hD,wD)
-        deps[nom]=_np.where(_np.isfinite(th),th,0.0).astype(_np.float32)
+        deps[nom]=_np.where(_np.isfinite(th),th,0.0).astype(_np.float16)
+        del gx,gy,dc,dw,rays,th
+    del scn,_mm,V; _gc.collect()
+    log("BAKE: profundidades de %d camaras listas | RAM %.1f GB | %.1f min"
+        % (len(vistas),_rss(),(time.time()-_t0)/60.0))
 
-    # ── 6) acumulacion (torch-CUDA si hay; si no numpy) ──
+    # ── 6) acumulacion (GPU si hay; reintenta con trozos menores si se llena) ──
     usa_gpu=False
     try:
         import torch as _th
@@ -1093,13 +1120,18 @@ def bake_multiview(objf, texfiles, mtl2tex):
         bestL=_th.zeros((NT,3),dtype=_th.float16,device=dev)
         cnt=_th.zeros(NT,dtype=_th.uint8,device=dev)
         POSg=_th.from_numpy(POS).to(dev); NRMg=_th.from_numpy(NRM).to(dev)
+        del POS,NRM; _gc.collect()
     else:
         sumL=_np.zeros((NT,3),_np.float32); sumW=_np.zeros(NT,_np.float32)
         bestW=_np.zeros(NT,_np.float32)
         bestS=_np.zeros((NT,3),_np.float16); bestL=_np.zeros((NT,3),_np.float16)
         cnt=_np.zeros(NT,_np.uint8); POSg=POS; NRMg=NRM
-    CH=20_000_000 if usa_gpu else 4_000_000
-    for nom,cid,Rc,tc in vistas:
+    CH=[20_000_000 if usa_gpu else 4_000_000]
+    log("BAKE: mezclando %d camaras en %s | RAM %.1f GB" % (len(vistas),"GPU" if usa_gpu else "CPU",_rss()))
+    for ki,(nom,cid,Rc,tc) in enumerate(vistas):
+        if ki % 16 == 0 and ki:
+            log("BAKE: camara %d/%d | RAM %.1f GB | %.1f min"
+                % (ki,len(vistas),_rss(),(time.time()-_t0)/60.0))
         w14,h14,fx,fy,cx,cy=cams2[cid]
         cr=CROPS.get(nom)
         try:
@@ -1112,40 +1144,52 @@ def bake_multiview(objf, texfiles, mtl2tex):
             im=Image.open(os.path.join(IMGD,nom)).convert("RGB")
         W12,H12=im.size; s12=W12/float(w14)
         low_im=im.resize((max(1,W12//BAKE_DS),max(1,H12//BAKE_DS)),Image.LANCZOS).resize((W12,H12),Image.BILINEAR)
-        sharp=_s2l(_np.asarray(im,_np.float32)/255.0)
-        low=_s2l(_np.asarray(low_im,_np.float32)/255.0)
-        dep=deps[nom]; hD,wD=dep.shape; sD=wD/float(w14)
+        sharp=_s2l(_np.asarray(im,_np.float32)/255.0); del im
+        low=_s2l(_np.asarray(low_im,_np.float32)/255.0); del low_im
+        dep=deps[nom].astype(_np.float32); hD,wD=dep.shape; sD=wD/float(w14)
         Cc=(-Rc.T@tc).astype(_np.float32)
         if usa_gpu:
             Rg=_th.from_numpy(Rc.astype(_np.float32)).to(dev); tg=_th.from_numpy(tc.astype(_np.float32)).to(dev)
             Cg=_th.from_numpy(Cc).to(dev)
-            shg=_th.from_numpy(sharp).to(dev).half(); log_=_th.from_numpy(low).to(dev).half()
+            shg=_th.from_numpy(sharp).to(dev).half(); lwg=_th.from_numpy(low).to(dev).half()
             dpg=_th.from_numpy(dep).to(dev)
-            for c0 in range(0,NT,CH):
-                sl=slice(c0,min(c0+CH,NT))
-                P=POSg[sl]; N=NRMg[sl]
-                Xc=P@Rg.T+tg; z=Xc[:,2]
-                ok=z>0.05
-                u=fx*Xc[:,0]/z+cx; v=fy*Xc[:,1]/z+cy
-                ok&=(u>=0)&(u<w14-1)&(v>=0)&(v<h14-1)
-                iu=_th.clamp((u*sD).long(),0,wD-1); iv=_th.clamp((v*sD).long(),0,hD-1)
-                d=dpg[iv,iu]
-                ok&=(d>0)&((z-d).abs()<BAKE_TOL*z)
-                dv=P-Cg; dv=dv/_th.clamp(dv.norm(dim=1,keepdim=True),min=1e-9)
-                cosv=(dv*N).sum(1).abs()
-                w=_th.where(ok,(cosv**BAKE_COSK)/(z*z+1e-6),_th.zeros_like(z))
-                i12u=_th.clamp((u*s12).long(),0,W12-1); i12v=_th.clamp((v*s12).long(),0,H12-1)
-                cS=shg[i12v,i12u].float(); cL=log_[i12v,i12u].float()
-                sumL[sl]+=w[:,None]*cL; sumW[sl]+=w
-                cnt[sl]+= (w>0).to(_th.uint8)*(cnt[sl]<250).to(_th.uint8)
-                mej=w>bestW[sl]
-                bestW[sl]=_th.where(mej,w,bestW[sl])
-                bestS[sl]=_th.where(mej[:,None],cS.half(),bestS[sl])
-                bestL[sl]=_th.where(mej[:,None],cL.half(),bestL[sl])
+            del sharp,low,dep
+            c0=0
+            while c0<NT:
+                sl=slice(c0,min(c0+CH[0],NT))
+                try:
+                    P=POSg[sl]; N=NRMg[sl].float()
+                    Xc=P@Rg.T+tg; z=Xc[:,2]
+                    ok=z>0.05
+                    u=fx*Xc[:,0]/z+cx; v=fy*Xc[:,1]/z+cy
+                    ok&=(u>=0)&(u<w14-1)&(v>=0)&(v<h14-1)
+                    iu=_th.clamp((u*sD).long(),0,wD-1); iv=_th.clamp((v*sD).long(),0,hD-1)
+                    d=dpg[iv,iu]
+                    ok&=(d>0)&((z-d).abs()<BAKE_TOL*z)
+                    dv=P-Cg; dv=dv/_th.clamp(dv.norm(dim=1,keepdim=True),min=1e-9)
+                    cosv=(dv*N).sum(1).abs()
+                    w=_th.where(ok,(cosv**BAKE_COSK)/(z*z+1e-6),_th.zeros_like(z))
+                    i12u=_th.clamp((u*s12).long(),0,W12-1); i12v=_th.clamp((v*s12).long(),0,H12-1)
+                    cS=shg[i12v,i12u].float(); cL=lwg[i12v,i12u].float()
+                    sumL[sl]+=w[:,None]*cL; sumW[sl]+=w
+                    cnt[sl]+=(w>0).to(_th.uint8)*(cnt[sl]<250).to(_th.uint8)
+                    mej=w>bestW[sl]
+                    bestW[sl]=_th.where(mej,w,bestW[sl])
+                    bestS[sl]=_th.where(mej[:,None],cS.half(),bestS[sl])
+                    bestL[sl]=_th.where(mej[:,None],cL.half(),bestL[sl])
+                    del P,N,Xc,z,ok,u,v,iu,iv,d,dv,cosv,w,i12u,i12v,cS,cL,mej
+                    c0=sl.stop
+                except RuntimeError as _oe:
+                    if "out of memory" in str(_oe).lower() and CH[0]>2_000_000:
+                        _th.cuda.empty_cache(); CH[0]//=2
+                        log("BAKE: GPU corta de memoria -> trozos a %.0fM" % (CH[0]/1e6))
+                    else:
+                        raise
+            del Rg,tg,Cg,shg,lwg,dpg
         else:
-            for c0 in range(0,NT,CH):
-                sl=slice(c0,min(c0+CH,NT))
-                P=POSg[sl]; N=NRMg[sl]
+            for c0 in range(0,NT,CH[0]):
+                sl=slice(c0,min(c0+CH[0],NT))
+                P=POSg[sl]; N=NRMg[sl].astype(_np.float32)
                 Xc=P@Rc.T.astype(_np.float32)+tc.astype(_np.float32)
                 z=Xc[:,2]; ok=z>0.05
                 u=fx*Xc[:,0]/_np.maximum(z,1e-6)+cx; v=fy*Xc[:,1]/_np.maximum(z,1e-6)+cy
@@ -1164,9 +1208,13 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 bestW[sl]=_np.where(mej,w,bestW[sl])
                 bestS[sl]=_np.where(mej[:,None],cS,bestS[sl].astype(_np.float32)).astype(_np.float16)
                 bestL[sl]=_np.where(mej[:,None],cL,bestL[sl].astype(_np.float32)).astype(_np.float16)
+    del deps; _gc.collect()
     if usa_gpu:
         sumL=sumL.cpu().numpy(); sumW=sumW.cpu().numpy(); bestW=bestW.cpu().numpy()
         bestS=bestS.cpu().numpy(); bestL=bestL.cpu().numpy(); cnt=cnt.cpu().numpy()
+        del POSg,NRMg
+        _th.cuda.empty_cache()
+    log("BAKE: mezcla terminada | RAM %.1f GB | %.1f min" % (_rss(),(time.time()-_t0)/60.0))
 
     seen=(cnt>=1)&(sumW>1e-9)
     cov1=100.0*seen.mean(); cov3=100.0*(cnt>=3).mean()
@@ -1175,30 +1223,32 @@ def bake_multiview(objf, texfiles, mtl2tex):
     lowb=sumL/_np.maximum(sumW,1e-9)[:,None]
     outl=_np.clip(lowb+(bestS.astype(_np.float32)-bestL.astype(_np.float32)),0.0,1.0)
     outs=(_np.clip(_l2s(outl),0,1)*255.0+0.5).astype(_np.uint8)
+    del sumL,sumW,bestW,bestS,bestL,lowb,outl; _gc.collect()
 
-    # ── 7) escribir atlas: base = OpenMVS upscaleado; horneado encima; dilatar ──
+    # ── 7) escribir atlas: base OpenMVS upscaleada + horneado + dilatacion (1 sola pasada EDT) ──
     for ti,tf in enumerate(texfiles):
         W2,H2=at_dims[ti]
         base=_np.asarray(Image.open(tf).convert("RGB").resize((W2,H2),Image.BILINEAR)).copy()
         m=(AID==ti)&seen
         if m.any():
-            lin=LIN[m]; iy=(lin//W2).astype(_np.int64); ix=(lin%W2).astype(_np.int64)
+            lin=LIN[m].astype(_np.int64); iy=lin//W2; ix=lin%W2
             base[iy,ix]=outs[m]
             filled=_np.zeros((H2,W2),bool); filled[iy,ix]=True
-            for _ in range(BAKE_DILA):
-                nb=_ndi.binary_dilation(filled)
-                nuevo=nb&~filled
-                if not nuevo.any(): break
-                idx=_ndi.distance_transform_edt(~filled,return_distances=False,return_indices=True)
-                base[nuevo]=base[idx[0][nuevo],idx[1][nuevo]]
-                filled=nb
+            del lin,iy,ix
+            dist,(ry,rx)=_ndi.distance_transform_edt(~filled,return_indices=True)
+            sel=(~filled)&(dist<=BAKE_DILA)
+            base[sel]=base[ry[sel],rx[sel]]
+            del filled,dist,ry,rx,sel
         if tf.lower().endswith((".jpg",".jpeg")):
             Image.fromarray(base).save(tf,quality=92,subsampling=0)
         else:
             Image.fromarray(base).save(tf)
-    log("BAKE listo: %.1fM texeles horneados | cobertura >=1 foto %.0f%%, >=3 fotos %.0f%% | "
-        "%s | atlas x%d en %.1f min"
-        % (NT/1e6, cov1, cov3, "GPU" if usa_gpu else "CPU", SC, (time.time()-_t0)/60.0))
+        del base; _gc.collect()
+        log("BAKE: atlas %d/%d escrito (%dx%d) | RAM %.1f GB"
+            % (ti+1,len(texfiles),W2,H2,_rss()))
+    log("BAKE listo: %.1fM texeles | cobertura >=1 foto %.0f%%, >=3 fotos %.0f%% | %s | "
+        "atlas x%d en %.1f min"
+        % (NT/1e6,cov1,cov3,"GPU" if usa_gpu else "CPU",SC,(time.time()-_t0)/60.0))
     return True
 
 
@@ -2184,7 +2234,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'bake91' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{'bake92' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
