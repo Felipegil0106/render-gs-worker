@@ -302,7 +302,7 @@ OUTGLB = sys.argv[4]
 # Perillas (defaults probados en produccion):
 TEX_MESH_TRIS = int(os.environ.get("TEX_MESH_TRIS", "1100000"))  # caras del glb final
 IMG_MAX       = int(os.environ.get("OMVS_IMG_MAX", "2000"))      # lado mayor de las fotos que ve OpenMVS
-MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "4096"))      # tam. de textura (agrupa mejor -> menos archivos)
+MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "8192"))      # v9.3: empaque a 8192 NATIVO -> 2-3 atlas en vez de 11, mucho menos gutter desperdiciado y archivo mas liviano; cfg2 cae a 4096 (lo probado) si fallara
 RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso
 OUTLIER       = os.environ.get("OMVS_OUTLIER", "0.06")           # descarta fotos inconsistentes
 SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "0.02")            # hacia 0 = parches GRANDES (investigacion: la escala va AL REVES; 1=mas fragmentado)
@@ -318,10 +318,12 @@ EXPO_SAMPLES  = int(os.environ.get("OMVS_EXPO_SAMPLES", "40000"))# puntos de la 
 OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno
 # ── HORNEADOR MULTI-VISTA (v9.1; plan P1 de la investigacion, estilo Polycam) ──
 BAKE          = os.environ.get("OMVS_BAKE", "1") == "1"          # repinta cada texel MEZCLANDO todas las fotos que lo ven
-BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "2"))      # atlas x2 (4096->8192): ~0.075 cm/texel (UV viejo 0.15, vertice 0.84)
+BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "1"))      # v9.3: con MAX_TEX=8192 nativo la densidad ya es ~0.075 cm/texel SIN upscalear (menos texeles crudos, menos RAM/tiempo). Si bajas MAX_TEX a 4096, sube esto a 2
 BAKE_DS       = int(os.environ.get("OMVS_BAKE_DS", "8"))         # banda baja = foto reducida /8 y devuelta (multiBandDownscale de AliceVision)
 BAKE_COSK     = float(os.environ.get("OMVS_BAKE_COSK", "2"))     # peso angular cos^k (k=2 recomendado por la investigacion)
-BAKE_TOL      = float(os.environ.get("OMVS_BAKE_TOL", "0.006"))  # tolerancia de visibilidad = 0.6% de la profundidad
+BAKE_TOL      = float(os.environ.get("OMVS_BAKE_TOL", "0.010"))  # tolerancia de visibilidad = 1% de la profundidad (0.6% rechazaba camaras buenas donde la malla erra 1-2 cm -> cobertura 70% y parches leves)
+BAKE_BILIN    = os.environ.get("OMVS_BAKE_BILIN", "1") == "1"    # muestreo BILINEAL de las fotos (bordes de letras suaves, sin dientes)
+BAKE_JQ       = int(os.environ.get("OMVS_BAKE_JQ", "85"))        # JPEG q85 + croma 4:2:0 (como Polycam): ~3x mas liviano que q92 4:4:4
 BAKE_DILA     = int(os.environ.get("OMVS_BAKE_DILA", "6"))       # dilatacion del borde horneado (px) para mipmaps
 POSE_OPT      = os.environ.get("OMVS_POSEOPT", "0") == "1"       # Zhou-Koltun rigido (P2): OFF hasta medir su costo en el pod
 POSE_ITERS    = int(os.environ.get("OMVS_POSE_ITERS", "60"))     # iteraciones si se enciende
@@ -1169,8 +1171,19 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     dv=P-Cg; dv=dv/_th.clamp(dv.norm(dim=1,keepdim=True),min=1e-9)
                     cosv=(dv*N).sum(1).abs()
                     w=_th.where(ok,(cosv**BAKE_COSK)/(z*z+1e-6),_th.zeros_like(z))
-                    i12u=_th.clamp((u*s12).long(),0,W12-1); i12v=_th.clamp((v*s12).long(),0,H12-1)
-                    cS=shg[i12v,i12u].float(); cL=lwg[i12v,i12u].float()
+                    fu=_th.clamp(u*s12,0.0,W12-1.001); fv=_th.clamp(v*s12,0.0,H12-1.001)
+                    if BAKE_BILIN:
+                        x0=fu.long(); y0=fv.long(); ax=(fu-x0).unsqueeze(1); ay=(fv-y0).unsqueeze(1)
+                        x1=_th.clamp(x0+1,max=W12-1); y1=_th.clamp(y0+1,max=H12-1)
+                        cS=((shg[y0,x0].float()*(1-ax)+shg[y0,x1].float()*ax)*(1-ay)
+                            +(shg[y1,x0].float()*(1-ax)+shg[y1,x1].float()*ax)*ay)
+                        cL=((lwg[y0,x0].float()*(1-ax)+lwg[y0,x1].float()*ax)*(1-ay)
+                            +(lwg[y1,x0].float()*(1-ax)+lwg[y1,x1].float()*ax)*ay)
+                        del x0,y0,x1,y1,ax,ay
+                    else:
+                        i12u=fu.long(); i12v=fv.long()
+                        cS=shg[i12v,i12u].float(); cL=lwg[i12v,i12u].float()
+                    del fu,fv
                     sumL[sl]+=w[:,None]*cL; sumW[sl]+=w
                     cnt[sl]+=(w>0).to(_th.uint8)*(cnt[sl]<250).to(_th.uint8)
                     mej=w>bestW[sl]
@@ -1200,8 +1213,18 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 dv=P-Cc; dv/= (_np.linalg.norm(dv,axis=1,keepdims=True)+1e-9)
                 cosv=_np.abs((dv*N).sum(1))
                 w=_np.where(ok,(cosv**BAKE_COSK)/(z*z+1e-6),0.0).astype(_np.float32)
-                i12u=_np.clip((u*s12).astype(_np.int64),0,W12-1); i12v=_np.clip((v*s12).astype(_np.int64),0,H12-1)
-                cS=sharp[i12v,i12u]; cL=low[i12v,i12u]
+                fu=_np.clip(u*s12,0.0,W12-1.001); fv=_np.clip(v*s12,0.0,H12-1.001)
+                if BAKE_BILIN:
+                    x0=fu.astype(_np.int64); y0=fv.astype(_np.int64)
+                    ax=(fu-x0)[:,None].astype(_np.float32); ay=(fv-y0)[:,None].astype(_np.float32)
+                    x1=_np.minimum(x0+1,W12-1); y1=_np.minimum(y0+1,H12-1)
+                    cS=((sharp[y0,x0]*(1-ax)+sharp[y0,x1]*ax)*(1-ay)
+                        +(sharp[y1,x0]*(1-ax)+sharp[y1,x1]*ax)*ay)
+                    cL=((low[y0,x0]*(1-ax)+low[y0,x1]*ax)*(1-ay)
+                        +(low[y1,x0]*(1-ax)+low[y1,x1]*ax)*ay)
+                else:
+                    cS=sharp[fv.astype(_np.int64),fu.astype(_np.int64)]
+                    cL=low[fv.astype(_np.int64),fu.astype(_np.int64)]
                 sumL[sl]+=w[:,None]*cL; sumW[sl]+=w
                 cnt[sl]=_np.minimum(cnt[sl].astype(_np.int32)+(w>0),250).astype(_np.uint8)
                 mej=w>bestW[sl]
@@ -1220,10 +1243,17 @@ def bake_multiview(objf, texfiles, mtl2tex):
     cov1=100.0*seen.mean(); cov3=100.0*(cnt>=3).mean()
     if cov1<30.0:
         log("BAKE: cobertura muy baja (%.0f%% con >=1 foto); no toco los atlas" % cov1); return False
-    lowb=sumL/_np.maximum(sumW,1e-9)[:,None]
-    outl=_np.clip(lowb+(bestS.astype(_np.float32)-bestL.astype(_np.float32)),0.0,1.0)
-    outs=(_np.clip(_l2s(outl),0,1)*255.0+0.5).astype(_np.uint8)
-    del sumL,sumW,bestW,bestS,bestL,lowb,outl; _gc.collect()
+    # componer POR TROZOS: v9.2 armaba aqui ~8 temporales del tamano completo
+    # (el pico de 10.4 GB visto en el pod). Ahora: un solo buffer de salida
+    # uint8 y trozos de 4M texeles con temporales diminutos.
+    outs=_np.empty((NT,3),_np.uint8)
+    for c0 in range(0,NT,4_000_000):
+        sl=slice(c0,min(c0+4_000_000,NT))
+        lb=sumL[sl]/_np.maximum(sumW[sl],1e-9)[:,None]
+        ol=_np.clip(lb+(bestS[sl].astype(_np.float32)-bestL[sl].astype(_np.float32)),0.0,1.0)
+        outs[sl]=(_np.clip(_l2s(ol),0,1)*255.0+0.5).astype(_np.uint8)
+    del sumL,sumW,bestW,bestS,bestL; _gc.collect()
+    log("BAKE: composicion lista | RAM %.1f GB" % _rss())
 
     # ── 7) escribir atlas: base OpenMVS upscaleada + horneado + dilatacion (1 sola pasada EDT) ──
     for ti,tf in enumerate(texfiles):
@@ -1235,12 +1265,14 @@ def bake_multiview(objf, texfiles, mtl2tex):
             base[iy,ix]=outs[m]
             filled=_np.zeros((H2,W2),bool); filled[iy,ix]=True
             del lin,iy,ix
-            dist,(ry,rx)=_ndi.distance_transform_edt(~filled,return_indices=True)
-            sel=(~filled)&(dist<=BAKE_DILA)
-            base[sel]=base[ry[sel],rx[sel]]
-            del filled,dist,ry,rx,sel
+            for _ in range(BAKE_DILA):
+                nb=filled[1:,:]&~filled[:-1,:]; base[:-1][nb]=base[1:][nb]; filled[:-1][nb]=True
+                nb=filled[:-1,:]&~filled[1:,:]; base[1:][nb]=base[:-1][nb]; filled[1:][nb]=True
+                nb=filled[:,1:]&~filled[:,:-1]; base[:,:-1][nb]=base[:,1:][nb]; filled[:,:-1][nb]=True
+                nb=filled[:,:-1]&~filled[:,1:]; base[:,1:][nb]=base[:,:-1][nb]; filled[:,1:][nb]=True
+            del filled,nb
         if tf.lower().endswith((".jpg",".jpeg")):
-            Image.fromarray(base).save(tf,quality=92,subsampling=0)
+            Image.fromarray(base).save(tf,quality=BAKE_JQ,subsampling=2)
         else:
             Image.fromarray(base).save(tf)
         del base; _gc.collect()
@@ -1310,9 +1342,50 @@ def obj_to_glb(objf, outglb):
             log("BAKE: horneador fallo (%s); los atlas de OpenMVS quedan" % _bk)
     elif not BAKE:
         log("BAKE apagado (OMVS_BAKE=0): atlas de OpenMVS tal cual")
-    # (b) cargar la Scene (texturas ya corregidas) y exportar SIN concatenar
-    obj = trimesh.load(objf, process=False)
-    obj.export(outglb)
+    # (b) exportar SOLDANDO vertices: el OBJ repite cada esquina (v/vt) y el
+    #     glb salia con el TRIPLE de vertices (3.29M para 1.1M caras; Polycam
+    #     usa 0.57 por cara). Aqui cada par unico (vertice, uv) es UN vertice:
+    #     ~25 MB menos. Si algo falla, cae al exportador simple de siempre.
+    try:
+        import numpy as _np
+        _Vs=[]; _Ts=[]; _Fs={}; _cur=None
+        with open(objf) as _fh:
+            for _ln in _fh:
+                if _ln.startswith("v "):
+                    _p=_ln.split(); _Vs.append((float(_p[1]),float(_p[2]),float(_p[3])))
+                elif _ln.startswith("vt "):
+                    _p=_ln.split(); _Ts.append((float(_p[1]),float(_p[2])))
+                elif _ln.startswith("usemtl"):
+                    _cur=_ln.split(None,1)[1].strip(); _Fs.setdefault(_cur,[])
+                elif _ln.startswith("f ") and _cur is not None:
+                    _p=_ln.split()
+                    if len(_p)<4: continue
+                    _tri=[]
+                    for _c in _p[1:4]:
+                        _q=_c.split("/"); _tri.append((int(_q[0])-1, int(_q[1])-1))
+                    _Fs[_cur].append(_tri)
+        _V=_np.asarray(_Vs,_np.float64); _T=_np.asarray(_Ts,_np.float64)
+        _NT_=len(_T)+1
+        _esc=trimesh.Scene(); _tot_v=0; _tot_c=0
+        for _mtl,_caras in _Fs.items():
+            if not _caras or _mtl not in mtl2tex: continue
+            _fa=_np.asarray(_caras,_np.int64)              # (n,3,2) = (vi,ti)
+            _clave=_fa[:,:,0]*_NT_+_fa[:,:,1]
+            _uq,_inv=_np.unique(_clave.reshape(-1),return_inverse=True)
+            _vi=(_uq//_NT_); _ti=(_uq%_NT_)
+            _mesh=trimesh.Trimesh(vertices=_V[_vi], faces=_inv.reshape(-1,3),
+                                  process=False)
+            _mesh.visual=trimesh.visual.TextureVisuals(
+                uv=_T[_ti], image=Image.open(texfiles[mtl2tex[_mtl]]))
+            _esc.add_geometry(_mesh, geom_name=_mtl)
+            _tot_v+=len(_vi); _tot_c+=len(_fa)
+        _esc.export(outglb)
+        log("export SOLDADO: %d vertices para %d caras (antes: %d)"
+            % (_tot_v,_tot_c,_tot_c*3))
+    except Exception as _we:
+        log("export soldado fallo (%s) -> exportador simple" % _we)
+        obj = trimesh.load(objf, process=False)
+        obj.export(outglb)
     # (c) material MATE + UNLIT
     _patch_unlit_matte(outglb)
     return os.path.exists(outglb) and os.path.getsize(outglb) > 200000
@@ -1332,7 +1405,7 @@ CFG2 = ["--virtual-face-images", str(VFACES),
         "--local-seam-leveling", "0",
         "--sharpness-weight", "0",
         "--global-seam-leveling", "0"]
-CONFIGS = [(MAX_TEX, CFG1, OMP_HI), (MAX_TEX, CFG2, OMP_HI)]
+CONFIGS = [(MAX_TEX, CFG1, OMP_HI), (4096, CFG2, OMP_HI)]   # cfg2 = respaldo con el 4096 probado en produccion
 final = None
 for ci, (mt, extra, omp) in enumerate(CONFIGS):
     for f in glob.glob(BASE + ".*"):
@@ -2234,7 +2307,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'bake92' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{'bake93' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
