@@ -701,14 +701,24 @@ def tone_level(objf, texfiles, mtl2tex):
     if NF < 1000 or len(Tn) == 0 or (FT < 0).any() or (FM < 0).any():
         log("TONO: el OBJ no trae UVs/materiales utilizables; textura sin tocar"); return False
 
-    # ── 1) PARCHES = componentes conexas por indice de UV ──
-    vt = FT.reshape(-1); ff = _np.repeat(_np.arange(NF), 3)
-    o = _np.argsort(vt, kind="stable"); vt = vt[o]; ff = ff[o]
-    st = _np.r_[0, _np.flatnonzero(_np.diff(vt)) + 1]
-    msk = _np.ones(len(ff), bool); msk[st] = False
+    # ── 1) PARCHES = caras unidas por (MISMO vertice 3D + MISMA coordenada UV) ──
+    #   v8.9 fallo: uni por INDICE de UV, pero OpenMVS repite las UV por cara
+    #   (cada cara trae su propio vt) -> cada cara salia como un parche y 0
+    #   costuras. Aqui suelto las UV por VALOR (no por indice) y exijo ademas
+    #   que compartan el vertice 3D: eso ES el parche. Verificado sobre el .glb
+    #   real: da ~116k parches y ~62k pares de vecinos (antes: 1.09M y 0).
+    uvq = _np.round(Tn, 6)
+    _, uid = _np.unique(_np.c_[uvq, _np.zeros(len(uvq))], axis=0, return_inverse=True)
+    NU = int(uid.max()) + 2
+    cf = _np.repeat(_np.arange(NF), 3)
+    cv = F.reshape(-1)                                   # vertice 3D (el OBJ SI los comparte)
+    cu = uid[FT.reshape(-1)] + _np.repeat(FM, 3) * NU    # UV soldada, separada por atlas
+    key = cv.astype(_np.int64) * (NU * (FM.max() + 2)) + cu
+    o = _np.argsort(key, kind="stable"); key_s = key[o]; cf_s = cf[o]
+    st = _np.r_[0, _np.flatnonzero(_np.diff(key_s)) + 1]
+    msk = _np.ones(len(cf_s), bool); msk[st] = False
     pos = _np.flatnonzero(msk)
-    e0 = ff[pos]; e1 = ff[pos - 1]
-    NISL, isl = _cc(_sp.coo_matrix((_np.ones(len(e0), _np.int8), (e0, e1)),
+    NISL, isl = _cc(_sp.coo_matrix((_np.ones(len(pos), _np.int8), (cf_s[pos], cf_s[pos-1])),
                                    shape=(NF, NF)), directed=False)
     isl = isl.astype(_np.int64)
 
@@ -741,62 +751,69 @@ def tone_level(objf, texfiles, mtl2tex):
     if okf.sum() < 1000:
         log("TONO: no pude leer el color de las caras; textura sin tocar"); return False
 
-    # ── 3) costuras: vertices 3D donde se tocan DOS parches ──
-    vi = F.reshape(-1); fi = _np.repeat(_np.arange(NF), 3)
-    g = okf[fi]; vi = vi[g]; fi = fi[g]
-    o = _np.argsort(vi, kind="stable"); vi = vi[o]; fi = fi[o]
-    isf = isl[fi]
-    st = _np.r_[0, _np.flatnonzero(_np.diff(vi)) + 1]
-    en = _np.r_[st[1:], len(vi)]
-    mn = _np.minimum.reduceat(isf, st); mx = _np.maximum.reduceat(isf, st)
-    seam = _np.flatnonzero(mn != mx)
+    # ── 3) costuras: vertices 3D donde se tocan DOS parches (vectorizado) ──
+    g = okf[cf]
+    cvg = cv[g]; cpg = isl[cf[g]]; cfg = cf[g]
+    o2 = _np.lexsort((cpg, cvg)); cvg = cvg[o2]; cpg = cpg[o2]; cfg = cfg[o2]
     lg = _np.log(_np.maximum(col, 1e-4))
-    acc = {}; tocadas = set()
-    for gi in seam:
-        s0, s1 = st[gi], en[gi]
-        ii = isf[s0:s1]; fj = fi[s0:s1]
-        uq = _np.unique(ii)
-        if len(uq) < 2: continue
-        med = {}
-        for u in uq:
-            sel = fj[ii == u]; med[int(u)] = lg[sel].mean(0); tocadas.update(sel.tolist())
-        for x in range(len(uq)):
-            for y in range(x + 1, len(uq)):
-                A, B = int(uq[x]), int(uq[y])
-                d = _np.clip(med[B] - med[A], -0.7, 0.7)
-                k = (A, B) if A < B else (B, A)
-                if A > B: d = -d
-                if k in acc: acc[k][0] += d; acc[k][1] += 1
-                else: acc[k] = [d.copy(), 1]
-    pairs = [(k, v) for k, v in acc.items() if v[1] >= TONE_MINF]
-    cover = 100.0 * len(tocadas) / NF
-    log("TONO: %d parches (OpenMVS empaco los suyos), %d costuras, tocan el %.0f%% de las caras"
-        % (NISL, len(pairs), cover))
-    if len(pairs) < 500 or cover < 5.0:
-        log("TONO: muy pocas costuras utiles -> NO nivelo (textura sin tocar)"); return False
+    nuevo = _np.r_[True, (_np.diff(cvg) != 0) | (_np.diff(cpg) != 0)]
+    gs = _np.flatnonzero(nuevo)
+    gcnt = _np.diff(_np.r_[gs, len(cvg)])
+    gmean = _np.add.reduceat(lg[cfg], gs) / gcnt[:, None]     # color medio por (vertice,parche)
+    gv = cvg[gs]; gp = cpg[gs]
+    vs = _np.flatnonzero(_np.r_[True, _np.diff(gv) != 0])
+    ve = _np.r_[vs[1:], len(gv)]
+    npat = ve - vs
+    A_l = []; B_l = []; D_l = []
+    two = _np.flatnonzero(npat == 2)                          # el caso comun: vectorizado
+    if len(two):
+        i0 = vs[two]; i1 = i0 + 1
+        A_l.append(gp[i0]); B_l.append(gp[i1]); D_l.append(gmean[i1] - gmean[i0])
+    for gi in _np.flatnonzero(npat > 2):                      # los pocos con 3+ parches
+        a, b = vs[gi], ve[gi]
+        for x in range(a, b):
+            for y in range(x + 1, b):
+                A_l.append(_np.array([gp[x]])); B_l.append(_np.array([gp[y]]))
+                D_l.append((gmean[y] - gmean[x])[None, :])
+    if not A_l:
+        log("TONO: no encontre costuras entre parches; textura sin tocar"); return False
+    A = _np.concatenate(A_l); B = _np.concatenate(B_l); D = _np.concatenate(D_l)
+    sw = A > B
+    A2 = _np.where(sw, B, A); B2 = _np.where(sw, A, B)
+    D = _np.where(sw[:, None], -D, D)
+    D = _np.clip(D, -0.7, 0.7)
+    pk = A2 * NISL + B2
+    uk, inv = _np.unique(pk, return_inverse=True)
+    cnt = _np.bincount(inv).astype(_np.float64)
+    sums = _np.stack([_np.bincount(inv, weights=D[:, c]) for c in range(3)], 1)
+    keep = cnt >= TONE_MINF
+    PA = (uk[keep] // NISL).astype(_np.int64); PB = (uk[keep] % NISL).astype(_np.int64)
+    PD = sums[keep] / cnt[keep][:, None]; PN = cnt[keep]
+    NP = len(PA)
+    tocados = _np.zeros(NISL, bool); tocados[PA] = True; tocados[PB] = True
+    cover = 100.0 * tocados[isl].mean()
+    log("TONO: %d parches, %d costuras entre vecinos, cubren el %.0f%% de las caras"
+        % (NISL, NP, cover))
+    if NP < 500 or cover < 20.0:
+        log("TONO: cobertura insuficiente -> NO nivelo (textura sin tocar)"); return False
 
     # ── 4) una ganancia por canal por parche ──
-    NP = len(pairs)
     ri = _np.repeat(_np.arange(NP), 2)
     ci = _np.empty(NP * 2, _np.int64); dv = _np.empty(NP * 2, _np.float64)
-    w = _np.empty(NP); rhs = _np.empty((NP, 3))
-    for i, ((A, B), (sd, n)) in enumerate(pairs):
-        ww = min(n, 60) ** 0.5
-        ci[2*i] = A; ci[2*i+1] = B; dv[2*i] = ww; dv[2*i+1] = -ww
-        w[i] = ww; rhs[i] = sd / n
+    w = _np.minimum(PN, 60.0) ** 0.5
+    ci[0::2] = PA; ci[1::2] = PB; dv[0::2] = w; dv[1::2] = -w
     lam = 0.05
     M = _sp.vstack([_sp.coo_matrix((dv, (ri, ci)), shape=(NP, NISL)),
                     _sp.identity(NISL, format="coo") * lam]).tocsr()
     G = _np.ones((NISL, 3))
     for c in range(3):
-        b = _np.r_[rhs[:, c] * w, _np.zeros(NISL)]
-        G[:, c] = _np.exp(_spl.lsqr(M, b, atol=1e-7, btol=1e-7, iter_lim=800)[0])
+        b = _np.r_[PD[:, c] * w, _np.zeros(NISL)]
+        G[:, c] = _np.exp(_spl.lsqr(M, b, atol=1e-7, btol=1e-7, iter_lim=600)[0])
     lo, hi = 1.0 / TONE_CLAMP, TONE_CLAMP
     nclamp = int(((G < lo) | (G > hi)).sum()); G = _np.clip(G, lo, hi)
     lgG = _np.log(G).mean(1)
-    d0 = _np.array([abs(float((sd/n).mean())) for (_k, (sd, n)) in pairs])
-    d1 = _np.array([abs(float((sd/n).mean()) - (lgG[A]-lgG[B])) for ((A, B), (sd, n)) in pairs])
-    red = 100.0 * (1.0 - d1.mean()/max(d0.mean(), 1e-9))
+    d0 = _np.abs(PD.mean(1)); d1 = _np.abs(PD.mean(1) - (lgG[PA] - lgG[PB]))
+    red = 100.0 * (1.0 - d1.mean() / max(d0.mean(), 1e-9))
 
     # ── 5) pintar: cada pixel toma la ganancia de su cara mas cercana ──
     for ti, tf in enumerate(texfiles):
