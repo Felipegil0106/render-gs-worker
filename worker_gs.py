@@ -309,7 +309,13 @@ IMG_MAX       = int(os.environ.get("OMVS_IMG_MAX", "2000"))      # lado mayor de
 # texel cubre 3x mas: por eso la etiqueta del frasco no se lee y la cama no
 # se define. v9.5: OpenMVS empaqueta a 4096 (necesita mas atlas para la misma
 # densidad) y el horneador los sube a 8192 -> 4x texeles = ~0.75 mm/texel.
-MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "4096"))      # OpenMVS empaqueta aqui; el horneador multiplica por BAKE_SCALE
+# Reparto de atlas: se vuelve al del render (45) —probado, 2 atlas de 8192—
+# para que ESTE render pruebe UNA sola cosa nueva: la correccion de tono.
+# Para subir la densidad a ~0.75 mm/texel (el doble de fino) mas adelante:
+#     OMVS_MAX_TEX=4096  OMVS_BAKE_SCALE=2  OMVS_BAKE_MAXATL=8
+# Advertencia medida: eso pide ~8 atlas de 8192 -> archivo ~60 MB y ~2 GB de
+# memoria de video al abrirlo. En celular puede no cargar. Polycam usa 2.
+MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "8192"))      # probado en el (45): 2 atlas
 RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso
 OUTLIER       = os.environ.get("OMVS_OUTLIER", "0.06")           # descarta fotos inconsistentes
 SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "0.02")            # hacia 0 = parches GRANDES (investigacion: la escala va AL REVES; 1=mas fragmentado)
@@ -317,7 +323,12 @@ GLOBAL_SEAM   = os.environ.get("OMVS_GLOBAL_SEAM", "0")          # 0 = apagado: 
 LOCAL_SEAM    = os.environ.get("OMVS_LOCAL_SEAM", "0")           # 0 = apagado: sin base global escribe bandas negras (comprobado byte a byte)
 SHARP         = os.environ.get("OMVS_SHARP", "0")                # 0 = apagado: el enfoque (default 0.5) crea halos oscuros en bordes de parches
 VFACES        = os.environ.get("OMVS_VFACES", "3")               # caras virtuales coplanares: agrupa triangulos del mismo plano en parches GRANDES (el arreglo real de la fragmentacion)
-PACKH         = os.environ.get("OMVS_PACKH", "0")                # empaque de parches: 0 = MEJOR AJUSTE (mas lento pero deja menos hueco), 3 = rapido. Medido en el (45): aprovechamos 26% del atlas, Polycam 61%
+# PACKH=0 ("mejor ajuste") COLGO el render del 23-jul: con decenas de miles de
+# parches ese empaque es cuadratico y no termina nunca (22 min sin pasar de
+# TextureMesh; el paso se habria cortado a los 40). Vuelve al 3 (el default de
+# OpenMVS, el que corrio bien en el render 45). NO subir a 0 sin medir antes
+# cuantos parches genera la malla.
+PACKH         = os.environ.get("OMVS_PACKH", "3")                # 3 = buena velocidad (probado). 0 = mejor ajuste pero se cuelga con muchos parches
 EXPOCOMP      = os.environ.get("OMVS_EXPOCOMP", "0") == "1"     # 0 = APAGADO: medido sobre el .glb real, EMPEORO el tono (dispersion 21.6 -> 34.0). Se deja por si acaso
 TONE_LEVEL    = os.environ.get("OMVS_TONE", "0") == "1"          # SUPERADO por el horneador (v9.1): la mezcla multi-vista iguala el tono por construccion
 TONE_CLAMP    = float(os.environ.get("OMVS_TONE_CLAMP", "1.35")) # tope de la correccion por isla (1.35 = +-35%): solo mueve el TONO, nunca el detalle
@@ -326,7 +337,7 @@ EXPO_SAMPLES  = int(os.environ.get("OMVS_EXPO_SAMPLES", "40000"))# puntos de la 
 OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno
 # ── HORNEADOR MULTI-VISTA (v9.1; plan P1 de la investigacion, estilo Polycam) ──
 BAKE          = os.environ.get("OMVS_BAKE", "1") == "1"          # repinta cada texel MEZCLANDO todas las fotos que lo ven
-BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "2"))      # 4096 -> 8192: 4x texeles (~0.75 mm/texel). CANDADO: si OpenMVS devuelve demasiados atlas, baja solo a 1 para no producir un archivo gigante
+BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "1"))      # 1 = el atlas de OpenMVS tal cual (probado). Con MAX_TEX=4096 sube esto a 2 para el doble de fino
 BAKE_MAXATL   = int(os.environ.get("OMVS_BAKE_MAXATL", "5"))     # tope de atlas para permitir el x2 (5 atlas 8192 ~ 45-55 MB)
 BAKE_DS       = int(os.environ.get("OMVS_BAKE_DS", "8"))         # banda baja = foto reducida /8 y devuelta (multiBandDownscale de AliceVision)
 BAKE_COSK     = float(os.environ.get("OMVS_BAKE_COSK", "2"))     # peso angular cos^k (k=2 recomendado por la investigacion)
@@ -2456,7 +2467,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'bake95' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{'bake96' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
