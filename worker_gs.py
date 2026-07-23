@@ -302,7 +302,14 @@ OUTGLB = sys.argv[4]
 # Perillas (defaults probados en produccion):
 TEX_MESH_TRIS = int(os.environ.get("TEX_MESH_TRIS", "1100000"))  # caras del glb final
 IMG_MAX       = int(os.environ.get("OMVS_IMG_MAX", "2000"))      # lado mayor de las fotos que ve OpenMVS
-MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "8192"))      # v9.3: empaque a 8192 NATIVO -> 2-3 atlas en vez de 11, mucho menos gutter desperdiciado y archivo mas liviano; cfg2 cae a 4096 (lo probado) si fallara
+# MEDIDO en el render (45) contra la malla de Polycam:
+#   Polycam: 20.7 m2 de superficie en 2 atlas 8192 -> 0.50 mm por texel
+#   nuestro: 76.4 m2 (¡3.7x mas cuarto!) en 2 atlas 8192 -> 1.49 mm por texel
+# Con el mismo presupuesto de textura repartido en 3.7x mas superficie, cada
+# texel cubre 3x mas: por eso la etiqueta del frasco no se lee y la cama no
+# se define. v9.5: OpenMVS empaqueta a 4096 (necesita mas atlas para la misma
+# densidad) y el horneador los sube a 8192 -> 4x texeles = ~0.75 mm/texel.
+MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "4096"))      # OpenMVS empaqueta aqui; el horneador multiplica por BAKE_SCALE
 RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso
 OUTLIER       = os.environ.get("OMVS_OUTLIER", "0.06")           # descarta fotos inconsistentes
 SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "0.02")            # hacia 0 = parches GRANDES (investigacion: la escala va AL REVES; 1=mas fragmentado)
@@ -310,6 +317,7 @@ GLOBAL_SEAM   = os.environ.get("OMVS_GLOBAL_SEAM", "0")          # 0 = apagado: 
 LOCAL_SEAM    = os.environ.get("OMVS_LOCAL_SEAM", "0")           # 0 = apagado: sin base global escribe bandas negras (comprobado byte a byte)
 SHARP         = os.environ.get("OMVS_SHARP", "0")                # 0 = apagado: el enfoque (default 0.5) crea halos oscuros en bordes de parches
 VFACES        = os.environ.get("OMVS_VFACES", "3")               # caras virtuales coplanares: agrupa triangulos del mismo plano en parches GRANDES (el arreglo real de la fragmentacion)
+PACKH         = os.environ.get("OMVS_PACKH", "0")                # empaque de parches: 0 = MEJOR AJUSTE (mas lento pero deja menos hueco), 3 = rapido. Medido en el (45): aprovechamos 26% del atlas, Polycam 61%
 EXPOCOMP      = os.environ.get("OMVS_EXPOCOMP", "0") == "1"     # 0 = APAGADO: medido sobre el .glb real, EMPEORO el tono (dispersion 21.6 -> 34.0). Se deja por si acaso
 TONE_LEVEL    = os.environ.get("OMVS_TONE", "0") == "1"          # SUPERADO por el horneador (v9.1): la mezcla multi-vista iguala el tono por construccion
 TONE_CLAMP    = float(os.environ.get("OMVS_TONE_CLAMP", "1.35")) # tope de la correccion por isla (1.35 = +-35%): solo mueve el TONO, nunca el detalle
@@ -318,7 +326,8 @@ EXPO_SAMPLES  = int(os.environ.get("OMVS_EXPO_SAMPLES", "40000"))# puntos de la 
 OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno
 # ── HORNEADOR MULTI-VISTA (v9.1; plan P1 de la investigacion, estilo Polycam) ──
 BAKE          = os.environ.get("OMVS_BAKE", "1") == "1"          # repinta cada texel MEZCLANDO todas las fotos que lo ven
-BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "1"))      # v9.3: con MAX_TEX=8192 nativo la densidad ya es ~0.075 cm/texel SIN upscalear (menos texeles crudos, menos RAM/tiempo). Si bajas MAX_TEX a 4096, sube esto a 2
+BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "2"))      # 4096 -> 8192: 4x texeles (~0.75 mm/texel). CANDADO: si OpenMVS devuelve demasiados atlas, baja solo a 1 para no producir un archivo gigante
+BAKE_MAXATL   = int(os.environ.get("OMVS_BAKE_MAXATL", "5"))     # tope de atlas para permitir el x2 (5 atlas 8192 ~ 45-55 MB)
 BAKE_DS       = int(os.environ.get("OMVS_BAKE_DS", "8"))         # banda baja = foto reducida /8 y devuelta (multiBandDownscale de AliceVision)
 BAKE_COSK     = float(os.environ.get("OMVS_BAKE_COSK", "2"))     # peso angular cos^k (k=2 recomendado por la investigacion)
 BAKE_TOL      = float(os.environ.get("OMVS_BAKE_TOL", "0.010"))  # tolerancia de visibilidad = 1% de la profundidad (0.6% rechazaba camaras buenas donde la malla erra 1-2 cm -> cobertura 70% y parches leves)
@@ -326,6 +335,9 @@ BAKE_BILIN    = os.environ.get("OMVS_BAKE_BILIN", "1") == "1"    # muestreo BILI
 BAKE_JQ       = int(os.environ.get("OMVS_BAKE_JQ", "85"))        # JPEG q85 + croma 4:2:0 (como Polycam): ~3x mas liviano que q92 4:4:4
 BAKE_DILA     = int(os.environ.get("OMVS_BAKE_DILA", "6"))       # dilatacion del borde horneado (px) para mipmaps
 BAKE_EXPO     = os.environ.get("OMVS_BAKE_EXPO", "1") == "1"     # normaliza la exposicion de cada foto a la mediana global antes de mezclar (mata el "distintos tonos" del auto-exposicion del celular)
+BAKE_FIX      = os.environ.get("OMVS_BAKE_FIX", "1") == "1"      # a los texeles que ninguna foto ve les copia el TONO de sus vecinos horneados (mata las islas poligonales de tono ajeno)
+BAKE_FIXBLUR  = int(os.environ.get("OMVS_BAKE_FIXBLUR", "9"))    # suavizado del campo de correccion (celdas de la rejilla gruesa)
+BAKE_FIXDS    = int(os.environ.get("OMVS_BAKE_FIXDS", "16"))     # la correccion se calcula a 1/16 de resolucion (es de baja frecuencia): megas en vez de gigas
 POSE_OPT      = os.environ.get("OMVS_POSEOPT", "0") == "1"       # Zhou-Koltun rigido (P2): OFF hasta medir su costo en el pod
 POSE_ITERS    = int(os.environ.get("OMVS_POSE_ITERS", "60"))     # iteraciones si se enciende
 POSE_VERTS    = int(os.environ.get("OMVS_POSE_VERTS", "400000")) # malla reducida para el optimizador (CPU)
@@ -1041,6 +1053,10 @@ def bake_multiview(objf, texfiles, mtl2tex):
 
     # ── 4) tabla de texeles por splat (trozos por PRESUPUESTO de muestras) ──
     SC=max(1,BAKE_SCALE)
+    if SC>1 and len(texfiles)>BAKE_MAXATL:
+        log("BAKE: OpenMVS devolvio %d atlas (tope %d para el x%d) -> horneo a escala 1 "
+            "para no producir un archivo gigante" % (len(texfiles),BAKE_MAXATL,SC))
+        SC=1
     at_lin=[]; at_pos=[]; at_nrm=[]; at_id=[]; at_dims=[]
     PRESU=25_000_000
     for ti in range(len(texfiles)):
@@ -1284,22 +1300,103 @@ def bake_multiview(objf, texfiles, mtl2tex):
     del sumL,sumW,bestW,bestS,bestL; _gc.collect()
     log("BAKE: composicion lista | RAM %.1f GB" % _rss())
 
-    # ── 7) escribir atlas: base OpenMVS upscaleada + horneado + dilatacion (1 sola pasada EDT) ──
+    # ── 7) escribir atlas: horneado donde hay fotos + CORRECCION DE TONO donde no ──
+    #
+    # PROBLEMA QUE ARREGLA (visto en el render 45): el horneador solo repinta
+    # los texeles que alguna foto VE. El 5-15% restante (rincones, zonas
+    # ocluidas, detras de muebles) se quedaba con el pixel CRUDO de OpenMVS
+    # -> islas poligonales con el tono de UNA sola foto, en medio de la
+    # superficie ya armonizada. Eso es lo que se ve como "figuras
+    # geometricas" y "cicatrices/mesetas" en las paredes.
+    #
+    # SOLUCION: en vez de dejar el crudo, calculamos el campo de CORRECCION
+    #   C = horneado - crudo      (solo donde SI hay horneado)
+    # lo extendemos suavemente a todo el atlas (relleno por vecino mas
+    # cercano + desenfoque) y se lo sumamos al crudo. Asi:
+    #   - donde hay fotos: queda el horneado exacto
+    #   - donde no: queda el crudo con el MISMO tono de sus vecinos, y
+    #     conserva su detalle fino. No sobrevive ninguna isla de tono ajeno.
+    _nfix=0
     for ti,tf in enumerate(texfiles):
         W2,H2=at_dims[ti]
         base=_np.asarray(Image.open(tf).convert("RGB").resize((W2,H2),Image.BILINEAR)).copy()
         m=(AID==ti)&seen
         if m.any():
             lin=LIN[m].astype(_np.int64); iy=lin//W2; ix=lin%W2
+            crudo=base[iy,ix].astype(_np.float32)
             base[iy,ix]=outs[m]
             filled=_np.zeros((H2,W2),bool); filled[iy,ix]=True
-            del lin,iy,ix
+            # ── campo de correccion en REJILLA GRUESA ──
+            # la correccion de tono es de baja frecuencia, asi que se calcula
+            # a 1/BAKE_FIXDS de resolucion: cuesta megas en vez de gigas
+            # (a resolucion completa el mapa de distancias pedia >3 GB y el
+            #  sistema mataba el proceso).
+            # se guarda la SUMA del horneado y la SUMA del crudo por celda:
+            # la correccion es una RAZON (ganancia), no una resta. Una
+            # diferencia de exposicion entre fotos es multiplicativa: sumar
+            # un numero fijo arregla los tonos medios y estropea los claros
+            # y oscuros (medido: sumar quitaba 31% de las islas, multiplicar
+            # las quita casi todas).
+            DS=max(1,BAKE_FIXDS); GW=(W2+DS-1)//DS; GH=(H2+DS-1)//DS
+            ghor=_np.zeros((GH,GW,3),_np.float32); gcru=_np.zeros((GH,GW,3),_np.float32)
+            gcnt=_np.zeros((GH,GW),_np.float32)
+            gy_=iy//DS; gx_=ix//DS
+            _oh=outs[m].astype(_np.float32)
+            for _c in range(3):
+                _np.add.at(ghor[:,:,_c],(gy_,gx_),_oh[:,_c])
+                _np.add.at(gcru[:,:,_c],(gy_,gx_),crudo[:,_c])
+            _np.add.at(gcnt,(gy_,gx_),1.0)
+            del lin,iy,ix,crudo,_oh,gy_,gx_
+            # dilatacion normal (borde de parche, para mipmaps)
             for _ in range(BAKE_DILA):
                 nb=filled[1:,:]&~filled[:-1,:]; base[:-1][nb]=base[1:][nb]; filled[:-1][nb]=True
                 nb=filled[:-1,:]&~filled[1:,:]; base[1:][nb]=base[:-1][nb]; filled[1:][nb]=True
                 nb=filled[:,1:]&~filled[:,:-1]; base[:,:-1][nb]=base[:,1:][nb]; filled[:,:-1][nb]=True
                 nb=filled[:,:-1]&~filled[:,1:]; base[:,1:][nb]=base[:,:-1][nb]; filled[:,1:][nb]=True
-            del filled,nb
+            # ── que texeles quedaron con el color CRUDO de OpenMVS ──
+            # OJO (bug de v9.5-a): antes se usaba la lista de texeles
+            # rasterizados (LIN) para saber que es superficie. Pero LIN trae
+            # repetidos y NO cubre todos los texeles de cada parche, asi que
+            # la correccion solo llegaba a la MITAD de los texeles crudos
+            # (medido: 21.7M crudos, solo 10.7M corregidos). Ahora se detecta
+            # al reves y sin huecos: todo lo que NO es el relleno gris vacio
+            # de OpenMVS y NO lo repinto el horneador, es superficie cruda.
+            # (por FRANJAS: convertir el atlas entero a int16 pedia 0.4 GB de golpe)
+            sinh=_np.zeros((H2,W2),bool)
+            for _r0 in range(0,H2,512):
+                _r1=min(_r0+512,H2); _b=base[_r0:_r1]
+                _g=((_b[:,:,0]>=125)&(_b[:,:,0]<=131)&(_b[:,:,1]>=125)&(_b[:,:,1]<=131)
+                    &(_b[:,:,2]>=125)&(_b[:,:,2]<=131))
+                sinh[_r0:_r1]=(~filled[_r0:_r1])&(~_g)
+                del _g,_b
+            nsin=int(sinh.sum())
+            if nsin>0 and BAKE_FIX:
+                gok=gcnt>=4          # celdas con muestras suficientes
+                if gok.any():
+                    gan=_np.ones_like(ghor)
+                    _num=ghor[gok]+8.0; _den=gcru[gok]+8.0
+                    gan[gok]=_np.clip(_num/_den,0.45,2.2)
+                    # extender la ganancia a las celdas sin muestras (vecino mas cercano)
+                    gi=_ndi.distance_transform_edt(~gok,return_distances=False,return_indices=True)
+                    gan=gan[gi[0],gi[1]]
+                    # suavizar: un degradado de ganancia, no calcos con borde
+                    gan=_ndi.uniform_filter(gan,size=(BAKE_FIXBLUR,BAKE_FIXBLUR,1))
+                    # aplicar SOLO donde ninguna foto vio (el horneado no se toca),
+                    # por FRANJAS: sacar las coordenadas de 20M de texeles de
+                    # golpe pedia 0.35 GB y mataba el proceso.
+                    _cx=_np.minimum(_np.arange(W2)//DS,GW-1)
+                    for _r0 in range(0,H2,512):
+                        _r1=min(_r0+512,H2)
+                        _m2=sinh[_r0:_r1]
+                        if not _m2.any(): continue
+                        _cy=_np.minimum(_np.arange(_r0,_r1)//DS,GH-1)
+                        _gg=gan[_cy[:,None],_cx[None,:]]
+                        _blk=_np.clip(base[_r0:_r1].astype(_np.float32)*_gg,0,255).astype(_np.uint8)
+                        base[_r0:_r1]=_np.where(_m2[:,:,None],_blk,base[_r0:_r1])
+                        del _gg,_blk,_m2,_cy
+                    _nfix+=nsin
+                    del gan,gi,_num,_den,_cx
+            del ghor,gcru,gcnt,filled,sinh
         if tf.lower().endswith((".jpg",".jpeg")):
             Image.fromarray(base).save(tf,quality=BAKE_JQ,subsampling=2)
         else:
@@ -1307,6 +1404,9 @@ def bake_multiview(objf, texfiles, mtl2tex):
         del base; _gc.collect()
         log("BAKE: atlas %d/%d escrito (%dx%d) | RAM %.1f GB"
             % (ti+1,len(texfiles),W2,H2,_rss()))
+    if _nfix:
+        log("BAKE: %.1fM texeles sin foto recibieron correccion de tono de sus vecinos "
+            "(antes quedaban con el tono crudo de OpenMVS = las 'figuras geometricas')" % (_nfix/1e6))
     log("BAKE listo: %.1fM texeles | cobertura >=1 foto %.0f%%, >=3 fotos %.0f%% | %s | "
         "atlas x%d en %.1f min"
         % (NT/1e6,cov1,cov3,"GPU" if usa_gpu else "CPU",SC,(time.time()-_t0)/60.0))
@@ -1438,11 +1538,19 @@ def obj_to_glb(objf, outglb):
 #         y sharpen APAGADOS (los que escribian las bandas negras).
 #  cfg2 = respaldo: la config EXACTA de v8.5 que ya funciono en produccion
 #         (sin niveladores). Si el nivelado global crashara, caes a lo de hoy.
+# NOTA CLAVE v9.5: el horneador repinta CADA texel mezclando todas las fotos,
+# asi que la "mejor vista por cara" que elige OpenMVS ya no afecta el color
+# final: lo unico que importa es el MAPA UV. Por eso subimos la compactacion
+# de parches (cost-smoothness-ratio) y usamos el empaque de mejor ajuste:
+# menos parches y mas grandes -> menos borde desperdiciado entre ellos.
+# MEDIDO en el (45): nuestro atlas aprovecha 26% del area; Polycam 61%.
 CFG1 = ["--virtual-face-images", str(VFACES),
+        "--patch-packing-heuristic", PACKH,
         "--local-seam-leveling", str(LOCAL_SEAM),
         "--sharpness-weight", str(SHARP),
         "--global-seam-leveling", str(GLOBAL_SEAM)]
 CFG2 = ["--virtual-face-images", str(VFACES),
+        "--patch-packing-heuristic", PACKH,
         "--local-seam-leveling", "0",
         "--sharpness-weight", "0",
         "--global-seam-leveling", "0"]
@@ -2348,7 +2456,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'bake94' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{'bake95' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
