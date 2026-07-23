@@ -348,6 +348,7 @@ BAKE_DILA     = int(os.environ.get("OMVS_BAKE_DILA", "6"))       # dilatacion de
 BAKE_EXPO     = os.environ.get("OMVS_BAKE_EXPO", "1") == "1"     # normaliza la exposicion de cada foto a la mediana global antes de mezclar (mata el "distintos tonos" del auto-exposicion del celular)
 BAKE_FIX      = os.environ.get("OMVS_BAKE_FIX", "1") == "1"      # a los texeles que ninguna foto ve les copia el TONO de sus vecinos horneados (mata las islas poligonales de tono ajeno)
 BAKE_FIXBLUR  = int(os.environ.get("OMVS_BAKE_FIXBLUR", "9"))    # suavizado del campo de correccion (celdas de la rejilla gruesa)
+BAKE_VFILL    = os.environ.get("OMVS_BAKE_VFILL", "1") == "1"     # tapa los parches vacios del atlas con el color por vertice de la malla (medido: 23% de las caras salian en gris plano)
 BAKE_FIXDS    = int(os.environ.get("OMVS_BAKE_FIXDS", "16"))     # la correccion se calcula a 1/16 de resolucion (es de baja frecuencia): megas en vez de gigas
 POSE_OPT      = os.environ.get("OMVS_POSEOPT", "0") == "1"       # Zhou-Koltun rigido (P2): OFF hasta medir su costo en el pod
 POSE_ITERS    = int(os.environ.get("OMVS_POSE_ITERS", "60"))     # iteraciones si se enciende
@@ -1110,7 +1111,10 @@ def bake_multiview(objf, texfiles, mtl2tex):
         log("BAKE: no pude rasterizar texeles; no horneo"); return False
     LIN=_np.concatenate(at_lin); POS=_np.concatenate(at_pos)
     NRM=_np.concatenate(at_nrm); AID=_np.concatenate(at_id)
-    del at_lin,at_pos,at_nrm,at_id,Tn,FT; _gc.collect()
+    del at_lin,at_pos,at_nrm,at_id
+    if not BAKE_VFILL:
+        del Tn,FT          # el parche de vacios los necesita al final
+    _gc.collect()
     NT=len(LIN)
     log("BAKE: %d texeles rasterizados (con duplicados raros de borde, inofensivos) "
         "| RAM %.1f GB | %.1f min" % (NT,_rss(),(time.time()-_t0)/60.0))
@@ -1327,7 +1331,26 @@ def bake_multiview(objf, texfiles, mtl2tex):
     #   - donde hay fotos: queda el horneado exacto
     #   - donde no: queda el crudo con el MISMO tono de sus vecinos, y
     #     conserva su detalle fino. No sobrevive ninguna isla de tono ajeno.
-    _nfix=0
+    _nfix=0; _nvac=0; _nvpx=0
+    # color por vertice de la malla original (viene de las fotos): se mapea a
+    # los vertices del OBJ de OpenMVS por posicion (el OBJ los renumera).
+    VCOL=None
+    if BAKE_VFILL:
+        try:
+            import open3d as _o3b
+            from scipy.spatial import cKDTree as _KD
+            _mo=_o3b.io.read_triangle_mesh(MESH)
+            _vc=_np.asarray(_mo.vertex_colors)
+            if len(_vc)==len(_mo.vertices) and len(_vc)>0:
+                _kd=_KD(_np.asarray(_mo.vertices))
+                _,_ii=_kd.query(V32,k=1,workers=-1)
+                VCOL=(_np.clip(_vc[_ii],0,1)*255.0).astype(_np.float32)
+                log("BAKE: color de la malla listo para tapar vacios (%d vertices)" % len(V32))
+            else:
+                log("BAKE: la malla no trae color por vertice; no puedo tapar vacios")
+            del _mo,_vc
+        except Exception as _vc_e:
+            log("BAKE: no pude leer el color de la malla (%s)" % _vc_e)
     for ti,tf in enumerate(texfiles):
         W2,H2=at_dims[ti]
         base=_np.asarray(Image.open(tf).convert("RGB").resize((W2,H2),Image.BILINEAR)).copy()
@@ -1408,6 +1431,79 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _nfix+=nsin
                     del gan,gi,_num,_den,_cx
             del ghor,gcru,gcnt,filled,sinh
+        # ── (c) PARCHE DE VACIOS ──────────────────────────────────────────
+        # MEDIDO en la malla (49): el 23.3% de las caras tienen su parche del
+        # atlas COMPLETAMENTE vacio (el gris de relleno de OpenMVS), o sea
+        # ~19 m2 de cuarto saliendo en gris plano repartidos por las paredes.
+        # No es un problema de bordes (eso es 1.5%): son parches que OpenMVS
+        # nunca escribio. Aqui se pintan con el color que YA tiene la malla en
+        # esos vertices (que viene de las fotos), interpolado por triangulo.
+        # Es el "rellenar con el color de los vecinos" hecho en 3D, no en el
+        # atlas: los vecinos del atlas son trozos de otra parte del cuarto.
+        if VCOL is not None:
+            try:
+                mf=_np.flatnonzero(FM==ti)
+                if len(mf):
+                    uvf=Tn[FT[mf]]
+                    # dispara si el centro O alguna esquina siguen vacios
+                    vac=_np.zeros(len(mf),bool)
+                    for _wq in ((1/3.,1/3.,1/3.),(.7,.15,.15),(.15,.7,.15),(.15,.15,.7)):
+                        cu=(_wq[0]*uvf[:,0]+_wq[1]*uvf[:,1]+_wq[2]*uvf[:,2])
+                        cx_=_np.clip((cu[:,0]*(W2-1)).astype(_np.int64),0,W2-1)
+                        cy_=_np.clip((((1.0-cu[:,1]) if flip==0 else cu[:,1])*(H2-1)).astype(_np.int64),0,H2-1)
+                        vac|=(_np.abs(base[cy_,cx_].astype(_np.int16)-128).max(1)<=6)
+                    nv=int(vac.sum())
+                    if nv:
+                        sel=mf[vac]
+                        pu=(uvf[vac,:,0]*(W2-1)).astype(_np.float32)
+                        pv=(((1.0-uvf[vac,:,1]) if flip==0 else uvf[vac,:,1])*(H2-1)).astype(_np.float32)
+                        x0=_np.clip(_np.floor(pu.min(1)),0,W2-1).astype(_np.int64)
+                        x1=_np.clip(_np.ceil (pu.max(1)),0,W2-1).astype(_np.int64)
+                        y0=_np.clip(_np.floor(pv.min(1)),0,H2-1).astype(_np.int64)
+                        y1=_np.clip(_np.ceil (pv.max(1)),0,H2-1).astype(_np.int64)
+                        K=int(min(64,max(2,(_np.maximum(x1-x0,y1-y0)+1).max())))
+                        dxy=_np.arange(K)
+                        paso=max(1,4_000_000//(K*K))
+                        npx=0
+                        for c0 in range(0,len(sel),paso):
+                            sl=slice(c0,min(c0+paso,len(sel))); n=sl.stop-sl.start
+                            X=x0[sl][:,None,None]+dxy[None,None,:]
+                            Y=y0[sl][:,None,None]+dxy[None,:,None]
+                            ok=(X<=x1[sl][:,None,None])&(Y<=y1[sl][:,None,None])
+                            ok=_np.broadcast_to(ok,(n,K,K)).copy()
+                            Xf=_np.broadcast_to(X,(n,K,K)).astype(_np.float32)
+                            Yf=_np.broadcast_to(Y,(n,K,K)).astype(_np.float32)
+                            ax=pu[sl,0][:,None,None]; ay=pv[sl,0][:,None,None]
+                            bx=pu[sl,1][:,None,None]; by=pv[sl,1][:,None,None]
+                            cx2=pu[sl,2][:,None,None]; cy2=pv[sl,2][:,None,None]
+                            den=(by-cy2)*(ax-cx2)+(cx2-bx)*(ay-cy2)
+                            den=_np.where(_np.abs(den)<1e-9,1e-9,den)
+                            l0=((by-cy2)*(Xf-cx2)+(cx2-bx)*(Yf-cy2))/den
+                            l1=((cy2-ay)*(Xf-cx2)+(ax-cx2)*(Yf-cy2))/den
+                            l2=1.0-l0-l1
+                            ok&=(l0>=-0.02)&(l1>=-0.02)&(l2>=-0.02)
+                            del Xf,Yf,den
+                            if ok.any():
+                                w0=_np.clip(l0[ok],0,1); w1=_np.clip(l1[ok],0,1); w2=_np.clip(l2[ok],0,1)
+                                sw=w0+w1+w2; sw=_np.where(sw<1e-9,1.0,sw)
+                                w0/=sw; w1/=sw; w2/=sw
+                                ixp=_np.broadcast_to(X,(n,K,K))[ok]
+                                iyp=_np.broadcast_to(Y,(n,K,K))[ok]
+                                # SOLO donde sigue vacio: lo ya horneado no se toca
+                                _cur=base[iyp,ixp].astype(_np.int16)
+                                _gz=(_np.abs(_cur-128).max(1)<=6)
+                                if _gz.any():
+                                    tri=sel[sl][_np.broadcast_to(_np.arange(n)[:,None,None],(n,K,K))[ok]][_gz]
+                                    cval=(w0[_gz][:,None]*VCOL[F[tri,0]]+w1[_gz][:,None]*VCOL[F[tri,1]]
+                                          +w2[_gz][:,None]*VCOL[F[tri,2]])
+                                    base[iyp[_gz],ixp[_gz]]=_np.clip(cval,0,255).astype(_np.uint8)
+                                    npx+=int(_gz.sum())
+                                    del tri,cval
+                                del w0,w1,w2,sw,ixp,iyp,_cur,_gz
+                            del X,Y,l0,l1,l2,ok
+                        _nvac+=nv; _nvpx+=npx
+            except Exception as _ve:
+                log("BAKE: parche de vacios fallo en atlas %d (%s)" % (ti+1,_ve))
         if tf.lower().endswith((".jpg",".jpeg")):
             Image.fromarray(base).save(tf,quality=BAKE_JQ,subsampling=2)
         else:
@@ -1416,8 +1512,11 @@ def bake_multiview(objf, texfiles, mtl2tex):
         log("BAKE: atlas %d/%d escrito (%dx%d) | RAM %.1f GB"
             % (ti+1,len(texfiles),W2,H2,_rss()))
     if _nfix:
-        log("BAKE: %.1fM texeles sin foto recibieron correccion de tono de sus vecinos "
-            "(antes quedaban con el tono crudo de OpenMVS = las 'figuras geometricas')" % (_nfix/1e6))
+        log("BAKE: %.1fM texeles de relleno recibieron correccion de tono" % (_nfix/1e6))
+    if _nvac:
+        log("BAKE: %d caras tenian su parche VACIO (gris de OpenMVS) -> pintadas con el "
+            "color de la malla (%.1fM texeles). Esto es lo que se veia como huecos sin rellenar."
+            % (_nvac,_nvpx/1e6))
     log("BAKE listo: %.1fM texeles | cobertura >=1 foto %.0f%%, >=3 fotos %.0f%% | %s | "
         "atlas x%d en %.1f min"
         % (NT/1e6,cov1,cov3,"GPU" if usa_gpu else "CPU",SC,(time.time()-_t0)/60.0))
@@ -2467,7 +2566,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'bake96' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{'bake97' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
