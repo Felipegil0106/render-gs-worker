@@ -1432,113 +1432,90 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _nfix+=nsin
                     del gan,gi,_num,_den,_cx
             del ghor,gcru,gcnt,filled,sinh
-        # ── (c) PARCHE DE VACIOS ──────────────────────────────────────────
-        # MEDIDO en la malla (49): el 23.3% de las caras tienen su parche del
-        # atlas COMPLETAMENTE vacio (el gris de relleno de OpenMVS), o sea
-        # ~19 m2 de cuarto saliendo en gris plano repartidos por las paredes.
-        # No es un problema de bordes (eso es 1.5%): son parches que OpenMVS
-        # nunca escribio. Aqui se pintan con el color que YA tiene la malla en
-        # esos vertices (que viene de las fotos), interpolado por triangulo.
-        # Es el "rellenar con el color de los vecinos" hecho en 3D, no en el
-        # atlas: los vecinos del atlas son trozos de otra parte del cuarto.
+        # ── (c) RELLENO DE GRIS ───────────────────────────────────────────
+        # MEDIDO en la malla (53): el 19.3% de las caras (219.817) quedaban
+        # apuntando al gris de relleno. El parche anterior las buscaba con un
+        # pre-filtro de 4 puntos por cara y solo encontraba 11.403 (el 5%):
+        # ese pre-filtro es el que fallaba. Aqui se elimina: se recorren TODAS
+        # las caras y se pinta el color de la malla (que viene de las fotos)
+        # en cada texel que siga gris. La prueba es POR TEXEL, no por cara, asi
+        # que no puede saltarse ninguno ni pisar nada de lo ya horneado.
+        #   - toda cara recibe un punto en su texel central (cubre las caras
+        #     mas chicas que un texel: el 45% de las grises)
+        #   - ademas se rellena su huella completa (cubre las medianas)
         if VCOL is not None:
             try:
                 mf=_np.flatnonzero(FM==ti)
-                if len(mf):
-                    uvf=Tn[FT[mf]]
-                    # dispara si el centro O alguna esquina siguen vacios
-                    vac=_np.zeros(len(mf),bool)
-                    for _wq in ((1/3.,1/3.,1/3.),(.7,.15,.15),(.15,.7,.15),(.15,.15,.7)):
-                        cu=(_wq[0]*uvf[:,0]+_wq[1]*uvf[:,1]+_wq[2]*uvf[:,2])
-                        cx_=_np.clip((cu[:,0]*(W2-1)).astype(_np.int64),0,W2-1)
-                        cy_=_np.clip((((1.0-cu[:,1]) if flip==0 else cu[:,1])*(H2-1)).astype(_np.int64),0,H2-1)
-                        vac|=(_np.abs(base[cy_,cx_].astype(_np.int16)-128).max(1)<=6)
-                    nv=int(vac.sum())
-                    if nv:
-                        npx=0
-                        sel=mf[vac]
-                        # ── (c1) CARAS CON UV COLAPSADO ──────────────────────
-                        # MEDIDO en la malla (51): el 76% de las caras que
-                        # salen en gris tienen area CERO en el atlas: OpenMVS
-                        # les colapso las tres coordenadas a un punto (asi
-                        # marca las caras que no pudo texturizar). Un triangulo
-                        # colapsado no contiene ningun texel, por eso el
-                        # relleno normal no las alcanzaba nunca. A estas se les
-                        # escribe su color en el punto donde caen, con un
-                        # puntito de +-BAKE_VDOT texeles para que sobreviva al
-                        # filtrado y a los mipmaps. Solo se escribe sobre gris.
-                        _uvs=Tn[FT[sel]]
-                        _pu=_uvs[:,:,0]*(W2-1)
-                        _pv=((1.0-_uvs[:,:,1]) if flip==0 else _uvs[:,:,1])*(H2-1)
-                        _aa=0.5*_np.abs((_pu[:,1]-_pu[:,0])*(_pv[:,2]-_pv[:,0])
-                                        -(_pu[:,2]-_pu[:,0])*(_pv[:,1]-_pv[:,0]))
-                        _dg=_aa<1.0                      # area < 1 texel = colapsada
-                        if _dg.any():
-                            _sd=sel[_dg]
-                            _cxd=_np.clip(_pu[_dg].mean(1).astype(_np.int64),0,W2-1)
-                            _cyd=_np.clip(_pv[_dg].mean(1).astype(_np.int64),0,H2-1)
-                            _cold=((VCOL[F[_sd,0]]+VCOL[F[_sd,1]]+VCOL[F[_sd,2]])/3.0)
-                            R=max(0,BAKE_VDOT)
-                            for _oy in range(-R,R+1):
-                                for _ox in range(-R,R+1):
-                                    _yy=_np.clip(_cyd+_oy,0,H2-1); _xx=_np.clip(_cxd+_ox,0,W2-1)
-                                    _cur=base[_yy,_xx].astype(_np.int16)
-                                    _gz=(_np.abs(_cur-128).max(1)<=6)
-                                    if _gz.any():
-                                        base[_yy[_gz],_xx[_gz]]=_np.clip(_cold[_gz],0,255).astype(_np.uint8)
-                                        npx+=int(_gz.sum())
-                                    del _cur,_gz,_yy,_xx
-                            _ndeg+=int(_dg.sum())
-                            del _sd,_cxd,_cyd,_cold
-                        del _uvs,_pu,_pv,_aa,_dg
-                        pu=(uvf[vac,:,0]*(W2-1)).astype(_np.float32)
-                        pv=(((1.0-uvf[vac,:,1]) if flip==0 else uvf[vac,:,1])*(H2-1)).astype(_np.float32)
-                        x0=_np.clip(_np.floor(pu.min(1)),0,W2-1).astype(_np.int64)
-                        x1=_np.clip(_np.ceil (pu.max(1)),0,W2-1).astype(_np.int64)
-                        y0=_np.clip(_np.floor(pv.min(1)),0,H2-1).astype(_np.int64)
-                        y1=_np.clip(_np.ceil (pv.max(1)),0,H2-1).astype(_np.int64)
-                        K=int(min(64,max(2,(_np.maximum(x1-x0,y1-y0)+1).max())))
-                        dxy=_np.arange(K)
-                        paso=max(1,4_000_000//(K*K))
-                        for c0 in range(0,len(sel),paso):
-                            sl=slice(c0,min(c0+paso,len(sel))); n=sl.stop-sl.start
-                            X=x0[sl][:,None,None]+dxy[None,None,:]
-                            Y=y0[sl][:,None,None]+dxy[None,:,None]
-                            ok=(X<=x1[sl][:,None,None])&(Y<=y1[sl][:,None,None])
+                NCH=150000
+                for _c0 in range(0,len(mf),NCH):
+                    idc=mf[_c0:_c0+NCH]
+                    uvf=Tn[FT[idc]]
+                    pu=(uvf[:,:,0]*(W2-1)).astype(_np.float32)
+                    pv=(((1.0-uvf[:,:,1]) if flip==0 else uvf[:,:,1])*(H2-1)).astype(_np.float32)
+                    colf=((VCOL[F[idc,0]]+VCOL[F[idc,1]]+VCOL[F[idc,2]])/3.0)
+                    # (1) PUNTO en el texel central de cada cara
+                    cxd=_np.clip(pu.mean(1),0,W2-1).astype(_np.int64)
+                    cyd=_np.clip(pv.mean(1),0,H2-1).astype(_np.int64)
+                    R=max(0,BAKE_VDOT)
+                    _hit=_np.zeros(len(idc),bool)
+                    for _oy in range(-R,R+1):
+                        for _ox in range(-R,R+1):
+                            yy=_np.clip(cyd+_oy,0,H2-1); xx=_np.clip(cxd+_ox,0,W2-1)
+                            _cur=base[yy,xx].astype(_np.int16)
+                            gz=(_np.abs(_cur-128).max(1)<=6)
+                            if gz.any():
+                                base[yy[gz],xx[gz]]=_np.clip(colf[gz],0,255).astype(_np.uint8)
+                                _nvpx+=int(gz.sum()); _hit|=gz
+                            del _cur,gz,yy,xx
+                    # (2) HUELLA completa de la cara (por grupos de tamano)
+                    x0=_np.clip(_np.floor(pu.min(1)),0,W2-1).astype(_np.int64)
+                    x1=_np.clip(_np.ceil (pu.max(1)),0,W2-1).astype(_np.int64)
+                    y0=_np.clip(_np.floor(pv.min(1)),0,H2-1).astype(_np.int64)
+                    y1=_np.clip(_np.ceil (pv.max(1)),0,H2-1).astype(_np.int64)
+                    lado=_np.maximum(x1-x0,y1-y0)+1
+                    exp=_np.zeros(len(idc),_np.int32); _l=lado.copy()
+                    while (_l>1).any():
+                        exp+=(_l>1); _l=(_l+1)//2
+                    exp=_np.minimum(exp,6)          # tope 64 px de lado
+                    for e in range(int(exp.max())+1 if len(exp) else 0):
+                        sel=_np.flatnonzero(exp==e)
+                        if len(sel)==0: continue
+                        K=1<<e; dxy=_np.arange(K,dtype=_np.int64)
+                        paso=max(1,3_000_000//(K*K))
+                        for f0 in range(0,len(sel),paso):
+                            ii=sel[f0:f0+paso]; n=len(ii)
+                            X=x0[ii][:,None,None]+dxy[None,None,:]
+                            Y=y0[ii][:,None,None]+dxy[None,:,None]
+                            ok=(X<=x1[ii][:,None,None])&(Y<=y1[ii][:,None,None])
                             ok=_np.broadcast_to(ok,(n,K,K)).copy()
                             Xf=_np.broadcast_to(X,(n,K,K)).astype(_np.float32)
                             Yf=_np.broadcast_to(Y,(n,K,K)).astype(_np.float32)
-                            ax=pu[sl,0][:,None,None]; ay=pv[sl,0][:,None,None]
-                            bx=pu[sl,1][:,None,None]; by=pv[sl,1][:,None,None]
-                            cx2=pu[sl,2][:,None,None]; cy2=pv[sl,2][:,None,None]
+                            ax=pu[ii,0][:,None,None]; ay=pv[ii,0][:,None,None]
+                            bx=pu[ii,1][:,None,None]; by=pv[ii,1][:,None,None]
+                            cx2=pu[ii,2][:,None,None]; cy2=pv[ii,2][:,None,None]
                             den=(by-cy2)*(ax-cx2)+(cx2-bx)*(ay-cy2)
                             den=_np.where(_np.abs(den)<1e-9,1e-9,den)
                             l0=((by-cy2)*(Xf-cx2)+(cx2-bx)*(Yf-cy2))/den
                             l1=((cy2-ay)*(Xf-cx2)+(ax-cx2)*(Yf-cy2))/den
-                            l2=1.0-l0-l1
-                            ok&=(l0>=-0.02)&(l1>=-0.02)&(l2>=-0.02)
-                            del Xf,Yf,den
+                            ok&=(l0>=-0.02)&(l1>=-0.02)&((1.0-l0-l1)>=-0.02)
+                            del Xf,Yf,den,l0,l1
                             if ok.any():
-                                w0=_np.clip(l0[ok],0,1); w1=_np.clip(l1[ok],0,1); w2=_np.clip(l2[ok],0,1)
-                                sw=w0+w1+w2; sw=_np.where(sw<1e-9,1.0,sw)
-                                w0/=sw; w1/=sw; w2/=sw
                                 ixp=_np.broadcast_to(X,(n,K,K))[ok]
                                 iyp=_np.broadcast_to(Y,(n,K,K))[ok]
-                                # SOLO donde sigue vacio: lo ya horneado no se toca
+                                fid=_np.broadcast_to(_np.arange(n)[:,None,None],(n,K,K))[ok]
                                 _cur=base[iyp,ixp].astype(_np.int16)
-                                _gz=(_np.abs(_cur-128).max(1)<=6)
-                                if _gz.any():
-                                    tri=sel[sl][_np.broadcast_to(_np.arange(n)[:,None,None],(n,K,K))[ok]][_gz]
-                                    cval=(w0[_gz][:,None]*VCOL[F[tri,0]]+w1[_gz][:,None]*VCOL[F[tri,1]]
-                                          +w2[_gz][:,None]*VCOL[F[tri,2]])
-                                    base[iyp[_gz],ixp[_gz]]=_np.clip(cval,0,255).astype(_np.uint8)
-                                    npx+=int(_gz.sum())
-                                    del tri,cval
-                                del w0,w1,w2,sw,ixp,iyp,_cur,_gz
-                            del X,Y,l0,l1,l2,ok
-                        _nvac+=nv; _nvpx+=npx
+                                gz=(_np.abs(_cur-128).max(1)<=6)
+                                if gz.any():
+                                    base[iyp[gz],ixp[gz]]=_np.clip(colf[ii][fid[gz]],0,255).astype(_np.uint8)
+                                    _nvpx+=int(gz.sum())
+                                    _hit[ii[fid[gz]]]=True
+                                del ixp,iyp,fid,_cur,gz
+                            del X,Y,ok
+                    _nvac+=int(_hit.sum())
+                    del uvf,pu,pv,colf,cxd,cyd,x0,x1,y0,y1,lado,exp,_hit
+                _gc.collect()
             except Exception as _ve:
-                log("BAKE: parche de vacios fallo en atlas %d (%s)" % (ti+1,_ve))
+                log("BAKE: relleno de gris fallo en atlas %d (%s)" % (ti+1,_ve))
         if tf.lower().endswith((".jpg",".jpeg")):
             Image.fromarray(base).save(tf,quality=BAKE_JQ,subsampling=2)
         else:
@@ -1548,12 +1525,9 @@ def bake_multiview(objf, texfiles, mtl2tex):
             % (ti+1,len(texfiles),W2,H2,_rss()))
     if _nfix:
         log("BAKE: %.1fM texeles de relleno recibieron correccion de tono" % (_nfix/1e6))
-    if _ndeg:
-        log("BAKE: %d caras venian con UV COLAPSADO de OpenMVS (area cero en el atlas: "
-            "no cabia textura). Se les escribio su color de la malla en el punto donde caen." % _ndeg)
     if _nvac:
-        log("BAKE: %d caras tenian su parche VACIO (gris de OpenMVS) -> pintadas con el "
-            "color de la malla (%.1fM texeles). Esto es lo que se veia como huecos sin rellenar."
+        log("BAKE: %d caras apuntaban al gris de relleno -> pintadas con el color de la "
+            "malla (%.1fM texeles). Esto es lo que se veia como parches y huecos en paredes y piso."
             % (_nvac,_nvpx/1e6))
     log("BAKE listo: %.1fM texeles | cobertura >=1 foto %.0f%%, >=3 fotos %.0f%% | %s | "
         "atlas x%d en %.1f min"
@@ -2604,7 +2578,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'bake98' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{'bake99' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
