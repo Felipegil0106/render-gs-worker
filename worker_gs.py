@@ -2578,7 +2578,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'bake99-snap2' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{'bake99-snap2b' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -3214,6 +3214,11 @@ def main():
             "    try:\n"
             "        import scipy.sparse.csgraph as _csg\n"
             "        _BAND2 = float(os.environ.get('SNAP2_BAND', '0.15'))\n"
+            "        _ALIN2 = float(os.environ.get('SNAP2_ALIN', '0.94'))\n"
+            "        _AR2 = float(os.environ.get('SNAP2_AREA', '0.005'))\n"
+            "        _NV2 = int(os.environ.get('SNAP2_NV', '20'))\n"
+            "        _FL2 = float(os.environ.get('SNAP2_FLAT', '0.02'))\n"
+            "        _GR2 = float(os.environ.get('SNAP2_GROS', '0.06'))\n"
             "        if _planos and os.environ.get('SNAP2', '1') == '1':\n"
             "            _V2 = np.asarray(m.vertices)\n"
             "            m.compute_vertex_normals()\n"
@@ -3223,7 +3228,7 @@ def main():
             "            _Vn2 = _V2.copy(); _nt2 = 0; _at2 = 0.0\n"
             "            for _nrm2, _d2 in _planos:\n"
             "                _dv = _V2 @ _nrm2 + _d2\n"
-            "                _cand = ((np.abs(_N2 @ _nrm2) > 0.94) & (np.abs(_dv) > 0.03) & (np.abs(_dv) < _BAND2))\n"
+            "                _cand = ((np.abs(_N2 @ _nrm2) > _ALIN2) & (np.abs(_dv) > 0.03) & (np.abs(_dv) < _BAND2))\n"
             "                if _cand.sum() < 200: continue\n"
             "                _ix2 = np.flatnonzero(_cand)\n"
             "                _nc, _lb = _csg.connected_components(_A[_ix2][:,_ix2], directed=False)\n"
@@ -3238,7 +3243,7 @@ def main():
             "                _sd = np.sqrt(np.maximum(_s2/np.maximum(_nv2,1) - _mu*_mu, 0))\n"
             "                _mx = np.full(_nc,-1e9); _mn = np.full(_nc,1e9)\n"
             "                np.maximum.at(_mx,_lb,_dd); np.minimum.at(_mn,_lb,_dd)\n"
-            "                _kp = (_am>0.02)&(_nv2>=60)&(_sd<0.02)&((_mx-_mn)<0.06)\n"
+            "                _kp = (_am>_AR2)&(_nv2>=_NV2)&(_sd<_FL2)&((_mx-_mn)<_GR2)\n"
             "                if not _kp.any(): continue\n"
             "                _mv = _ix2[_kp[_lb]]\n"
             "                _w2 = np.zeros(len(_V2)); _w2[_mv] = 1.0\n"
