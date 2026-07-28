@@ -2370,7 +2370,17 @@ _PRIORS_DIR = os.environ.get("MONO_PRIORS_DIR", "")
 # la deformación del BA, así que se vuelve al valor conocido-bueno. Ancla la
 # geometría métrica y densifica el techo. Las estrías se atacan por extracción
 # (depth_ratio=1), no aquí.
-_L_DEPTH = float(os.environ.get("MONO_LAMBDA_DEPTH", "0.2"))
+# FASE 0 (investigacion): el prior de PROFUNDIDAD queda en 0 a proposito.
+# Fue el que causo las LAMINAS: la profundidad monocular se alinea con
+# escala+desplazamiento FOTO POR FOTO, cada foto pide la pared a otra
+# distancia y el entrenamiento apila una capa por version. Evidencia dura
+# en los logs de este proyecto: 17.949 -> 116.896 pedazos sueltos, error de
+# orientacion de surfels 12 -> 45 grados.
+# El prior de NORMALES no tiene ese problema: una normal es una DIRECCION,
+# no depende de escala ni de desplazamiento, asi que es consistente entre
+# fotos. Es justo lo que aplana paredes lisas sin textura (DN-Splatter,
+# GaussianRoom). Subir esto de 0 solo si se quiere reproducir el fallo.
+_L_DEPTH = float(os.environ.get("MONO_LAMBDA_DEPTH", "0.0"))
 _L_NORM  = float(os.environ.get("MONO_LAMBDA_NORMAL", "0.1"))
 _P_FROM  = int(os.environ.get("MONO_FROM_ITER", "100"))
 _prior_cache = {}
@@ -2570,7 +2580,9 @@ def main():
             _img_tag = Path("/opt/IMAGE_TAG").read_text().strip()
         except Exception:
             _img_tag = "v3-o-v4-vieja (sin marcador)"
-        _bn_pr = "priorsOFF" if os.environ.get("MONO_PRIORS", "0") != "1" else "priorsON"
+        _bn_pr = ("priorsOFF" if os.environ.get("MONO_PRIORS", "1") != "1"
+                  else ("priorsNORM" if float(os.environ.get("MONO_LAMBDA_DEPTH","0.0"))==0.0
+                        else "priorsON"))
         _bn_sm = os.environ.get("SMOOTH_MODE", "twostep")
         _bn_sn = "snapON" if os.environ.get("PLANE_SNAP", "1") == "1" else "snapOFF"
         _bn_tr = int(os.environ.get("MESH_TRIS", "2500000")) // 1000
@@ -2578,7 +2590,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'bake99-snap2b' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{'bake99-snap2b-fase0' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -2687,7 +2699,7 @@ def main():
         # Riesgo conocido: sin la profundidad, el techo liso puede volver a tener
         # algún hueco -> lo compensa sdf_trunc 5x (banda ancha que rellena).
         # Reactivable con MONO_PRIORS=1.
-        if os.environ.get("MONO_PRIORS", "0") == "1":
+        if os.environ.get("MONO_PRIORS", "1") == "1":
             fase(0.42, "PASO 2c/5 — Priors monoculares (profundidad+normales)")
             pri_py = WORK / "make_priors.py"
             pri_py.write_text(PRIORS_SCRIPT)
@@ -2703,7 +2715,7 @@ def main():
                 log(f"   priors no disponibles (rc={_rc_pr}, n={_n_npz}): "
                     "entreno sin priors como hasta ahora")
         else:
-            log("   PASO 2c saltado (MONO_PRIORS=0)")
+            log("   PASO 2c saltado (MONO_PRIORS=0)")   # apagable con MONO_PRIORS=0
 
         # ── PARCHE matplotlib en 2DGS ──
         # 2DGS usa fig.canvas.tostring_rgb() en su función colormap(), pero
@@ -2766,6 +2778,10 @@ def main():
                 tptxt = tptxt.replace(TRAIN_ANCHOR, PRIOR_LOSS, 1)
                 tp.write_text(tptxt)
                 log("   parche de priors monoculares inyectado en train.py")
+                log("   FASE 0: prior de NORMALES activo (peso %s); prior de PROFUNDIDAD "
+                    "en %s (0 = apagado, fue el que causaba las laminas)"
+                    % (os.environ.get("MONO_LAMBDA_NORMAL","0.1"),
+                       os.environ.get("MONO_LAMBDA_DEPTH","0.0")))
             else:
                 log("   AVISO: no encontré las anclas en train.py — entreno SIN priors")
         except Exception as e:
@@ -2887,11 +2903,16 @@ def main():
         # NaN → el visor se colgaba ("cargando para siempre"). El camino del voxel fino
         # choca con un muro de visualización; el detalle vendrá por TEXTURA UV (no añade
         # triángulos, no rompe el visor). FAIL-SAFE: este /500 es la base que carga.
-        voxel = max(_maxext / 500.0, 0.005)
-        sdf_trunc = 5.0 * voxel          # banda ~5 voxeles (antes 4): cierra mejor los HUECOS
+        # FASE 0: ajustables sin tocar codigo. MEDIDO en la malla (55): del ruido
+        # total de pared (17.8 mm RMS), solo el 29% esta por debajo de 5 cm; el
+        # 52% es ondulacion de 20-50 cm que NINGUN ajuste de voxel arregla. O sea
+        # que subir el voxel tiene un techo de ~10-20%. Se dejan los knobs para
+        # poder barrer sin gastar codigo: TSDF_DIV mas chico = voxel mas grande.
+        voxel = max(_maxext / float(os.environ.get("TSDF_DIV", "500")), 0.005)
+        sdf_trunc = float(os.environ.get("TSDF_TRUNC_K", "5.0")) * voxel          # banda ~5 voxeles (antes 4): cierra mejor los HUECOS
         #                                  en zonas de poca observación, a cambio de redondear
         #                                  un poquito los detalles finos (compromiso aceptable).
-        depth_trunc = _diag * 1.3        # cubre el cuarto + margen; corta agujas lejanas
+        depth_trunc = _diag * float(os.environ.get("TSDF_DEPTH_K", "1.3"))        # cubre el cuarto + margen; corta agujas lejanas
         log(f"   escala medida: cuarto≈{_ext[0]:.2f}×{_ext[1]:.2f}×{_ext[2]:.2f}, "
             f"voxel={voxel:.4f}, sdf_trunc={sdf_trunc:.4f}, depth_trunc={depth_trunc:.2f}")
 
