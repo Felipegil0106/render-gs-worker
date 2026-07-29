@@ -2871,6 +2871,29 @@ def main():
             log(f"   ⚠ PGSR no esta en la imagen ({_PGSR_DIR}): uso 2DGS")
             _ENGINE = "2dgs"
         log(f"   MOTOR DE SUPERFICIE: {_ENGINE.upper()}")
+        if _ENGINE == "pgsr":
+            # FALLO REAL (job 4660e8f8): PGSR lee el sparse de <dataset>/sparse/
+            # SIN el /0, mientras MASt3R lo escribe en <dataset>/sparse/0/.
+            # Su lector intenta primero BINARIO en sparse/, y al fallar cae a
+            # TEXTO en sparse/ (nunca mira dentro de 0/), asi que reventaba con
+            #   FileNotFoundError: .../dataset/sparse/images.txt
+            # Se copian los tres .txt un nivel arriba. No se mueven ni se borran:
+            # 2DGS sigue leyendo su sparse/0 igual que siempre.
+            try:
+                _sp0 = dataset / "sparse" / "0"
+                _sp1 = dataset / "sparse"
+                _cop = []
+                for _f in ("cameras.txt", "images.txt", "points3D.txt"):
+                    if (_sp0 / _f).exists():
+                        shutil.copy(str(_sp0 / _f), str(_sp1 / _f)); _cop.append(_f)
+                log("   PGSR: sparse copiado a %s -> %s (PGSR lo lee SIN el /0)"
+                    % (_sp1, ", ".join(_cop) if _cop else "NADA"))
+                if len(_cop) < 2:
+                    log("   ⚠ PGSR: faltan archivos del sparse; uso 2DGS")
+                    _ENGINE = "2dgs"
+            except Exception as _ce:
+                log(f"   ⚠ PGSR: no pude preparar el sparse ({_ce}); uso 2DGS")
+                _ENGINE = "2dgs"
         def _entrenar(_dd):
             if _ENGINE == "pgsr":
                 return run(["python", os.path.join(_PGSR_DIR, "train.py"),
