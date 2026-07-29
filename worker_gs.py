@@ -2382,6 +2382,8 @@ _PRIORS_DIR = os.environ.get("MONO_PRIORS_DIR", "")
 # GaussianRoom). Subir esto de 0 solo si se quiere reproducir el fallo.
 _L_DEPTH = float(os.environ.get("MONO_LAMBDA_DEPTH", "0.0"))
 _L_NORM  = float(os.environ.get("MONO_LAMBDA_NORMAL", "0.1"))
+_ABS_COS = os.environ.get("MONO_ABS_COS", "1") == "1"   # |cos|: inmune al signo
+_COS_DIAG = False
 _P_FROM  = int(os.environ.get("MONO_FROM_ITER", "100"))
 _prior_cache = {}
 def _get_prior(name):
@@ -2430,7 +2432,24 @@ def _mono_losses(viewpoint_cam, render_pkg):
     n_world = (n_mono.permute(1, 2, 0) @ (viewpoint_cam.world_view_transform[:3, :3].T)).permute(2, 0, 1)
     rn = render_pkg["rend_normal"]
     cosine = (rn * n_world).sum(dim=0)
-    L_n = ((1.0 - cosine) * m.float()).sum() / (m.float().sum() + 1e-6)
+    # DIAGNOSTICO (una sola vez): si el coseno medio sale NEGATIVO, la normal
+    # del prior viene invertida respecto a la de 2DGS y la perdida estaba
+    # empujando los surfels justo al reves. Eso explicaria el desastre medido.
+    global _COS_DIAG
+    if not _COS_DIAG:
+        try:
+            _cm = float((cosine * m.float()).sum() / (m.float().sum() + 1e-6))
+            print("[priors] DIAGNOSTICO coseno medio prior-vs-render = %+.3f  (%s)"
+                  % (_cm, "SIGNO INVERTIDO" if _cm < -0.2 else
+                          ("alineado" if _cm > 0.2 else "SIN CORRELACION")), flush=True)
+            _COS_DIAG = True
+        except Exception:
+            _COS_DIAG = True
+    # |coseno|: penaliza que el EJE no coincida, sin depender del signo.
+    if _ABS_COS:
+        L_n = ((1.0 - cosine.abs()) * m.float()).sum() / (m.float().sum() + 1e-6)
+    else:
+        L_n = ((1.0 - cosine) * m.float()).sum() / (m.float().sum() + 1e-6)
     return L_d, L_n
 # ======= fin priors =======
 '''
@@ -2580,7 +2599,7 @@ def main():
             _img_tag = Path("/opt/IMAGE_TAG").read_text().strip()
         except Exception:
             _img_tag = "v3-o-v4-vieja (sin marcador)"
-        _bn_pr = ("priorsOFF" if os.environ.get("MONO_PRIORS", "1") != "1"
+        _bn_pr = ("priorsOFF" if os.environ.get("MONO_PRIORS", "0") != "1"
                   else ("priorsNORM" if float(os.environ.get("MONO_LAMBDA_DEPTH","0.0"))==0.0
                         else "priorsON"))
         _bn_sm = os.environ.get("SMOOTH_MODE", "twostep")
@@ -2590,7 +2609,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{'bake99-snap2b-fase0' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{os.environ.get("MESH_ENGINE","pgsr").lower() + '-bake99-snap2b' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -2683,7 +2702,20 @@ def main():
         else:
             log("   PASO 2b saltado (POSE_BA=0)")
 
-        # ── PASO 2c: priors monoculares — APAGADOS (causa de las LÁMINAS) ──
+        # ── PASO 2c: priors monoculares — APAGADOS (2 experimentos fallidos) ──
+        # INTENTO 2 (fase 0, job 47349919): se probo el prior de NORMALES SOLO,
+        # con la profundidad en 0, pensando que el culpable era la profundidad.
+        # RESULTADO: MISMO desastre. 139.570 pedazos sueltos (peor que los
+        # 116.896 del intento 1), gaussianas 1.1M -> 2.19M, PSNR 33.5 -> 29.1,
+        # malla cruda 272 MB, y el aplanado NO ENCONTRO NI UN PLANO (la malla
+        # quedo tan laminada que RANSAC no reconocia una pared).
+        # Asi que la normal tampoco sirve TAL COMO ESTA APLICADA. Sospecha
+        # concreta pendiente de verificar: el signo. DSINE entrega la normal en
+        # SU convencion de camara y aqui se usa cruda, sin comprobar que
+        # coincida con la de 2DGS. Una normal invertida empuja los surfels a la
+        # orientacion contraria: eso produce exactamente lo que se midio.
+        # Queda el arreglo |coseno| (insensible al signo) + un diagnostico que
+        # imprime el coseno medio; se activa con MONO_PRIORS=1 para UNA prueba.
         # EVIDENCIA DURA de los logs: al activar los priors, la malla cruda pasó de
         # 17,949 a 116,896 PEDAZOS SUELTOS (6.5x), las gaussianas de 922k a 1.96M
         # (2.1x) y el error de orientación de los surfels de 12° a 45° (13x peor).
@@ -2699,7 +2731,7 @@ def main():
         # Riesgo conocido: sin la profundidad, el techo liso puede volver a tener
         # algún hueco -> lo compensa sdf_trunc 5x (banda ancha que rellena).
         # Reactivable con MONO_PRIORS=1.
-        if os.environ.get("MONO_PRIORS", "1") == "1":
+        if os.environ.get("MONO_PRIORS", "0") == "1":
             fase(0.42, "PASO 2c/5 — Priors monoculares (profundidad+normales)")
             pri_py = WORK / "make_priors.py"
             pri_py.write_text(PRIORS_SCRIPT)
@@ -2788,7 +2820,7 @@ def main():
             log(f"   (no se pudo parchear priors en train.py: {e})")
 
         # ── PASO 3: entrenar 2DGS ──
-        fase(0.45, f"PASO 3/5 — Entrenando 2DGS ({ITERS} iter)")
+        fase(0.45, f"PASO 3/5 — Entrenando superficie ({ITERS} iter)")
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
         # --lambda_dist : regularizador de DISTORSIÓN. En TEORÍA (paper 2DGS) subirlo
         # de 25 a 100-1000 debería consolidar las láminas en una superficie. Se probó
@@ -2822,7 +2854,35 @@ def main():
                 log(f"   (no pude leer la VRAM: {_e}) → data_device=cpu (modo seguro)")
         _LAMBDA_DIST = os.environ.get("LAMBDA_DIST", "25")
         log(f"   lambda_dist = {_LAMBDA_DIST} (25 preserva estructura; 100 deformaba)")
+        # ── FASE 1: motor de superficie seleccionable ────────────────────────
+        # MESH_ENGINE=pgsr (por defecto) -> PGSR: impone planaridad DURANTE el
+        # entrenamiento (profundidad insesgada + consistencia multi-vista
+        # fotometrica y geometrica). Es lo que ataca la ondulacion de 20-50 cm
+        # que medimos como el 52% del ruido de pared y que ningun ajuste del
+        # TSDF ni del aplanado posterior podia tocar.
+        # MESH_ENGINE=2dgs -> el motor de siempre, intacto, como respaldo.
+        # Banderas de PGSR recomendadas por sus autores para escenas de POCA
+        # TEXTURA (exactamente paredes lisas): --max_abs_split_points 0 evita
+        # que se sobreajuste partiendo puntos, y --opacity_cull_threshold 0.05
+        # baja el numero de gaussianas.
+        _ENGINE = os.environ.get("MESH_ENGINE", "pgsr").lower()
+        _PGSR_DIR = os.environ.get("PGSR_DIR", "/opt/pgsr")
+        if _ENGINE == "pgsr" and not os.path.exists(os.path.join(_PGSR_DIR, "train.py")):
+            log(f"   ⚠ PGSR no esta en la imagen ({_PGSR_DIR}): uso 2DGS")
+            _ENGINE = "2dgs"
+        log(f"   MOTOR DE SUPERFICIE: {_ENGINE.upper()}")
         def _entrenar(_dd):
+            if _ENGINE == "pgsr":
+                return run(["python", os.path.join(_PGSR_DIR, "train.py"),
+                     "-s", str(dataset), "-m", str(dgs_out),
+                     "--iterations", str(ITERS),
+                     "-r", "1",
+                     "--max_abs_split_points",
+                     os.environ.get("PGSR_SPLIT_PTS", "0"),
+                     "--opacity_cull_threshold",
+                     os.environ.get("PGSR_OPACITY_CULL", "0.05"),
+                     "--data_device", _dd],
+                    fase_label="PASO 3/5 — Entrenando PGSR", check=False)
             return run(["python", "/opt/2dgs/train.py",
                  "-s", str(dataset), "-m", str(dgs_out),
                  "--iterations", str(ITERS),
@@ -2837,7 +2897,7 @@ def main():
             log("   ⚠ el entrenamiento falló en VRAM (probable falta de memoria); REINTENTO en modo seguro (cpu)")
             _rc_tr, _out_tr = _entrenar("cpu")
         if _rc_tr != 0:
-            raise RuntimeError(f"El entrenamiento 2DGS falló (código {_rc_tr}).")
+            raise RuntimeError(f"El entrenamiento falló (código {_rc_tr}).")
         log(f"   2DGS entrenado en {(time.time()-_t_tr)/60:.1f} min (data_device={_dev})")
         # ── CHEQUEO DE CALIDAD (PSNR) — red de seguridad ──
         # La investigación mostró que el entrenamiento puede salir mal e inestable.
@@ -2939,19 +2999,36 @@ def main():
         # valor de b02d2d8c.
         _DEPTH_RATIO = os.environ.get("DEPTH_RATIO", "0")
         log(f"   depth_ratio = {_DEPTH_RATIO} (0=promedio, el de b02d2d8c; la mediana empeoró)")
-        log(f"$ python /opt/2dgs/render.py (BOUNDED) --depth_ratio {_DEPTH_RATIO} "
-            f"--voxel_size {voxel:.4f} --sdf_trunc {sdf_trunc:.4f} "
-            f"--depth_trunc {depth_trunc:.2f} --num_cluster 50  (OMP=8)")
-        rc_mesh, _salida_mesh = run(
-            ["python", "/opt/2dgs/render.py",
-             "-s", str(dataset), "-m", str(dgs_out),
-             "--skip_train", "--skip_test",
-             "--depth_ratio", _DEPTH_RATIO,
-             "--voxel_size", f"{voxel:.6f}",
-             "--sdf_trunc", f"{sdf_trunc:.6f}",
-             "--depth_trunc", f"{depth_trunc:.6f}",
-             "--num_cluster", "50"],
-            env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
+        if _ENGINE == "pgsr":
+            # PGSR fusiona su propia malla (TSDF) con profundidad insesgada.
+            # --use_depth_filter lo recomiendan sus autores cuando hay puntos
+            # flotantes o vistas insuficientes: es justo nuestro caso y ataca
+            # las laminas despegadas ANTES de que existan.
+            _pg_cmd = ["python", os.path.join(_PGSR_DIR, "render.py"),
+                       "-s", str(dataset), "-m", str(dgs_out),
+                       "--skip_test",
+                       "--max_depth", f"{depth_trunc:.6f}",
+                       "--voxel_size", f"{voxel:.6f}",
+                       "--num_cluster", os.environ.get("PGSR_CLUSTER", "50")]
+            if os.environ.get("PGSR_DEPTH_FILTER", "1") == "1":
+                _pg_cmd.append("--use_depth_filter")
+            log("$ " + " ".join(_pg_cmd))
+            rc_mesh, _salida_mesh = run(_pg_cmd, env=env_mesh,
+                fase_label="PASO 4/5 — Extrayendo malla (PGSR)", check=False)
+        else:
+            log(f"$ python /opt/2dgs/render.py (BOUNDED) --depth_ratio {_DEPTH_RATIO} "
+                f"--voxel_size {voxel:.4f} --sdf_trunc {sdf_trunc:.4f} "
+                f"--depth_trunc {depth_trunc:.2f} --num_cluster 50  (OMP=8)")
+            rc_mesh, _salida_mesh = run(
+                ["python", "/opt/2dgs/render.py",
+                 "-s", str(dataset), "-m", str(dgs_out),
+                 "--skip_train", "--skip_test",
+                 "--depth_ratio", _DEPTH_RATIO,
+                 "--voxel_size", f"{voxel:.6f}",
+                 "--sdf_trunc", f"{sdf_trunc:.6f}",
+                 "--depth_trunc", f"{depth_trunc:.6f}",
+                 "--num_cluster", "50"],
+                env=env_mesh, fase_label="PASO 4/5 — Extrayendo malla", check=False)
         # Buscar la malla generada. En modo unbounded los nombres son
         # fuse_unbounded.ply (cruda) y fuse_unbounded_post.ply (limpia). Preferimos
         # la limpia. En modo BOUNDED los nombres son fuse_post.ply (limpia) y
@@ -2963,7 +3040,10 @@ def main():
             except Exception:
                 return False
         malla = None
-        for nombre in ("fuse_post.ply", "fuse.ply",
+        candidatos = [c for c in candidatos
+                      if "point_cloud" not in str(c).lower()]   # esa es la NUBE, no la malla
+        for nombre in ("tsdf_fusion_post.ply", "tsdf_fusion.ply",   # PGSR
+                       "fuse_post.ply", "fuse.ply",                 # 2DGS
                        "fuse_unbounded_post.ply", "fuse_unbounded.ply"):
             for c in candidatos:
                 if c.name.lower() == nombre and _es_no_vacia(c):
