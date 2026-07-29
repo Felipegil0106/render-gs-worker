@@ -2609,7 +2609,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{os.environ.get("MESH_ENGINE","pgsr").lower() + '-bake99-snap2b' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{os.environ.get('MESH_ENGINE','pgsr').lower() + '-bake99-snap2b' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
