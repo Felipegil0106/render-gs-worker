@@ -348,6 +348,10 @@ BAKE_DILA     = int(os.environ.get("OMVS_BAKE_DILA", "6"))       # dilatacion de
 BAKE_EXPO     = os.environ.get("OMVS_BAKE_EXPO", "1") == "1"     # normaliza la exposicion de cada foto a la mediana global antes de mezclar (mata el "distintos tonos" del auto-exposicion del celular)
 BAKE_FIX      = os.environ.get("OMVS_BAKE_FIX", "1") == "1"      # a los texeles que ninguna foto ve les copia el TONO de sus vecinos horneados (mata las islas poligonales de tono ajeno)
 BAKE_FIXBLUR  = int(os.environ.get("OMVS_BAKE_FIXBLUR", "9"))    # suavizado del campo de correccion (celdas de la rejilla gruesa)
+BAKE_TONO     = os.environ.get("OMVS_BAKE_TONO", "1") == "1"   # nivelar tono de paredes
+BAKE_TONO_ESC = float(os.environ.get("OMVS_TONO_ESC", "1.0"))  # se aplana lo que varie a mas de N metros
+BAKE_TONO_FZA = float(os.environ.get("OMVS_TONO_FZA", "1.0"))  # 1.0 = correccion completa
+BAKE_TONO_TOPE= float(os.environ.get("OMVS_TONO_TOPE","1.6"))  # tope de la ganancia
 BAKE_VDOT     = int(os.environ.get("OMVS_BAKE_VDOT", "2"))       # radio del puntito para las caras de area cero (texeles)
 BAKE_VFILL    = os.environ.get("OMVS_BAKE_VFILL", "1") == "1"     # tapa los parches vacios del atlas con el color por vertice de la malla (medido: 23% de las caras salian en gris plano)
 BAKE_FIXDS    = int(os.environ.get("OMVS_BAKE_FIXDS", "16"))     # la correccion se calcula a 1/16 de resolucion (es de baja frecuencia): megas en vez de gigas
@@ -1529,6 +1533,186 @@ def bake_multiview(objf, texfiles, mtl2tex):
         log("BAKE: %d caras apuntaban al gris de relleno -> pintadas con el color de la "
             "malla (%.1fM texeles). Esto es lo que se veia como parches y huecos en paredes y piso."
             % (_nvac,_nvpx/1e6))
+    # ══ NIVELADO DE TONO DE PAREDES ═════════════════════════════════════════
+    # MEDIDO en la malla (58): la variacion de brillo de las paredes NO es
+    # excesiva en total (es menor que la de Polycam), pero esta CONCENTRADA en
+    # la escala grande: banda de 1-3 m = 22.3 niveles de gris, mientras 5-30 cm
+    # y 30 cm-1 m valen ~14. Un gradiente suave de metro y medio es lo que el
+    # ojo lee como "esta pared no esta de un solo tono"; el grano fino lo lee
+    # como textura. Asi que se quita SOLO la banda grande.
+    # Probado sobre la (58) antes de tocar nada: banda 1-3 m 22.3 -> 7.6 (-66%),
+    # 30cm-1m 14.8 -> 12.3, 5-30cm 13.4 -> 13.5 (igual), grano fino 9.2 -> 10.1.
+    # COMO: por cada plano grande (pared/piso/techo) se arma una rejilla de 2 cm
+    # EN COORDENADAS DEL PLANO (no del atlas: el atlas parte cada pared en miles
+    # de parches y un filtro ahi mezclaria zonas que no se tocan), se saca su
+    # gradiente de baja frecuencia y se corrige de forma MULTIPLICATIVA hacia el
+    # tono medio de esa pared. La ganancia es por CARA porque varia a escala de
+    # metros: no hace falta por texel.
+    # COSTO ACEPTADO: los gradientes de luz REALES (ventana, lampara) tambien se
+    # aplanan. Es el precio de "un solo tono"; se baja con OMVS_TONO_FZA<1.
+    if BAKE_TONO and len(F) > 5000:
+        try:
+            _tt0=time.time()
+            from scipy import ndimage as _ndi
+            # COLOR POR CARA: se lee el atlas ya horneado y se muestrea el texel
+            # del centro de cada cara. Con una muestra por cara sobra, porque lo
+            # que se busca es el gradiente a escala de METROS, no el detalle.
+            FCOL=_np.zeros((len(F),3),_np.float32)
+            _uvc=(Tn[FT[:,0]]+Tn[FT[:,1]]+Tn[FT[:,2]])/3.0
+            for _ti,_tf in enumerate(texfiles):
+                _mt=_np.flatnonzero(FM==_ti)
+                if not len(_mt): continue
+                _im=Image.open(_tf).convert("RGB")
+                _A=_np.asarray(_im,dtype=_np.uint8); del _im
+                _Ha,_Wa=_A.shape[:2]
+                _px=_np.clip((_uvc[_mt,0]*(_Wa-1)).astype(_np.int64),0,_Wa-1)
+                _vv=(1.0-_uvc[_mt,1]) if flip==0 else _uvc[_mt,1]
+                _py=_np.clip((_vv*(_Ha-1)).astype(_np.int64),0,_Ha-1)
+                FCOL[_mt]=_A[_py,_px].astype(_np.float32)
+                del _A; _gc.collect()
+            # las caras que quedaron en el gris de relleno no aportan tono
+            _gris=_np.abs(FCOL-128.0).max(1)<=6
+            FCOL[_gris]=_np.nan
+            _o3=None
+            try:
+                import open3d as _o3
+            except Exception:
+                _o3=None
+            _cen=(V[F[:,0]]+V[F[:,1]]+V[F[:,2]])/3.0
+            _e0=V[F[:,1]]-V[F[:,0]]; _e1v=V[F[:,2]]-V[F[:,0]]
+            _fn=_np.cross(_e0,_e1v)
+            _ln=_np.linalg.norm(_fn,axis=1); _ok=_ln>1e-12
+            _fn[_ok]/=_ln[_ok][:,None]
+            _CG=V.mean(0)
+            # --- planos dominantes por RANSAC (submuestreado) ---
+            _planos=[]
+            if _o3 is not None:
+                _Vs=V[::4]
+                _rest=_np.arange(len(_Vs))
+                for _r in range(8):
+                    if len(_rest)<4000: break
+                    _pc=_o3.geometry.PointCloud()
+                    _pc.points=_o3.utility.Vector3dVector(_Vs[_rest])
+                    try:
+                        _mod,_inl=_pc.segment_plane(distance_threshold=0.02,ransac_n=3,num_iterations=800)
+                    except Exception:
+                        break
+                    if len(_inl)<4000: break
+                    _a,_b,_c,_d=_mod; _nn=_np.array([_a,_b,_c],dtype=_np.float64)
+                    _L=_np.linalg.norm(_nn)
+                    if _L<1e-9: break
+                    _planos.append((_nn/_L,_d/_L))
+                    _rest=_np.setdiff1d(_rest,_rest[_np.asarray(_inl)])
+            if not _planos:
+                log("BAKE TONO: no encontre planos grandes; lo salto")
+            else:
+                _gan=_np.ones(len(F),_np.float32)
+                _npar=0
+                for _nrm,_dd in _planos:
+                    _lado=_np.sign(float(_np.dot(_CG,_nrm))+_dd) or 1.0
+                    _dist=(_cen@_nrm+_dd)*_lado
+                    _sel=(_np.abs(_fn@_nrm)>0.90)&(_np.abs(_dist)<0.06)
+                    if int(_sel.sum())<8000: continue
+                    _ix=_np.flatnonzero(_sel)
+                    _u=_np.array([1.0,0,0]) if abs(_nrm[0])<0.9 else _np.array([0,1.0,0])
+                    _a1=_np.cross(_nrm,_u); _a1/=_np.linalg.norm(_a1)
+                    _a2=_np.cross(_nrm,_a1)
+                    _x=_cen[_ix]@_a1; _y=_cen[_ix]@_a2
+                    _P=0.02
+                    _gx=((_x-_x.min())/_P).astype(_np.int64)
+                    _gy=((_y-_y.min())/_P).astype(_np.int64)
+                    _W=int(_gx.max())+1; _H=int(_gy.max())+1
+                    if _W*_H>4_000_000 or _W<60 or _H<60: continue
+                    # color medio por cara (basta: se busca la escala de METROS)
+                    _bue=~_np.isnan(FCOL[_ix]).any(1)
+                    if _bue.sum()<4000: continue
+                    _ix=_ix[_bue]
+                    _gx=_gx[_bue]; _gy=_gy[_bue]
+                    _cf=FCOL[_ix]
+                    _S=_np.zeros((_H,_W,3)); _Cn=_np.zeros((_H,_W))
+                    for _k in range(3): _np.add.at(_S[:,:,_k],(_gy,_gx),_cf[:,_k])
+                    _np.add.at(_Cn,(_gy,_gx),1.0)
+                    _mk=_Cn>0
+                    if _mk.mean()<0.05: continue
+                    _G=_np.where(_mk[:,:,None],_S/_np.maximum(_Cn,1.0)[:,:,None],0.0)
+                    _ii=_ndi.distance_transform_edt(~_mk,return_distances=False,return_indices=True)
+                    _G=_G[_ii[0],_ii[1]]
+                    _kk=max(3,int(BAKE_TONO_ESC/_P))
+                    _BJ=_np.stack([_ndi.uniform_filter(_G[:,:,_k],size=_kk) for _k in range(3)],-1)
+                    _obj=_G[_mk].mean(0)
+                    _g3=_np.clip(_obj[None,None,:]/_np.maximum(_BJ,1.0),
+                                 1.0/BAKE_TONO_TOPE,BAKE_TONO_TOPE)
+                    _gl=_g3.mean(2)                       # una ganancia por celda
+                    _gf=_gl[_np.clip(_gy,0,_H-1),_np.clip(_gx,0,_W-1)]
+                    _gf=1.0+BAKE_TONO_FZA*(_gf-1.0)
+                    _gan[_ix]=_gf.astype(_np.float32)
+                    _npar+=1
+                if _npar==0:
+                    log("BAKE TONO: ningun plano cumplio el minimo; lo salto")
+                else:
+                    _apl=_np.flatnonzero(_np.abs(_gan-1.0)>0.01)
+                    log("BAKE TONO: %d superficies, %d caras a corregir (escala %.1f m, fuerza %.2f)"
+                        % (_npar,len(_apl),BAKE_TONO_ESC,BAKE_TONO_FZA))
+                    _ntx=0
+                    for _ti,_tf in enumerate(texfiles):
+                        _sf=_apl[FM[_apl]==_ti]
+                        if not len(_sf): continue
+                        _im=Image.open(_tf).convert("RGB")
+                        _bs=_np.asarray(_im,dtype=_np.uint8).copy(); del _im
+                        _H2,_W2=_bs.shape[:2]
+                        _uv=Tn[FT[_sf]]
+                        _pu=(_uv[:,:,0]*(_W2-1)).astype(_np.float32)
+                        _pv=(((1.0-_uv[:,:,1]) if flip==0 else _uv[:,:,1])*(_H2-1)).astype(_np.float32)
+                        _x0=_np.clip(_np.floor(_pu.min(1)),0,_W2-1).astype(_np.int64)
+                        _x1=_np.clip(_np.ceil (_pu.max(1)),0,_W2-1).astype(_np.int64)
+                        _y0=_np.clip(_np.floor(_pv.min(1)),0,_H2-1).astype(_np.int64)
+                        _y1=_np.clip(_np.ceil (_pv.max(1)),0,_H2-1).astype(_np.int64)
+                        _ld=_np.maximum(_x1-_x0,_y1-_y0)+1
+                        _ex=_np.zeros(len(_sf),_np.int32); _l=_ld.copy()
+                        while (_l>1).any(): _ex+=(_l>1); _l=(_l+1)//2
+                        _ex=_np.minimum(_ex,6)
+                        _gs=_gan[_sf]
+                        for _e in range(int(_ex.max())+1 if len(_ex) else 0):
+                            _sg=_np.flatnonzero(_ex==_e)
+                            if not len(_sg): continue
+                            _K=1<<_e; _dxy=_np.arange(_K,dtype=_np.int64)
+                            _paso=max(1,3_000_000//(_K*_K))
+                            for _c0 in range(0,len(_sg),_paso):
+                                _s=_sg[_c0:_c0+_paso]; _n=len(_s)
+                                _X=_x0[_s][:,None,None]+_dxy[None,None,:]
+                                _Y=_y0[_s][:,None,None]+_dxy[None,:,None]
+                                _okb=(_X<=_x1[_s][:,None,None])&(_Y<=_y1[_s][:,None,None])
+                                _okb=_np.broadcast_to(_okb,(_n,_K,_K)).copy()
+                                _Xf=_np.broadcast_to(_X,(_n,_K,_K)).astype(_np.float32)
+                                _Yf=_np.broadcast_to(_Y,(_n,_K,_K)).astype(_np.float32)
+                                _ax=_pu[_s,0][:,None,None]; _ay=_pv[_s,0][:,None,None]
+                                _bx=_pu[_s,1][:,None,None]; _by=_pv[_s,1][:,None,None]
+                                _cx=_pu[_s,2][:,None,None]; _cy=_pv[_s,2][:,None,None]
+                                _den=(_by-_cy)*(_ax-_cx)+(_cx-_bx)*(_ay-_cy)
+                                _den=_np.where(_np.abs(_den)<1e-9,1e-9,_den)
+                                _l0=((_by-_cy)*(_Xf-_cx)+(_cx-_bx)*(_Yf-_cy))/_den
+                                _l1=((_cy-_ay)*(_Xf-_cx)+(_ax-_cx)*(_Yf-_cy))/_den
+                                _okb&=(_l0>=-0.02)&(_l1>=-0.02)&((1.0-_l0-_l1)>=-0.02)
+                                del _Xf,_Yf,_den,_l0,_l1
+                                if _okb.any():
+                                    _ixp=_np.broadcast_to(_X,(_n,_K,_K))[_okb]
+                                    _iyp=_np.broadcast_to(_Y,(_n,_K,_K))[_okb]
+                                    _fid=_np.broadcast_to(_np.arange(_n)[:,None,None],(_n,_K,_K))[_okb]
+                                    _cur=_bs[_iyp,_ixp].astype(_np.float32)
+                                    _bs[_iyp,_ixp]=_np.clip(_cur*_gs[_s][_fid][:,None],0,255).astype(_np.uint8)
+                                    _ntx+=int(_okb.sum())
+                                    del _ixp,_iyp,_fid,_cur
+                                del _X,_Y,_okb
+                        if _tf.lower().endswith((".jpg",".jpeg")):
+                            Image.fromarray(_bs).save(_tf,quality=max(BAKE_JQ,90),subsampling=2)
+                        else:
+                            Image.fromarray(_bs).save(_tf)
+                        del _bs; _gc.collect()
+                    log("BAKE TONO: %.1fM texeles nivelados en %.1f min "
+                        "(esto es lo que se veia como paredes con tonos distintos)"
+                        % (_ntx/1e6,(time.time()-_tt0)/60.0))
+        except Exception as _te:
+            log("BAKE TONO: fallo, sigo sin el (%s)" % _te)
     log("BAKE listo: %.1fM texeles | cobertura >=1 foto %.0f%%, >=3 fotos %.0f%% | %s | "
         "atlas x%d en %.1f min"
         % (NT/1e6,cov1,cov3,"GPU" if usa_gpu else "CPU",SC,(time.time()-_t0)/60.0))
@@ -2609,7 +2793,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{os.environ.get('MESH_ENGINE','pgsr').lower() + '-bake99-snap2b' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b-tono' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -2865,7 +3049,11 @@ def main():
         # TEXTURA (exactamente paredes lisas): --max_abs_split_points 0 evita
         # que se sobreajuste partiendo puntos, y --opacity_cull_threshold 0.05
         # baja el numero de gaussianas.
-        _ENGINE = os.environ.get("MESH_ENGINE", "pgsr").lower()
+        # PGSR se probo (job eefc0681) y NO mejoro las paredes: rugosidad 18.1 vs
+        # 19.0 mm de 2DGS (5%, ruido) y ondulacion 20-50cm 13.3 vs 14.1 mm, pero
+        # el render paso de 58 a 109 minutos y el PSNR bajo de 33.6 a 31.3.
+        # Se vuelve a 2DGS. PGSR sigue en la imagen: MESH_ENGINE=pgsr lo enciende.
+        _ENGINE = os.environ.get("MESH_ENGINE", "2dgs").lower()
         _PGSR_DIR = os.environ.get("PGSR_DIR", "/opt/pgsr")
         if _ENGINE == "pgsr" and not os.path.exists(os.path.join(_PGSR_DIR, "train.py")):
             log(f"   ⚠ PGSR no esta en la imagen ({_PGSR_DIR}): uso 2DGS")
