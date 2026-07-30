@@ -348,10 +348,14 @@ BAKE_DILA     = int(os.environ.get("OMVS_BAKE_DILA", "6"))       # dilatacion de
 BAKE_EXPO     = os.environ.get("OMVS_BAKE_EXPO", "1") == "1"     # normaliza la exposicion de cada foto a la mediana global antes de mezclar (mata el "distintos tonos" del auto-exposicion del celular)
 BAKE_FIX      = os.environ.get("OMVS_BAKE_FIX", "1") == "1"      # a los texeles que ninguna foto ve les copia el TONO de sus vecinos horneados (mata las islas poligonales de tono ajeno)
 BAKE_FIXBLUR  = int(os.environ.get("OMVS_BAKE_FIXBLUR", "9"))    # suavizado del campo de correccion (celdas de la rejilla gruesa)
-BAKE_TONO     = os.environ.get("OMVS_BAKE_TONO", "1") == "1"   # nivelar tono de paredes
+BAKE_TONO     = os.environ.get("OMVS_BAKE_TONO", "0") == "1"   # APAGADO: fallo con V; se prueba aparte
 BAKE_TONO_ESC = float(os.environ.get("OMVS_TONO_ESC", "1.0"))  # se aplana lo que varie a mas de N metros
 BAKE_TONO_FZA = float(os.environ.get("OMVS_TONO_FZA", "1.0"))  # 1.0 = correccion completa
 BAKE_TONO_TOPE= float(os.environ.get("OMVS_TONO_TOPE","1.6"))  # tope de la ganancia
+BAKE_SEAM     = os.environ.get("OMVS_BAKE_SEAM", "1") == "1"   # nivelar costuras entre parches
+BAKE_SEAM_MU  = float(os.environ.get("OMVS_SEAM_MU",  "0.05"))  # rigidez dentro del parche
+BAKE_SEAM_LAM = float(os.environ.get("OMVS_SEAM_LAM", "0.02"))  # anclaje del offset
+BAKE_SEAM_TOPE= float(os.environ.get("OMVS_SEAM_TOPE","40"))    # tope del offset en niveles
 BAKE_VDOT     = int(os.environ.get("OMVS_BAKE_VDOT", "2"))       # radio del puntito para las caras de area cero (texeles)
 BAKE_VFILL    = os.environ.get("OMVS_BAKE_VFILL", "1") == "1"     # tapa los parches vacios del atlas con el color por vertice de la malla (medido: 23% de las caras salian en gris plano)
 BAKE_FIXDS    = int(os.environ.get("OMVS_BAKE_FIXDS", "16"))     # la correccion se calcula a 1/16 de resolucion (es de baja frecuencia): megas en vez de gigas
@@ -1713,6 +1717,142 @@ def bake_multiview(objf, texfiles, mtl2tex):
                         % (_ntx/1e6,(time.time()-_tt0)/60.0))
         except Exception as _te:
             log("BAKE TONO: fallo, sigo sin el (%s)" % _te)
+    # ══ NIVELADO DE COSTURAS ENTRE PARCHES ══════════════════════════════════
+    # MEDIDO en la malla (58): OpenMVS parte la malla en parches y a cada uno le
+    # asigna UNA foto. Al cruzar de parche cambia la foto y salta el tono. En las
+    # paredes el salto medio entre caras vecinas es 4.44 niveles DENTRO del mismo
+    # parche y 9.15 CRUZANDO (2.1x), y el 13.7% de los bordes de parche salta mas
+    # de 15 niveles. Como el borde sigue aristas de triangulos, se ve como
+    # RECTANGULOS Y PARALELOGRAMOS de bordes rectos y diagonales con distinto
+    # gris: es justo lo que se reportaba como "bloques" y "cicatrices".
+    # OpenMVS trae dos correcciones para esto (--global/--local-seam-leveling)
+    # pero estan en 0, y aunque se encendieran NO SERVIRIA: el horneador escribe
+    # 48M texeles ENCIMA, borrandolas. Por eso el arreglo va aqui.
+    # COMO: se resuelve un campo de compensacion (un offset por cara) que anula
+    # el salto en los bordes de parche y se mantiene liso dentro de cada parche.
+    # Es un sistema disperso (Laplaciano) resuelto por gradiente conjugado.
+    # PROBADO sobre la (58) antes de escribir esto:
+    #   cruzando parche  9.70 -> 1.34 niveles (-86%), p95 38.3 -> 3.4
+    #   dentro del parche 4.35 -> 4.39 (+1%)  <- el detalle NO se toca
+    #   bordes con salto >15 niveles: 14.9% -> 2.2%
+    if BAKE_SEAM and len(F) > 5000:
+        try:
+            _st0=time.time()
+            import scipy.sparse as _sps
+            from scipy.sparse.linalg import cg as _cg
+            # --- color por cara, leido de los atlas ya horneados ---
+            _uvc=(Tn[FT[:,0]]+Tn[FT[:,1]]+Tn[FT[:,2]])/3.0
+            _FC=_np.zeros((len(F),3),_np.float32)
+            for _ti,_tf in enumerate(texfiles):
+                _mt=_np.flatnonzero(FM==_ti)
+                if not len(_mt): continue
+                _im=Image.open(_tf).convert("RGB")
+                _A=_np.asarray(_im,dtype=_np.uint8); del _im
+                _Ha,_Wa=_A.shape[:2]
+                _px=_np.clip((_uvc[_mt,0]*(_Wa-1)).astype(_np.int64),0,_Wa-1)
+                _vv=(1.0-_uvc[_mt,1]) if flip==0 else _uvc[_mt,1]
+                _py=_np.clip((_vv*(_Ha-1)).astype(_np.int64),0,_Ha-1)
+                _FC[_mt]=_A[_py,_px].astype(_np.float32)
+                del _A; _gc.collect()
+            # --- caras vecinas (comparten arista) ---
+            _E=_np.sort(_np.stack([F[:,[0,1]],F[:,[1,2]],F[:,[2,0]]],1).reshape(-1,2),axis=1)
+            _fi=_np.repeat(_np.arange(len(F)),3)
+            _o=_np.lexsort((_E[:,1],_E[:,0])); _Es=_E[_o]; _fs=_fi[_o]
+            _ig=_np.flatnonzero((_Es[:-1]==_Es[1:]).all(1))
+            _f1=_fs[_ig]; _f2=_fs[_ig+1]
+            del _E,_fi,_o,_Es,_fs,_ig
+            if len(_f1)<1000:
+                log("BAKE COSTURA: la malla no comparte aristas; lo salto")
+            else:
+                _duv=_np.linalg.norm(_uvc[_f1]-_uvc[_f2],axis=1)
+                _tip=float(_np.median(_duv))
+                _sm=(FM[_f1]!=FM[_f2])|(_duv>5.0*max(_tip,1e-9))
+                _N=len(F)
+                def _lap(_a,_b,_w):
+                    _n=len(_a)
+                    _r=_np.concatenate([_a,_b,_a,_b]); _c=_np.concatenate([_a,_b,_b,_a])
+                    _v=_np.concatenate([_np.full(_n,_w),_np.full(_n,_w),
+                                        _np.full(_n,-_w),_np.full(_n,-_w)])
+                    return _sps.csr_matrix((_v,(_r,_c)),shape=(_N,_N))
+                _Aop=(_lap(_f1[_sm],_f2[_sm],1.0)
+                      +_lap(_f1[~_sm],_f2[~_sm],BAKE_SEAM_MU)
+                      +BAKE_SEAM_LAM*_sps.identity(_N,format='csr')).tocsr()
+                _OFF=_np.zeros((_N,3),_np.float32)
+                for _ch in range(3):
+                    _d=(_FC[_f1[_sm],_ch]-_FC[_f2[_sm],_ch]).astype(_np.float64)
+                    _b=_np.zeros(_N)
+                    _np.add.at(_b,_f1[_sm],-_d); _np.add.at(_b,_f2[_sm],_d)
+                    try:
+                        _x,_inf=_cg(_Aop,_b,rtol=1e-6,maxiter=300)
+                    except TypeError:
+                        _x,_inf=_cg(_Aop,_b,tol=1e-6,maxiter=300)
+                    _OFF[:,_ch]=_np.clip(_x,-BAKE_SEAM_TOPE,BAKE_SEAM_TOPE)
+                log("BAKE COSTURA: %d bordes de parche de %d aristas; compensacion "
+                    "media %.2f niveles, maxima %.1f"
+                    % (int(_sm.sum()),len(_f1),float(_np.abs(_OFF).mean()),
+                       float(_np.abs(_OFF).max())))
+                # --- aplicar el offset a la huella de cada cara ---
+                _apl=_np.flatnonzero(_np.abs(_OFF).max(1)>0.5)
+                _ntx=0
+                for _ti,_tf in enumerate(texfiles):
+                    _sf=_apl[FM[_apl]==_ti]
+                    if not len(_sf): continue
+                    _im=Image.open(_tf).convert("RGB")
+                    _bs=_np.asarray(_im,dtype=_np.uint8).copy(); del _im
+                    _H2,_W2=_bs.shape[:2]
+                    _uv=Tn[FT[_sf]]
+                    _pu=(_uv[:,:,0]*(_W2-1)).astype(_np.float32)
+                    _pv=(((1.0-_uv[:,:,1]) if flip==0 else _uv[:,:,1])*(_H2-1)).astype(_np.float32)
+                    _x0=_np.clip(_np.floor(_pu.min(1)),0,_W2-1).astype(_np.int64)
+                    _x1=_np.clip(_np.ceil (_pu.max(1)),0,_W2-1).astype(_np.int64)
+                    _y0=_np.clip(_np.floor(_pv.min(1)),0,_H2-1).astype(_np.int64)
+                    _y1=_np.clip(_np.ceil (_pv.max(1)),0,_H2-1).astype(_np.int64)
+                    _ld=_np.maximum(_x1-_x0,_y1-_y0)+1
+                    _ex=_np.zeros(len(_sf),_np.int32); _l=_ld.copy()
+                    while (_l>1).any(): _ex+=(_l>1); _l=(_l+1)//2
+                    _ex=_np.minimum(_ex,6)
+                    _os=_OFF[_sf]
+                    for _e in range(int(_ex.max())+1 if len(_ex) else 0):
+                        _sg=_np.flatnonzero(_ex==_e)
+                        if not len(_sg): continue
+                        _K=1<<_e; _dxy=_np.arange(_K,dtype=_np.int64)
+                        _paso=max(1,3_000_000//(_K*_K))
+                        for _c0 in range(0,len(_sg),_paso):
+                            _s=_sg[_c0:_c0+_paso]; _n=len(_s)
+                            _X=_x0[_s][:,None,None]+_dxy[None,None,:]
+                            _Y=_y0[_s][:,None,None]+_dxy[None,:,None]
+                            _okb=(_X<=_x1[_s][:,None,None])&(_Y<=_y1[_s][:,None,None])
+                            _okb=_np.broadcast_to(_okb,(_n,_K,_K)).copy()
+                            _Xf=_np.broadcast_to(_X,(_n,_K,_K)).astype(_np.float32)
+                            _Yf=_np.broadcast_to(_Y,(_n,_K,_K)).astype(_np.float32)
+                            _ax=_pu[_s,0][:,None,None]; _ay=_pv[_s,0][:,None,None]
+                            _bx=_pu[_s,1][:,None,None]; _by=_pv[_s,1][:,None,None]
+                            _cx=_pu[_s,2][:,None,None]; _cy=_pv[_s,2][:,None,None]
+                            _den=(_by-_cy)*(_ax-_cx)+(_cx-_bx)*(_ay-_cy)
+                            _den=_np.where(_np.abs(_den)<1e-9,1e-9,_den)
+                            _l0=((_by-_cy)*(_Xf-_cx)+(_cx-_bx)*(_Yf-_cy))/_den
+                            _l1=((_cy-_ay)*(_Xf-_cx)+(_ax-_cx)*(_Yf-_cy))/_den
+                            _okb&=(_l0>=-0.02)&(_l1>=-0.02)&((1.0-_l0-_l1)>=-0.02)
+                            del _Xf,_Yf,_den,_l0,_l1
+                            if _okb.any():
+                                _ixp=_np.broadcast_to(_X,(_n,_K,_K))[_okb]
+                                _iyp=_np.broadcast_to(_Y,(_n,_K,_K))[_okb]
+                                _fid=_np.broadcast_to(_np.arange(_n)[:,None,None],(_n,_K,_K))[_okb]
+                                _cur=_bs[_iyp,_ixp].astype(_np.float32)
+                                _bs[_iyp,_ixp]=_np.clip(_cur+_os[_s][_fid],0,255).astype(_np.uint8)
+                                _ntx+=int(_okb.sum())
+                                del _ixp,_iyp,_fid,_cur
+                            del _X,_Y,_okb
+                    if _tf.lower().endswith((".jpg",".jpeg")):
+                        Image.fromarray(_bs).save(_tf,quality=max(BAKE_JQ,90),subsampling=2)
+                    else:
+                        Image.fromarray(_bs).save(_tf)
+                    del _bs; _gc.collect()
+                log("BAKE COSTURA: %.1fM texeles compensados en %.1f min "
+                    "(esto es lo que se veia como bloques y cicatrices de distinto tono)"
+                    % (_ntx/1e6,(time.time()-_st0)/60.0))
+        except Exception as _se:
+            log("BAKE COSTURA: fallo, sigo sin ella (%s)" % _se)
     log("BAKE listo: %.1fM texeles | cobertura >=1 foto %.0f%%, >=3 fotos %.0f%% | %s | "
         "atlas x%d en %.1f min"
         % (NT/1e6,cov1,cov3,"GPU" if usa_gpu else "CPU",SC,(time.time()-_t0)/60.0))
@@ -2793,7 +2933,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b-tono' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b-costura' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
