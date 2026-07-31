@@ -348,14 +348,43 @@ BAKE_DILA     = int(os.environ.get("OMVS_BAKE_DILA", "6"))       # dilatacion de
 BAKE_EXPO     = os.environ.get("OMVS_BAKE_EXPO", "1") == "1"     # normaliza la exposicion de cada foto a la mediana global antes de mezclar (mata el "distintos tonos" del auto-exposicion del celular)
 BAKE_FIX      = os.environ.get("OMVS_BAKE_FIX", "1") == "1"      # a los texeles que ninguna foto ve les copia el TONO de sus vecinos horneados (mata las islas poligonales de tono ajeno)
 BAKE_FIXBLUR  = int(os.environ.get("OMVS_BAKE_FIXBLUR", "9"))    # suavizado del campo de correccion (celdas de la rejilla gruesa)
-BAKE_TONO     = os.environ.get("OMVS_BAKE_TONO", "0") == "1"   # APAGADO: fallo con V; se prueba aparte
+BAKE_TONO     = os.environ.get("OMVS_BAKE_TONO", "1") == "1"   # APAGADO: fallo con V; se prueba aparte
 BAKE_TONO_ESC = float(os.environ.get("OMVS_TONO_ESC", "1.0"))  # se aplana lo que varie a mas de N metros
 BAKE_TONO_FZA = float(os.environ.get("OMVS_TONO_FZA", "1.0"))  # 1.0 = correccion completa
 BAKE_TONO_TOPE= float(os.environ.get("OMVS_TONO_TOPE","1.6"))  # tope de la ganancia
-BAKE_SEAM     = os.environ.get("OMVS_BAKE_SEAM", "1") == "1"   # nivelar costuras entre parches
+# APAGADO por defecto. El intento del job d87eae06 EMPEORO el render: la
+# compensacion se SATURO en el tope (+-40 niveles, o sea el sistema no
+# convergio) y pinto la pared de retazos -> los cuadraditos.
+# Aqui queda con tres arreglos, para encenderlo con OMVS_BAKE_SEAM=1:
+#   1) deteccion EXACTA de costura (por UV en la arista compartida)
+#   2) candado que aborta si >12% de aristas salen costura
+#   3) anclaje 10x mas fuerte y tope 4x mas bajo, para que NO se sature
+BAKE_SEAM     = os.environ.get("OMVS_BAKE_SEAM", "0") == "1"
 BAKE_SEAM_MU  = float(os.environ.get("OMVS_SEAM_MU",  "0.05"))  # rigidez dentro del parche
-BAKE_SEAM_LAM = float(os.environ.get("OMVS_SEAM_LAM", "0.02"))  # anclaje del offset
-BAKE_SEAM_TOPE= float(os.environ.get("OMVS_SEAM_TOPE","40"))    # tope del offset en niveles
+BAKE_SEAM_LAM = float(os.environ.get("OMVS_SEAM_LAM", "0.20"))  # anclaje del offset
+BAKE_SEAM_TOPE= float(os.environ.get("OMVS_SEAM_TOPE","10"))    # tope del offset en niveles
+# MEDIDO: en TODOS los logs las ganancias salian 0.70-1.40, o sea LOS DOS
+# extremos del recorte a la vez. Eso significa que a las fotos mas claras y
+# mas oscuras se les queda diferencia SIN corregir, y como cada zona de la
+# pared se hornea desde fotos distintas, esa diferencia aparece como parches
+# de tono. Se abre el rango y ahora el log dice CUANTAS fotos tocan el limite.
+# CORRECCION FOTOMETRICA (investigacion, prioridad 1)
+# MEDIDO: las "figuras difusas de distinto tono" NO vienen de la geometria
+# (correlacion brillo-vs-relieve r=+0.02..+0.10, o sea cero). Quedan dos causas
+# fotometricas que la exposicion NO corrige, porque la exposicion es UNA ganancia
+# escalar por foto:
+#   1) BALANCE DE BLANCOS: el auto-WB del celular cambia foto a foto y deja
+#      tintes distintos. Al mezclar 185 fotos por texel, esos tintes aparecen
+#      como manchas suaves del mismo color pero distinto tono.
+#   2) VINETEADO: el lente oscurece los bordes del cuadro. Cada zona de pared se
+#      hornea desde fotos distintas y cae en zonas distintas del cuadro -> parches.
+# Se corrigen aqui, ANTES de mezclar. Ninguna toca la geometria.
+BAKE_WB       = os.environ.get("OMVS_BAKE_WB", "1") == "1"      # igualar el color entre fotos
+BAKE_WB_TOPE  = float(os.environ.get("OMVS_WB_TOPE", "1.30"))   # tope de la correccion por canal
+BAKE_VIG      = os.environ.get("OMVS_BAKE_VIG", "1") == "1"     # corregir el vineteado del lente
+BAKE_VIG_TOPE = float(os.environ.get("OMVS_VIG_TOPE", "1.60"))  # tope de la correccion de borde
+_EXPLO        = float(os.environ.get("OMVS_EXPO_MIN", "0.45"))
+_EXPHI        = float(os.environ.get("OMVS_EXPO_MAX", "2.20"))
 BAKE_VDOT     = int(os.environ.get("OMVS_BAKE_VDOT", "2"))       # radio del puntito para las caras de area cero (texeles)
 BAKE_VFILL    = os.environ.get("OMVS_BAKE_VFILL", "1") == "1"     # tapa los parches vacios del atlas con el color por vertice de la malla (medido: 23% de las caras salian en gris plano)
 BAKE_FIXDS    = int(os.environ.get("OMVS_BAKE_FIXDS", "16"))     # la correccion se calcula a 1/16 de resolucion (es de baja frecuencia): megas en vez de gigas
@@ -1147,6 +1176,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
         th=scn.cast_rays(_o3.core.Tensor(rays))["t_hit"].numpy().reshape(hD,wD)
         deps[nom]=_np.where(_np.isfinite(th),th,0.0).astype(_np.float16)
         del gx,gy,dc,dw,rays,th
+    _Vkeep=V.astype(_np.float32)   # copia para el nivelado de tono (V se borra aqui)
     del scn,_mm,V; _gc.collect()
     log("BAKE: profundidades de %d camaras listas | RAM %.1f GB | %.1f min"
         % (len(vistas),_rss(),(time.time()-_t0)/60.0))
@@ -1208,9 +1238,12 @@ def bake_multiview(objf, texfiles, mtl2tex):
     #    auto-exposicion foto a foto (medido: hasta 4x en este set). Antes de
     #    mezclar, se lleva cada foto a la MEDIANA global de luminancia lineal.
     #    Ataca "no hay armonia / distintos tonos" en la RAIZ, no solo tapa. ──
-    _gain={}
-    if BAKE_EXPO:
-        _ms=[]
+    _gain={}; _wb={}; _VIGC={}
+    _vig_on=BAKE_VIG        # local: NO reasignar el global (bug del V)
+    if BAKE_EXPO or BAKE_WB or _vig_on:
+        _ms=[]; _rgb=[]
+        _NR=24                      # bins radiales del perfil de vineteado
+        _vsum=_np.zeros(_NR); _vcnt=_np.zeros(_NR)
         for nom,cid,_Rc,_tc in vistas:
             cr=CROPS.get(nom)
             try:
@@ -1221,13 +1254,78 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _q=Image.open(os.path.join(IMGD,nom)).convert("RGB").resize((160,213),Image.BILINEAR)
             except Exception:
                 _q=Image.open(os.path.join(IMGD,nom)).convert("RGB").resize((160,213),Image.BILINEAR)
-            _ms.append((nom,float(_np.median(_s2l(_np.asarray(_q,_np.float32)/255.0)))))
+            _a=_s2l(_np.asarray(_q,_np.float32)/255.0)      # luz LINEAL
+            _ms.append((nom,float(_np.median(_a))))
+            # (1) color medio por canal -> para igualar el BALANCE DE BLANCOS
+            _rgb.append((nom,_a.reshape(-1,3).mean(0)))
+            # (2) perfil radial: brillo normalizado por el de la propia foto.
+            #     Promediado sobre 185 fotos, el contenido de la escena se
+            #     cancela y queda la caida del LENTE (flat-field retrospectivo).
+            if _vig_on:
+                _hq,_wq=_a.shape[:2]
+                _yy,_xx=_np.mgrid[0:_hq,0:_wq]
+                _rr=_np.sqrt(((_xx-(_wq-1)/2.0)/((_wq-1)/2.0))**2
+                             +((_yy-(_hq-1)/2.0)/((_hq-1)/2.0))**2)
+                _rr=_np.clip(_rr/_np.sqrt(2.0),0,0.999999)
+                _lum=_a.mean(2); _mn=float(_lum.mean())
+                if _mn>1e-6:
+                    _bi=(_rr*_NR).astype(_np.int64)
+                    _np.add.at(_vsum,_bi.ravel(),(_lum/_mn).ravel())
+                    _np.add.at(_vcnt,_bi.ravel(),1.0)
         _med=_np.median([x[1] for x in _ms])
         for nom,mi in _ms:
-            _gain[nom]=float(_np.clip(_med/max(mi,1e-4),0.7,1.4))
+            _gain[nom]=float(_np.clip(_med/max(mi,1e-4),_EXPLO,_EXPHI))
         _sp=_np.array([_gain[n] for n,_ in _ms])
-        log("BAKE: exposicion normalizada a mediana global | ganancias %.2f-%.2f (1.0=sin cambio)"
-            % (_sp.min(),_sp.max()))
+        _nsat=int(((_sp<=_EXPLO+1e-6)|(_sp>=_EXPHI-1e-6)).sum())
+        log("BAKE: exposicion normalizada | ganancias %.2f-%.2f (rango %.2f-%.2f) | "
+            "%d de %d fotos TOCAN el limite"
+            % (_sp.min(),_sp.max(),_EXPLO,_EXPHI,_nsat,len(_sp)))
+        # ── BALANCE DE BLANCOS: llevar TODAS las fotos al color de la MEDIANA ──
+        # No se fuerza "gris" (gray-world puro), que le cambiaria el color al
+        # cuarto entero: se igualan entre si. Es lo que hace falta, porque el
+        # defecto es que las fotos NO COINCIDEN, no que esten mal en absoluto.
+        if BAKE_WB and _rgb:
+            _M=_np.array([v for _,v in _rgb],_np.float64)      # (N,3)
+            _M=_np.maximum(_M,1e-6)
+            _rg=_M[:,0]/_M[:,1]; _bg=_M[:,2]/_M[:,1]           # razones al verde
+            _rgm=float(_np.median(_rg)); _bgm=float(_np.median(_bg))
+            _lo,_hi=1.0/BAKE_WB_TOPE,BAKE_WB_TOPE
+            _nw=0
+            for _i,(nom,_) in enumerate(_rgb):
+                _gr=float(_np.clip(_rgm/max(_rg[_i],1e-6),_lo,_hi))
+                _gb=float(_np.clip(_bgm/max(_bg[_i],1e-6),_lo,_hi))
+                _wb[nom]=_np.array([_gr,1.0,_gb],_np.float32)
+                if abs(_gr-1)>0.02 or abs(_gb-1)>0.02: _nw+=1
+            _dr=float(_np.percentile(_rg,90)-_np.percentile(_rg,10))
+            _db=float(_np.percentile(_bg,90)-_np.percentile(_bg,10))
+            log("BAKE WB: %d de %d fotos con tinte distinto; dispersion R/G %.3f, B/G %.3f "
+                "-> igualadas a la mediana" % (_nw,len(_rgb),_dr,_db))
+        # ── VINETEADO: invertir el perfil radial medido ──
+        if _vig_on and _vcnt.sum()>0:
+            _ok=_vcnt>0
+            _prof=_np.ones(_NR)
+            _prof[_ok]=_vsum[_ok]/_vcnt[_ok]
+            # OJO (bug cazado en la prueba sintetica): hay que suavizar ANTES de
+            # normalizar, y rellenando el borde con el propio valor. Al reves,
+            # convolve rellena con CEROS y hunde el bin del centro: el perfil
+            # salia 0.67 en el centro cuando debe ser 1.00, y minimum.accumulate
+            # congelaba ese error -> la correccion habria quedado invertida.
+            _prof=_np.convolve(_np.pad(_prof,1,mode="edge"),
+                               _np.ones(3)/3.0,mode="same")[1:-1]
+            _prof=_prof/max(_prof[0],1e-6)                     # normalizar al centro
+            _prof=_np.minimum.accumulate(_np.clip(_prof,0.2,1.0))
+            _caida=float(1.0-_prof[-1])
+            if _caida<0.02:
+                _vig_on=False
+                log("BAKE VIG: la caida al borde es solo %.1f%% -> no hace falta corregir" % (100*_caida))
+            else:
+                _corr=_np.clip(1.0/_np.maximum(_prof,1e-6),1.0,BAKE_VIG_TOPE)
+                _VIGC["prof"]=_corr
+                log("BAKE VIG: el borde del cuadro llega %.0f%% mas oscuro que el centro "
+                    "-> corregido (esto pintaba parches segun donde caia cada foto)"
+                    % (100*_caida))
+        else:
+            _vig_on=False
 
     for ki,(nom,cid,Rc,tc) in enumerate(vistas):
         if ki % 16 == 0 and ki:
@@ -1246,8 +1344,28 @@ def bake_multiview(objf, texfiles, mtl2tex):
         W12,H12=im.size; s12=W12/float(w14)
         low_im=im.resize((max(1,W12//BAKE_DS),max(1,H12//BAKE_DS)),Image.LANCZOS).resize((W12,H12),Image.BILINEAR)
         g_i=_gain.get(nom,1.0)
-        sharp=_s2l(_np.asarray(im,_np.float32)/255.0)*g_i; del im
-        low=_s2l(_np.asarray(low_im,_np.float32)/255.0)*g_i; del low_im
+        # exposicion (escalar) x balance de blancos (por canal)
+        _gv=_np.float32([g_i,g_i,g_i])
+        if BAKE_WB and nom in _wb: _gv=_gv*_wb[nom]
+        sharp=_s2l(_np.asarray(im,_np.float32)/255.0)*_gv[None,None,:]; del im
+        low=_s2l(_np.asarray(low_im,_np.float32)/255.0)*_gv[None,None,:]; del low_im
+        # vineteado: mapa radial, calculado UNA vez por tamano de foto y cacheado
+        if _vig_on and "prof" in _VIGC:
+            _k=(sharp.shape[1],sharp.shape[0])
+            if _k not in _VIGC:
+                _wv,_hv=_k
+                _yv,_xv=_np.mgrid[0:_hv,0:_wv]
+                _rv=_np.sqrt(((_xv-(_wv-1)/2.0)/((_wv-1)/2.0))**2
+                             +((_yv-(_hv-1)/2.0)/((_hv-1)/2.0))**2)
+                _rv=_np.clip(_rv/_np.sqrt(2.0),0,0.999999)
+                _pr=_VIGC["prof"]
+                _fi=_rv*(len(_pr)-1)
+                _i0=_np.floor(_fi).astype(_np.int32); _i1=_np.minimum(_i0+1,len(_pr)-1)
+                _fr=(_fi-_i0).astype(_np.float32)
+                _VIGC[_k]=(_pr[_i0]*(1-_fr)+_pr[_i1]*_fr).astype(_np.float32)
+                del _yv,_xv,_rv,_fi,_i0,_i1,_fr
+            _vm=_VIGC[_k][:,:,None]
+            sharp=sharp*_vm; low=low*_vm
         dep=deps[nom].astype(_np.float32); hD,wD=dep.shape; sD=wD/float(w14)
         Cc=(-Rc.T@tc).astype(_np.float32)
         # subir esta camara al backend
@@ -1582,16 +1700,16 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 import open3d as _o3
             except Exception:
                 _o3=None
-            _cen=(V[F[:,0]]+V[F[:,1]]+V[F[:,2]])/3.0
-            _e0=V[F[:,1]]-V[F[:,0]]; _e1v=V[F[:,2]]-V[F[:,0]]
+            _cen=(_Vkeep[F[:,0]]+_Vkeep[F[:,1]]+_Vkeep[F[:,2]])/3.0
+            _e0=_Vkeep[F[:,1]]-_Vkeep[F[:,0]]; _e1v=_Vkeep[F[:,2]]-_Vkeep[F[:,0]]
             _fn=_np.cross(_e0,_e1v)
             _ln=_np.linalg.norm(_fn,axis=1); _ok=_ln>1e-12
             _fn[_ok]/=_ln[_ok][:,None]
-            _CG=V.mean(0)
+            _CG=_Vkeep.mean(0)
             # --- planos dominantes por RANSAC (submuestreado) ---
             _planos=[]
             if _o3 is not None:
-                _Vs=V[::4]
+                _Vs=_Vkeep[::4].astype(_np.float64)
                 _rest=_np.arange(len(_Vs))
                 for _r in range(8):
                     if len(_rest)<4000: break
@@ -1760,13 +1878,42 @@ def bake_multiview(objf, texfiles, mtl2tex):
             _o=_np.lexsort((_E[:,1],_E[:,0])); _Es=_E[_o]; _fs=_fi[_o]
             _ig=_np.flatnonzero((_Es[:-1]==_Es[1:]).all(1))
             _f1=_fs[_ig]; _f2=_fs[_ig+1]
+            _Ea=_Es[_ig,0].copy(); _Eb=_Es[_ig,1].copy()   # vertices de la arista
             del _E,_fi,_o,_Es,_fs,_ig
             if len(_f1)<1000:
                 log("BAKE COSTURA: la malla no comparte aristas; lo salto")
             else:
-                _duv=_np.linalg.norm(_uvc[_f1]-_uvc[_f2],axis=1)
-                _tip=float(_np.median(_duv))
-                _sm=(FM[_f1]!=FM[_f2])|(_duv>5.0*max(_tip,1e-9))
+                # DETECCION EXACTA DE COSTURA (v2)
+                # FALLO del intento anterior (job d87eae06): marcaba costura con
+                # un umbral RELATIVO (distancia UV entre centroides > 5x la
+                # mediana). En mi banco daba 1.7% de las aristas; EN PRODUCCION
+                # dio 25.2% (407.966 de 1.621.751) y compensacion media de 7.26
+                # niveles en vez de 0.21. Marco como costura una de cada cuatro
+                # aristas SANAS y pinto la pared de retazos: eso fabrico los
+                # cuadraditos que aparecieron en ese render.
+                # AHORA la prueba es exacta y no depende de ninguna estadistica:
+                # dos caras vecinas comparten una arista de GEOMETRIA (2 vertices).
+                # Si sus UV EN ESOS DOS VERTICES coinciden, la textura es continua
+                # y NO hay costura; si diferen, es costura de verdad.
+                _p1=_np.zeros((len(_f1),2),_np.int64)
+                _p2=_np.zeros((len(_f1),2),_np.int64)
+                for _k in range(3):
+                    _m=F[_f1,_k]==_Ea; _p1[_m,0]=_k
+                    _m=F[_f1,_k]==_Eb; _p1[_m,1]=_k
+                    _m=F[_f2,_k]==_Ea; _p2[_m,0]=_k
+                    _m=F[_f2,_k]==_Eb; _p2[_m,1]=_k
+                _uA1=Tn[FT[_f1,_p1[:,0]]]; _uA2=Tn[FT[_f1,_p1[:,1]]]
+                _uB1=Tn[FT[_f2,_p2[:,0]]]; _uB2=Tn[FT[_f2,_p2[:,1]]]
+                _cont=((_np.abs(_uA1-_uB1).max(1)<1e-5)&(_np.abs(_uA2-_uB2).max(1)<1e-5))
+                _sm=(FM[_f1]!=FM[_f2])|(~_cont)
+                del _p1,_p2,_uA1,_uA2,_uB1,_uB2,_cont
+                _frac=float(_sm.mean())
+                log("BAKE COSTURA: %.2f%% de las aristas son costura real" % (100*_frac))
+                # CANDADO: en una malla sana son ~2%. Si sale mucho mas, la
+                # deteccion esta rota y se aborta ANTES de tocar un solo texel,
+                # en vez de repetir el desastre de los cuadraditos.
+                if _frac > float(os.environ.get("OMVS_SEAM_MAXFRAC","0.12")):
+                    raise RuntimeError("deteccion sospechosa (%.1f%% de aristas); no toco nada" % (100*_frac))
                 _N=len(F)
                 def _lap(_a,_b,_w):
                     _n=len(_a)
@@ -1787,7 +1934,10 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     except TypeError:
                         _x,_inf=_cg(_Aop,_b,tol=1e-6,maxiter=300)
                     _OFF[:,_ch]=_np.clip(_x,-BAKE_SEAM_TOPE,BAKE_SEAM_TOPE)
-                log("BAKE COSTURA: %d bordes de parche de %d aristas; compensacion "
+                if float(_np.abs(_OFF).max())>=BAKE_SEAM_TOPE-0.01:
+                    raise RuntimeError("la compensacion se saturo en el tope (%.0f): "
+                        "el sistema no convergio, no aplico nada" % BAKE_SEAM_TOPE)
+                log("BAKE COSTURA: %d costuras de %d aristas; compensacion "
                     "media %.2f niveles, maxima %.1f"
                     % (int(_sm.sum()),len(_f1),float(_np.abs(_OFF).mean()),
                        float(_np.abs(_OFF).max())))
@@ -2933,7 +3083,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b-costura' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b-foto' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -3653,6 +3803,47 @@ def main():
             "              % _nplanos, flush=True)\n"
             "    else:\n"
             "        print('SNAP: no encontre planos grandes que aplanar', flush=True)\n"
+            "    # ---- TAPAR HUECOS DE LA MALLA ----\n"
+            "    # MEDIDO en la malla (58), soldando por POSICION (no por UV, que es lo que\n"
+            "    # hace el .glb y confunde toda costura con un borde): la malla tiene 64.718\n"
+            "    # aristas de borde reales = 4.627 HUECOS, de los cuales 186 son grandes, con\n"
+            "    # 310 m de perimetro cayendo dentro de las PAREDES. Eso es geometria que\n"
+            "    # FALTA: son los huecos que se ven en la pared.\n"
+            "    # Se tapan con pymeshlab, que ya esta en la imagen. El tope de tamano es\n"
+            "    # deliberado: un hueco pequeno o mediano es un defecto y se cierra; un hueco\n"
+            "    # enorme suele ser una PUERTA o una VENTANA de verdad y NO se debe tapar.\n"
+            "    try:\n"
+            "        HOLE_MAX = int(os.environ.get('HOLE_MAX', '300'))\n"
+            "        if HOLE_MAX > 0:\n"
+            "            import pymeshlab as _pml\n"
+            "            _Vh = np.array(m.vertices, dtype=np.float64)\n"
+            "            _Th = np.asarray(m.triangles)\n"
+            "            _msh = _pml.MeshSet()\n"
+            "            _msh.add_mesh(_pml.Mesh(vertex_matrix=_Vh, face_matrix=_Th))\n"
+            "            _nf0 = _Th.shape[0]\n"
+            "            try:\n"
+            "                _msh.meshing_close_holes(maxholesize=HOLE_MAX,\n"
+            "                                         newfaceselected=False,\n"
+            "                                         selfintersection=True)\n"
+            "            except Exception:\n"
+            "                _msh.apply_filter('meshing_close_holes', maxholesize=HOLE_MAX)\n"
+            "            _Vn2 = _msh.current_mesh().vertex_matrix()\n"
+            "            _Tn2 = _msh.current_mesh().face_matrix()\n"
+            "            _add = _Tn2.shape[0] - _nf0\n"
+            "            # CANDADO: si el filtro anade una barbaridad, algo salio mal y no se aplica\n"
+            "            if _add < 0 or _add > 0.10 * _nf0:\n"
+            "                print('HUECOS: el cierre anadiria %d caras (%.1f%% de la malla): '\n"
+            "                      'lo descarto por seguridad' % (_add, 100.0*_add/max(_nf0,1)), flush=True)\n"
+            "            else:\n"
+            "                m.vertices = o3d.utility.Vector3dVector(_Vn2)\n"
+            "                m.triangles = o3d.utility.Vector3iVector(_Tn2.astype(np.int32))\n"
+            "                m.compute_vertex_normals()\n"
+            "                print('HUECOS: %d caras nuevas tapando huecos de hasta %d aristas '\n"
+            "                      '(esto es lo que se veia como huecos en la pared)'\n"
+            "                      % (_add, HOLE_MAX), flush=True)\n"
+            "            del _msh, _Vh, _Th\n"
+            "    except Exception as _he:\n"
+            "        print('HUECOS (fallo, sigo sin tapar):', _he, flush=True)\n"
             "    # ---- SNAP2: LAMINAS DESPEGADAS ----\n"
             "    # MEDIDO en la malla (54): 46 m2 de 83 despegados de su plano (el doble\n"
             "    # que Polycam en proporcion). El SNAP de arriba solo agarra lo que ya\n"
