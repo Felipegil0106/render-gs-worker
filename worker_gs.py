@@ -349,7 +349,14 @@ BAKE_EXPO     = os.environ.get("OMVS_BAKE_EXPO", "1") == "1"     # normaliza la 
 BAKE_FIX      = os.environ.get("OMVS_BAKE_FIX", "1") == "1"      # a los texeles que ninguna foto ve les copia el TONO de sus vecinos horneados (mata las islas poligonales de tono ajeno)
 BAKE_FIXBLUR  = int(os.environ.get("OMVS_BAKE_FIXBLUR", "9"))    # suavizado del campo de correccion (celdas de la rejilla gruesa)
 BAKE_TONO     = os.environ.get("OMVS_BAKE_TONO", "1") == "1"   # APAGADO: fallo con V; se prueba aparte
-BAKE_TONO_ESC = float(os.environ.get("OMVS_TONO_ESC", "1.0"))  # se aplana lo que varie a mas de N metros
+# MEDIDO en la malla (61), tras el primer nivelado: la banda de 1-3 m bajo de
+# 22.3 a 15.9 (-29%), PERO la que manda ahora es la de 5-30 cm, con 16.8. Con la
+# escala en 1 metro ese rango quedaba fuera a proposito, para no borrar textura
+# fina. Fue un error de diseno: 5-30 cm NO es textura fina, son PARCHES del
+# tamano de una mano. Bajando a 0.30 m el filtro los agarra y deja intacto lo de
+# menos de 5 cm (11.5), que si es el grano real de la pared.
+# Si aplana de mas y la pared queda artificial: OMVS_TONO_ESC=0.50
+BAKE_TONO_ESC = float(os.environ.get("OMVS_TONO_ESC", "0.30"))
 BAKE_TONO_FZA = float(os.environ.get("OMVS_TONO_FZA", "1.0"))  # 1.0 = correccion completa
 BAKE_TONO_TOPE= float(os.environ.get("OMVS_TONO_TOPE","1.6"))  # tope de la ganancia
 # APAGADO por defecto. El intento del job d87eae06 EMPEORO el render: la
@@ -1108,6 +1115,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
             "para no producir un archivo gigante" % (len(texfiles),BAKE_MAXATL,SC))
         SC=1
     at_lin=[]; at_pos=[]; at_nrm=[]; at_id=[]; at_dims=[]
+    _NMU=0; _NBIG=0; _MUBIG=0
     PRESU=25_000_000
     for ti in range(len(texfiles)):
         with Image.open(texfiles[ti]) as _im0: W0,H0=_im0.size
@@ -1120,6 +1128,8 @@ def bake_multiview(objf, texfiles, mtl2tex):
         del u
         area2=_np.abs((pu[:,1]-pu[:,0])*(pv[:,2]-pv[:,0])-(pu[:,2]-pu[:,0])*(pv[:,1]-pv[:,0]))
         ns=_np.clip((area2*2.0).astype(_np.int64)+3,3,400000)
+        _NMU+=int(ns.sum()); _bg=ns>10000
+        _NBIG+=int(_bg.sum()); _MUBIG+=int(ns[_bg].sum())
         cs=_np.cumsum(ns)
         f0=0
         while f0 < len(m):
@@ -1156,6 +1166,14 @@ def bake_multiview(objf, texfiles, mtl2tex):
     NT=len(LIN)
     log("BAKE: %d texeles rasterizados (con duplicados raros de borde, inofensivos) "
         "| RAM %.1f GB | %.1f min" % (NT,_rss(),(time.time()-_t0)/60.0))
+    # DIAGNOSTICO DE LENTITUD (medido en la (61): 198M muestras para 50M texeles;
+    # 1.822 caras de un millon pedian el 47% del trabajo. Eran ASTILLAS, la forma
+    # que deja el cosido de huecos. Si esta linea vuelve a dispararse, el culpable
+    # es HOLE_MAX otra vez.)
+    if _NMU:
+        log("BAKE: %.0fM muestras pedidas | %d caras piden >10k cada una (%.0f%% del "
+            "trabajo). Sano: <5%%; si sube mucho, baja HOLE_MAX"
+            % (_NMU/1e6,_NBIG,100*_MUBIG/max(_NMU,1)))
 
     # ── 5) mapas de profundidad (media resolucion, f16) ──
     import open3d as _o3
@@ -3083,7 +3101,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b-foto' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b-foto2' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -3813,7 +3831,13 @@ def main():
             "    # deliberado: un hueco pequeno o mediano es un defecto y se cierra; un hueco\n"
             "    # enorme suele ser una PUERTA o una VENTANA de verdad y NO se debe tapar.\n"
             "    try:\n"
-            "        HOLE_MAX = int(os.environ.get('HOLE_MAX', '300'))\n"
+            "        # MEDIDO en la (61): con 300 el cosido metio 23.571 caras nuevas en\n"
+            "        # forma de ASTILLA (la mas larga, 1.402 veces mas larga que ancha).\n"
+            "        # Esas astillas piden una huella enorme en el atlas: 198M muestras\n"
+            "        # para 50M texeles, y el horneado paso de 0.7 a 17.6 minutos.\n"
+            "        # Con 60 se tapan igual los huecos pequenos (la gran mayoria de los\n"
+            "        # 4.627 medidos, incluido el que se veia en la pared) SIN astillas.\n"
+            "        HOLE_MAX = int(os.environ.get('HOLE_MAX', '60'))\n"
             "        if HOLE_MAX > 0:\n"
             "            import pymeshlab as _pml\n"
             "            _Vh = np.array(m.vertices, dtype=np.float64)\n"
