@@ -1724,9 +1724,28 @@ def bake_multiview(objf, texfiles, mtl2tex):
             _ln=_np.linalg.norm(_fn,axis=1); _ok=_ln>1e-12
             _fn[_ok]/=_ln[_ok][:,None]
             _CG=_Vkeep.mean(0)
-            # --- planos dominantes por RANSAC (submuestreado) ---
+            # --- planos: PRIMERO los que ya encontro el script de malla ---
+            # Esos ya pasaron los tres candados (tamano >=1.2 m, periferia por
+            # percentil, normales alineadas). Recalcularlos aqui era duplicar el
+            # trabajo con peor informacion: en el job e13efea4 la busqueda de aqui
+            # devolvio CERO planos y el nivelado no corrio, mientras el script de
+            # malla habia encontrado 6 sin problema.
             _planos=[]
-            if _o3 is not None:
+            try:
+                _pf=os.environ.get("PLANOS_NPY","/workspace/job/planos.npy")
+                if os.path.exists(_pf):
+                    _pa=_np.load(_pf)
+                    for _row in _pa:
+                        _nn=_np.asarray(_row[:3],_np.float64)
+                        _L=_np.linalg.norm(_nn)
+                        if _L>1e-9: _planos.append((_nn/_L,float(_row[3])/_L))
+                    log("BAKE TONO: %d planos leidos del paso de malla (ya filtrados)"
+                        % len(_planos))
+                else:
+                    log("BAKE TONO: no hay planos guardados; los busco yo (respaldo)")
+            except Exception as _pe:
+                log("BAKE TONO: no pude leer los planos guardados (%s); los busco yo" % _pe)
+            if not _planos and _o3 is not None:
                 _Vs=_Vkeep[::4].astype(_np.float64)
                 _rest=_np.arange(len(_Vs))
                 for _r in range(8):
@@ -1747,12 +1766,14 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 log("BAKE TONO: no encontre planos grandes; lo salto")
             else:
                 _gan=_np.ones(len(F),_np.float32)
-                _npar=0
+                _npar=0; _desc=[]
                 for _nrm,_dd in _planos:
                     _lado=_np.sign(float(_np.dot(_CG,_nrm))+_dd) or 1.0
                     _dist=(_cen@_nrm+_dd)*_lado
                     _sel=(_np.abs(_fn@_nrm)>0.90)&(_np.abs(_dist)<0.06)
-                    if int(_sel.sum())<8000: continue
+                    if int(_sel.sum())<8000:
+                        _desc.append("plano con solo %d caras (<8000)" % int(_sel.sum()))
+                        continue
                     _ix=_np.flatnonzero(_sel)
                     _u=_np.array([1.0,0,0]) if abs(_nrm[0])<0.9 else _np.array([0,1.0,0])
                     _a1=_np.cross(_nrm,_u); _a1/=_np.linalg.norm(_a1)
@@ -1762,10 +1783,13 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _gx=((_x-_x.min())/_P).astype(_np.int64)
                     _gy=((_y-_y.min())/_P).astype(_np.int64)
                     _W=int(_gx.max())+1; _H=int(_gy.max())+1
-                    if _W*_H>4_000_000 or _W<60 or _H<60: continue
+                    if _W*_H>4_000_000 or _W<60 or _H<60:
+                        _desc.append("rejilla %dx%d fuera de rango" % (_W,_H)); continue
                     # color medio por cara (basta: se busca la escala de METROS)
                     _bue=~_np.isnan(FCOL[_ix]).any(1)
-                    if _bue.sum()<4000: continue
+                    if _bue.sum()<4000:
+                        _desc.append("solo %d caras con color leible (<4000)" % int(_bue.sum()))
+                        continue
                     _ix=_ix[_bue]
                     _gx=_gx[_bue]; _gy=_gy[_bue]
                     _cf=FCOL[_ix]
@@ -1773,7 +1797,9 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     for _k in range(3): _np.add.at(_S[:,:,_k],(_gy,_gx),_cf[:,_k])
                     _np.add.at(_Cn,(_gy,_gx),1.0)
                     _mk=_Cn>0
-                    if _mk.mean()<0.05: continue
+                    if _mk.mean()<0.05:
+                        _desc.append("rejilla casi vacia (%.1f%% llena)" % (100*_mk.mean()))
+                        continue
                     _G=_np.where(_mk[:,:,None],_S/_np.maximum(_Cn,1.0)[:,:,None],0.0)
                     _ii=_ndi.distance_transform_edt(~_mk,return_distances=False,return_indices=True)
                     _G=_G[_ii[0],_ii[1]]
@@ -1788,7 +1814,8 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _gan[_ix]=_gf.astype(_np.float32)
                     _npar+=1
                 if _npar==0:
-                    log("BAKE TONO: ningun plano cumplio el minimo; lo salto")
+                    log("BAKE TONO: ningun plano cumplio el minimo de %d. Motivos: %s"
+                        % (len(_planos), " | ".join(_desc[:6]) if _desc else "sin detalle"))
                 else:
                     _apl=_np.flatnonzero(_np.abs(_gan-1.0)>0.01)
                     log("BAKE TONO: %d superficies, %d caras a corregir (escala %.1f m, fuerza %.2f)"
@@ -3101,7 +3128,7 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b-foto2' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b-planos' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
 
         # ── PASO 1: descargar y descomprimir fotos ──
@@ -3821,6 +3848,22 @@ def main():
             "              % _nplanos, flush=True)\n"
             "    else:\n"
             "        print('SNAP: no encontre planos grandes que aplanar', flush=True)\n"
+            "    # GUARDAR LOS PLANOS PARA EL HORNEADOR.\n"
+            "    # FALLO REAL (job e13efea4): el horneador volvia a buscar los planos por\n"
+            "    # su cuenta con RANSAC sobre la malla de OpenMVS, y fallo: escribio\n"
+            "    # 'BAKE TONO: no encontre planos grandes' y el nivelado NO corrio, aunque\n"
+            "    # AQUI se habian encontrado 6 planos sin problema. Era una busqueda\n"
+            "    # duplicada, peor y sin diagnostico. Ahora se guardan los de aqui, que ya\n"
+            "    # pasaron los tres candados (tamano, periferia, normales), y el horneador\n"
+            "    # los lee. Si el archivo no existe, el horneador cae a su metodo de antes.\n"
+            "    try:\n"
+            "        if _planos:\n"
+            "            _pa = np.array([[float(n[0]), float(n[1]), float(n[2]), float(d)]\n"
+            "                            for n, d in _planos], dtype=np.float64)\n"
+            "            np.save('/workspace/job/planos.npy', _pa)\n"
+            "            print('PLANOS guardados para el horneador: %d' % len(_pa), flush=True)\n"
+            "    except Exception as _pe:\n"
+            "        print('PLANOS (no pude guardarlos, el horneador buscara solo):', _pe, flush=True)\n"
             "    # ---- TAPAR HUECOS DE LA MALLA ----\n"
             "    # MEDIDO en la malla (58), soldando por POSICION (no por UV, que es lo que\n"
             "    # hace el .glb y confunde toda costura con un borde): la malla tiene 64.718\n"
