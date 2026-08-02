@@ -46,6 +46,53 @@ POD_ID = (os.environ.get("RUNPOD_POD_ID")
 # es necesario para que el cuarto no salga a medias.
 ITERS = {"fast": 30000, "balanced": 30000, "quality": 30000}.get(QUALITY, 30000)
 
+# ════════════════════════════════════════════════════════════════════════
+# DEDUPLICACION DE FOTOS REDUNDANTES (v10)
+# ------------------------------------------------------------------------
+# Problema: al recorrer la casa el celular saca varias fotos casi identicas
+# desde el mismo punto y el mismo angulo (te paras frente a una baldosa y
+# siguen entrando fotos). Esas fotos no aportan NADA:
+#
+#   - No aportan paralaje, que es de donde sale la geometria.
+#   - Sobrerrepresentan una zona en el entrenamiento de 2DGS (el muestreo de
+#     vistas es aleatorio, asi que 5 fotos iguales = esa zona pesa 5x).
+#   - SI cuestan GPU en MASt3R, que es donde el costo escala con el numero de
+#     fotos: con scene_graph "retrieval-20-10" simetrizado son ~20-30 pares por
+#     foto, y cada par es un forward de un ViT-Large.
+#
+# OJO CON UNA COSA (para no hacerse ilusiones): quitar fotos NO acelera el
+# PASO 3. ITERS es fijo en 30000 y 2DGS escoge una vista al azar por iteracion,
+# asi que ese paso tarda lo mismo con 300 fotos que con 1200. Lo que se ahorra
+# esta en MASt3R, el retrieval, la escritura a 1000px, el TSDF y OpenMVS.
+#
+# Se hace en DOS SITIOS, del mas barato al mas preciso:
+#
+#   PREFILTRO (PASO 1)  Usa el poses.json que YA manda la app y que hasta ahora
+#                       se descomprimia y se ignoraba. Cuesta 0 GPU porque pasa
+#                       ANTES de cargar el modelo. Solo compara fotos cercanas
+#                       en el tiempo (ver PREFILTER_TIME_S abajo).
+#
+#   FILTRO FINO         Dentro de MAST3R_SCRIPT, despues del alineamiento
+#   (PASO 2)            global, con la pose 6DoF exacta de cada camara.
+#
+# Todo se apaga con DEDUP=0 si algo sale mal.
+# ════════════════════════════════════════════════════════════════════════
+DEDUP           = os.environ.get("DEDUP", "1") == "1"
+DEDUP_DIST_M    = float(os.environ.get("DEDUP_DIST_M", "0.08"))   # 8 cm
+DEDUP_ROT_DEG   = float(os.environ.get("DEDUP_ROT_DEG", "6.0"))   # 6 grados
+DEDUP_MIN_KEEP  = int(os.environ.get("DEDUP_MIN_KEEP", "60"))     # nunca bajar de aqui
+
+# Prefiltro con los datos del celular (PASO 1)
+PREFILTER        = os.environ.get("PREFILTER", "1") == "1"
+PREFILTER_TIME_S = float(os.environ.get("PREFILTER_TIME_S", "20"))
+
+# SEGURO ANTI-TEXTURA-REPETIDA (suelos de baldosa, paredes lisas, escaleras)
+# Si dos fotos salen en la MISMA pose segun MASt3R pero se tomaron con mucha
+# diferencia de tiempo, es sospechoso: puede que MASt3R se haya confundido con
+# baldosas iguales y haya puesto dos sitios distintos en la misma coordenada.
+# Ante la duda NO se borra. 0 = desactivar el seguro.
+DEDUP_TIME_GUARD_S = float(os.environ.get("DEDUP_TIME_GUARD_S", "120"))
+
 WORK = Path("/workspace/job")
 WORK.mkdir(parents=True, exist_ok=True)
 
@@ -76,6 +123,7 @@ except Exception:
 
 IMAGES_DIR = sys.argv[1]
 OUT_DIR = sys.argv[2]
+STAMPS_JSON = sys.argv[3] if len(sys.argv) > 3 else ""
 
 from mast3r.model import AsymmetricMASt3R
 from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
@@ -126,6 +174,146 @@ rgbimgs = scene.imgs
 N = len(rgbimgs)
 print("MAST3R: %d camaras registradas" % N, flush=True)
 
+# ════════════════════════════════════════════════════════════════════════
+# DEDUPLICACION POR POSE 6DoF EXACTA
+# ------------------------------------------------------------------------
+# Aqui ya tenemos la pose real de cada camara, asi que podemos responder la
+# pregunta exacta: "¿esta foto esta tomada desde el mismo punto Y el mismo
+# angulo que otra que ya acepte?".
+#
+# Regla:  se CONSERVA si  te moviste > DIST metros  O  giraste > ROT grados.
+#         Si las dos cosas estan por debajo, es la misma pose -> se descarta.
+#
+# Lo importante: se descarta solo para el ENTRENAMIENTO. La nube de puntos
+# densa de mas abajo sigue usando las N vistas, asi que la GEOMETRIA no pierde
+# absolutamente nada. Se gana por los dos lados.
+#
+# De cada grupo de repetidas sobrevive la MAS NITIDA (varianza del Laplaciano),
+# no la primera que llego.
+# ════════════════════════════════════════════════════════════════════════
+DEDUP     = os.environ.get("DEDUP", "1") == "1"
+DIST_M    = float(os.environ.get("DEDUP_DIST_M", "0.08"))
+ROT_DEG   = float(os.environ.get("DEDUP_ROT_DEG", "6.0"))
+MIN_KEEP  = int(os.environ.get("DEDUP_MIN_KEEP", "60"))
+GUARD_S   = float(os.environ.get("DEDUP_TIME_GUARD_S", "120"))
+
+# ---- Seguro anti-textura-repetida --------------------------------------
+# Un suelo de baldosas iguales (o una escalera, o una pared lisa) puede hacer
+# que MASt3R coloque DOS SITIOS DISTINTOS en la misma coordenada. Si eso pasa,
+# borrar una de las dos fotos seria un error.
+# Regla: si dos fotos salen en la misma pose PERO se tomaron con mas de GUARD_S
+# segundos de diferencia, NO se consideran repetidas. Ante la duda, se conservan
+# las dos. Cuesta unas pocas fotos de mas y evita perder cobertura real.
+_stamps = {}
+if STAMPS_JSON and os.path.exists(STAMPS_JSON):
+    try:
+        import json as _json
+        _stamps = _json.load(open(STAMPS_JSON))
+        print("DEDUP: seguro anti-textura-repetida ACTIVO (%d timestamps, %.0f s)"
+              % (len(_stamps), GUARD_S), flush=True)
+    except Exception as _e:
+        print("DEDUP: no pude leer timestamps (%s), seguro desactivado" % _e, flush=True)
+
+def _t_de(i):
+    """Instante de captura de la camara i, o None si no se sabe."""
+    try:
+        return _stamps.get(os.path.splitext(os.path.basename(filelist[i]))[0])
+    except Exception:
+        return None
+
+# En cams2world la traslacion ES el centro optico de la camara (cam->world),
+# asi que NO hay que hacer -R^T*t (eso es solo para el formato de COLMAP).
+centros = np.array([c[:3, 3] for c in cams2world])
+rots    = Rotation.from_matrix(np.array([c[:3, :3] for c in cams2world]))
+
+# ---- Comprobacion de escala -------------------------------------------
+# El checkpoint que usamos es el METRICO (..._catmlpdpt_metric.pth), asi que
+# las unidades deberian ser metros aproximados. Imprimimos el tamaño de la
+# escena para poder comprobarlo a ojo: si el recorrido de una casa da 8-15 m
+# de diagonal, la escala es creible y DIST_M=0.08 significa 8 cm de verdad.
+# Si diera 0.3 o 400, la escala NO es metrica y hay que subir/bajar DIST_M.
+_ext = centros.max(axis=0) - centros.min(axis=0)
+_diag = float(np.linalg.norm(_ext))
+print("ESCALA: recorrido de camaras = %.2f x %.2f x %.2f (diagonal %.2f). "
+      "Si esto se parece a metros, DEDUP_DIST_M=%.3f son %.1f cm reales."
+      % (_ext[0], _ext[1], _ext[2], _diag, DIST_M, DIST_M * 100), flush=True)
+
+def _nitidez(im):
+    """Varianza del Laplaciano sobre la imagen de 512px (float 0..1)."""
+    try:
+        g = im.mean(axis=2) if im.ndim == 3 else im
+        lap = (4.0 * g[1:-1, 1:-1] - g[:-2, 1:-1] - g[2:, 1:-1]
+               - g[1:-1, :-2] - g[1:-1, 2:])
+        return float(lap.var())
+    except Exception:
+        return 0.0
+
+keep = list(range(N))
+if DEDUP and N > MIN_KEEP:
+    nitidez = np.array([_nitidez(im) for im in rgbimgs])
+    # Las mas nitidas primero: asi la que sobrevive de cada grupo es la mejor.
+    orden = list(np.argsort(-nitidez))
+
+    # Rejilla de cubos: comparar contra todas seria O(N^2). Con el hash espacial
+    # solo se mira el cubo propio y los 26 vecinos -> tiempo constante.
+    lado = max(DIST_M, 1e-4)
+    rejilla = {}
+    aceptadas = []
+    descartadas = []
+
+    for i in orden:
+        c = centros[i]
+        k = (int(np.floor(c[0]/lado)), int(np.floor(c[1]/lado)), int(np.floor(c[2]/lado)))
+        repetida = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for j in rejilla.get((k[0]+dx, k[1]+dy, k[2]+dz), ()):
+                        if float(np.linalg.norm(c - centros[j])) >= DIST_M:
+                            continue                      # otro punto -> sirve
+                        ang = np.degrees((rots[i].inv() * rots[j]).magnitude())
+                        if ang >= ROT_DEG:
+                            continue                      # otro angulo -> sirve
+                        # Seguro: misma pose pero muy separadas en el tiempo =
+                        # sospechoso (posible confusion de MASt3R con textura
+                        # repetida). No se borra.
+                        if GUARD_S > 0:
+                            ta, tb = _t_de(i), _t_de(j)
+                            if ta is not None and tb is not None and abs(ta - tb) > GUARD_S:
+                                continue
+                        repetida = True                   # mismo punto Y angulo
+                        break
+                    if repetida: break
+                if repetida: break
+            if repetida: break
+        if repetida:
+            descartadas.append(i)
+        else:
+            rejilla.setdefault(k, []).append(i)
+            aceptadas.append(i)
+
+    # Seguro: si el filtro se paso de agresivo, devolvemos las mas nitidas de
+    # las descartadas hasta llegar a MIN_KEEP. Quedarse sin solape rompe 2DGS,
+    # y eso seria mucho peor que tener fotos de mas.
+    if len(aceptadas) < MIN_KEEP:
+        faltan = MIN_KEEP - len(aceptadas)
+        rescatadas = descartadas[:faltan]     # ya vienen ordenadas por nitidez
+        print("DEDUP: solo quedaban %d, devuelvo %d para no romper el solape"
+              % (len(aceptadas), len(rescatadas)), flush=True)
+        aceptadas += rescatadas
+
+    keep = sorted(aceptadas)
+    quitadas = N - len(keep)
+    print("DEDUP: %d fotos -> %d (%d repetidas quitadas, %.1f%%). "
+          "Criterio: misma pose = < %.0f cm Y < %.1f grados"
+          % (N, len(keep), quitadas, 100.0*quitadas/max(N,1), DIST_M*100, ROT_DEG),
+          flush=True)
+    if quitadas > 0.6 * N:
+        print("DEDUP: OJO, se quito mas del 60%. Si MASt3R registra pocas "
+              "camaras o la malla sale con huecos, sube DEDUP_DIST_M.", flush=True)
+else:
+    print("DEDUP: desactivado o pocas fotos (%d). Se usan todas." % N, flush=True)
+
 img_out = os.path.join(OUT_DIR, "images")
 sparse_out = os.path.join(OUT_DIR, "sparse", "0")
 os.makedirs(img_out, exist_ok=True)
@@ -151,11 +339,14 @@ TRAIN_RES = 1000   # lado mayor de las imágenes de entrenamiento. 1600px result
 #                    real es la captura (poses a 512px, celular sin LiDAR), no la resolución.
 print("ENTRENAMIENTO a %dpx (alta resolucion; poses a 512px)" % TRAIN_RES, flush=True)
 _n_hi = 0
-for i in range(N):
+# IMPORTANTE: se recorre `keep`, no range(N), y se RENUMERA con out_idx.
+# Los IDs de camara y los nombres de archivo tienen que quedar consecutivos
+# (1,2,3...) porque algunos lectores de 2DGS asumen que no hay huecos.
+for out_idx, i in enumerate(keep):
     im = rgbimgs[i]
     H, W = im.shape[:2]              # tamaño a 512px (referencia de aspecto/encuadre)
     aspect = W / float(H)
-    name = "img_%04d.png" % i
+    name = "img_%04d.png" % out_idx
     K = intrinsics[i]
     try:
         orig = Image.open(filelist[i]).convert("RGB")   # foto original (cam i = filelist[i])
@@ -184,7 +375,7 @@ for i in range(N):
     # intrínsecos escalados al nuevo tamaño (mismo FOV); cx,cy siguen centrados
     fx = float(K[0, 0]) * scale; fy = float(K[1, 1]) * scale
     cx = float(K[0, 2]) * scale; cy = float(K[1, 2]) * scale
-    cam_id = i + 1
+    cam_id = out_idx + 1
     fcam.write("%d PINHOLE %d %d %.6f %.6f %.6f %.6f\n" % (cam_id, Wsave, Hsave, fx, fy, cx, cy))
     # COLMAP guarda world->cam = inversa de cam->world (poses NO cambian con la resolución)
     w2c = np.linalg.inv(cams2world[i])
@@ -194,12 +385,16 @@ for i in range(N):
                (cam_id, float(q[3]), float(q[0]), float(q[1]), float(q[2]),
                 float(t[0]), float(t[1]), float(t[2]), cam_id, name))
     fimg.write("\n")   # linea de puntos 2D (vacia)
-print("ENTRENAMIENTO: %d/%d imagenes guardadas en alta resolucion" % (_n_hi, N), flush=True)
+print("ENTRENAMIENTO: %d/%d imagenes guardadas en alta resolucion"
+      % (_n_hi, len(keep)), flush=True)
 fcam.close()
 fimg.close()
 print("MAST3R: poses escritas", flush=True)
 
-# nube de puntos densa con color, para inicializar 2DGS
+# nube de puntos densa con color, para inicializar 2DGS.
+# OJO: esto usa las N vistas A PROPOSITO, no solo las de `keep`. La dedup es
+# solo para el ENTRENAMIENTO; la geometria se beneficia de TODAS las fotos.
+# No lo "arregles" filtrando aqui: perderias puntos gratis.
 pts3d, _, confs = scene.get_dense_pts3d(clean_depth=True)
 pts3d = to_numpy(pts3d)
 confs = to_numpy(confs)
@@ -3144,9 +3339,179 @@ def main():
                 list(raw.rglob("*.PNG")))
         if not imgs:
             raise RuntimeError("No se encontraron imágenes en el ZIP")
+
+        # ── PASO 1b: PREFILTRO con las poses que manda el celular ──────────
+        # La app escribe poses.json / poses.jsonl dentro del ZIP (orientacion en
+        # cuaternion, timestamp, y posicion si el telefono tiene ARCore). Hasta
+        # ahora ese archivo se descomprimia y se IGNORABA.
+        #
+        # Aprovecharlo aqui sale gratis: pasa ANTES de cargar el modelo, o sea
+        # cero GPU. Cada foto que se cae aqui son ~20-30 pares de MASt3R que no
+        # hay que calcular.
+        #
+        # REGLA DE SEGURIDAD (importante): sin ARCore el celular NO sabe donde
+        # esta, solo hacia donde apunta. Si dedujeramos por orientacion a secas,
+        # borrariamos fotos de la COCINA por parecerse a las del BAÑO (mismo
+        # rumbo, sitio distinto). Por eso solo se comparan fotos CERCANAS EN EL
+        # TIEMPO (PREFILTER_TIME_S). Eso ataca justo el caso real -quedarse
+        # quieto frente a la baldosa- sin tocar nada mas.
+        # ────────────────────────────────────────────────────────────────────
+        imgs = sorted(imgs)
+        if DEDUP and PREFILTER:
+            try:
+                poses_app = {}
+                for pf in list(raw.rglob("poses.json")) + list(raw.rglob("poses.jsonl")):
+                    txt = pf.read_text(encoding="utf-8", errors="ignore")
+                    registros = []
+                    if pf.suffix == ".jsonl":
+                        for ln in txt.splitlines():
+                            ln = ln.strip()
+                            if ln:
+                                try: registros.append(json.loads(ln))
+                                except Exception: pass
+                    else:
+                        try: registros = json.loads(txt).get("poses", [])
+                        except Exception: registros = []
+                    for r in registros:
+                        nom = r.get("image", "")
+                        if nom:
+                            poses_app[nom] = r
+
+                # ── VALIDACION DE TIMESTAMPS (seguro importante) ──────────
+                # Toda la seguridad del prefiltro descansa en la ventana de
+                # tiempo. Si los timestamps vinieran vacios o todos iguales, la
+                # ventana NUNCA expiraria y pasariamos a comparar todas contra
+                # todas: ahi si borrariamos la cocina por parecerse al baño.
+                # Antes de fiarnos, comprobamos que los tiempos sean creibles.
+                _ts = [float(r.get("timestamp", 0) or 0) for r in poses_app.values()]
+                _ts_ok = (len(set(_ts)) > max(2, len(_ts) // 10)
+                          and (max(_ts) - min(_ts)) > 1000.0)   # >1 s de recorrido
+
+                if len(poses_app) < 2:
+                    log("   PREFILTRO: el ZIP no trae poses.json usable, se salta")
+                elif not _ts_ok:
+                    log("   PREFILTRO: los timestamps del poses.json no son fiables "
+                        "(vacios o todos iguales). NO filtro aqui: sin reloj no puedo "
+                        "distinguir 'quieto en el baño' de 'otra habitacion'. "
+                        "El filtro fino del PASO 2 sigue activo.")
+                else:
+                    def _quat_de(r):
+                        """
+                        Saca el cuaternion de un registro de poses.json.
+
+                        COMPATIBILIDAD CON LA APP VIEJA (importante):
+                        Las versiones anteriores de la app NO escribian el campo
+                        "quaternion", solo "rotation" = [azimut, pitch, roll] en
+                        radianes, tal como los devuelve SensorManager.getOrientation().
+                        Aqui los convertimos, asi que los ZIPs viejos tambien sirven.
+
+                        Convertir a cuaternion no es un capricho: ARREGLA el problema
+                        del gimbal lock. Apuntando al piso o al techo (pitch cerca de
+                        +/-90) el azimut se dispara aunque no hayas girado, y restar
+                        angulos de Euler daria diferencias enormes falsas. El angulo
+                        geodesico entre cuaterniones mide el giro REAL.
+                        """
+                        q = r.get("quaternion")
+                        if q and len(q) >= 4:
+                            return list(q[:4])                    # app nueva: [x,y,z,w]
+                        e = r.get("rotation")
+                        if not e or len(e) < 3:
+                            return None
+                        import math as _m
+                        az, pi_, ro = float(e[0]), float(e[1]), float(e[2])
+
+                        def _mul(a, b):                           # [x,y,z,w] (x) [x,y,z,w]
+                            x1,y1,z1,w1 = a; x2,y2,z2,w2 = b
+                            return [w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                                    w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                                    w1*z2 + x1*y2 - y1*x2 + z1*w2,
+                                    w1*w2 - x1*x2 - y1*y2 - z1*z2]
+
+                        # Android compone la orientacion como Z (azimut), luego
+                        # X (pitch), luego Y (roll).
+                        qz = [0.0, 0.0, _m.sin(az/2), _m.cos(az/2)]
+                        qx = [_m.sin(pi_/2), 0.0, 0.0, _m.cos(pi_/2)]
+                        qy = [0.0, _m.sin(ro/2), 0.0, _m.cos(ro/2)]
+                        return _mul(_mul(qz, qx), qy)
+
+                    def _ang_deg(q1, q2):
+                        # angulo geodesico entre dos cuaterniones [x,y,z,w]:
+                        #   2*acos(|q1 . q2|).  El valor absoluto es lo que hace
+                        #   que q y -q (misma rotacion) den el mismo resultado.
+                        import math
+                        d = abs(sum(a*b for a, b in zip(q1, q2)))
+                        d = min(1.0, max(0.0, d))
+                        return math.degrees(2.0 * math.acos(d))
+
+                    conservadas, recientes = [], []   # recientes = [(ts, quat, pos, hay_pos)]
+                    sin_datos = 0
+                    _via_euler = 0
+                    for img in imgs:
+                        r = poses_app.get(img.name)
+                        q = _quat_de(r) if r else None
+                        if not r or not q:
+                            conservadas.append(img); sin_datos += 1
+                            continue
+                        if not r.get("quaternion"):
+                            _via_euler += 1
+                        ts = float(r.get("timestamp", 0)) / 1000.0
+                        pos = r.get("position") or [0.0, 0.0, 0.0]
+                        hay_pos = bool(r.get("has_position", False))
+
+                        # solo miramos las de la ventana de tiempo
+                        recientes = [x for x in recientes if ts - x[0] <= PREFILTER_TIME_S]
+
+                        repetida = False
+                        for (ts2, q2, pos2, hay2) in recientes:
+                            if _ang_deg(q, q2) >= DEDUP_ROT_DEG:
+                                continue                     # otro angulo -> sirve
+                            if hay_pos and hay2:
+                                d = sum((a-b)**2 for a, b in zip(pos, pos2)) ** 0.5
+                                if d >= DEDUP_DIST_M:
+                                    continue                 # otro punto -> sirve
+                            repetida = True
+                            break
+
+                        if not repetida:
+                            conservadas.append(img)
+                            recientes.append((ts, q, pos, hay_pos))
+
+                    quitadas = len(imgs) - len(conservadas)
+                    if len(conservadas) < DEDUP_MIN_KEEP:
+                        log(f"   PREFILTRO: quedarian {len(conservadas)} fotos "
+                            f"(menos de {DEDUP_MIN_KEEP}). NO filtro, es muy arriesgado.")
+                    elif quitadas > 0:
+                        log(f"   PREFILTRO: {len(imgs)} -> {len(conservadas)} fotos "
+                            f"({quitadas} repetidas quitadas sin gastar GPU, "
+                            f"~{quitadas*25} pares de MASt3R ahorrados)")
+                        if sin_datos:
+                            log(f"   PREFILTRO: {sin_datos} fotos sin pose en el JSON, conservadas")
+                        if _via_euler:
+                            log(f"   PREFILTRO: {_via_euler} fotos venian de una version vieja de "
+                                f"la app (sin cuaternion); convertidas desde los angulos de Euler")
+                        imgs = conservadas
+                    else:
+                        log("   PREFILTRO: no habia repetidas evidentes")
+            except Exception as e:
+                log(f"   PREFILTRO fallo ({e}); sigo con todas las fotos")
+
         images_dir = WORK / "images"; images_dir.mkdir(exist_ok=True)
-        for i, img in enumerate(sorted(imgs)):
-            shutil.copy(img, images_dir / f"foto_{i:04d}{img.suffix.lower()}")
+        _stamps = {}
+        for i, img in enumerate(imgs):
+            nuevo = f"foto_{i:04d}{img.suffix.lower()}"
+            shutil.copy(img, images_dir / nuevo)
+            # Guardamos el instante de captura con el NOMBRE NUEVO, porque el
+            # PASO 2 ya no conoce los nombres originales. Lo usa el seguro
+            # anti-baldosa del filtro fino.
+            try:
+                r = poses_app.get(img.name) if "poses_app" in dir() else None
+                if r and float(r.get("timestamp", 0) or 0) > 0:
+                    _stamps[Path(nuevo).stem] = float(r["timestamp"]) / 1000.0
+            except Exception:
+                pass
+        if _stamps:
+            (WORK / "timestamps.json").write_text(json.dumps(_stamps))
+            log(f"   {len(_stamps)} timestamps guardados (seguro anti-textura-repetida activo)")
         n_fotos = len(imgs)
         log(f"   {n_fotos} fotos listas")
 
@@ -3172,7 +3537,8 @@ def main():
         mast3r_py.write_text(MAST3R_SCRIPT)
         env_mast3r = dict(os.environ)
         env_mast3r["PYTHONPATH"] = "/opt/mast3r:/opt/mast3r/dust3r:/opt/2dgs"
-        run(["python", str(mast3r_py), str(images_dir), str(dataset)],
+        env_mast3r_ts = str(WORK / "timestamps.json")
+        run(["python", str(mast3r_py), str(images_dir), str(dataset), env_mast3r_ts],
             cwd="/opt/mast3r",
             env=env_mast3r,
             fase_label="PASO 2/5 — MASt3R calculando poses")
