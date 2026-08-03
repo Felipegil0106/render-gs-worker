@@ -1730,7 +1730,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                         base[_r0:_r1]=_np.where(_m2[:,:,None],_blk,base[_r0:_r1])
                         del _gg,_blk,_m2,_fy,_y0g,_y1g,_ty,_g00,_g01,_g10,_g11
                     _nfix+=nsin
-                    del gan,gi,_num,_den,_cx,_fx,_x0g,_x1g,_tx
+                    del gan,gi,_num,_den,_fx,_x0g,_x1g,_tx
             del ghor,gcru,gcnt,filled,sinh
         # ── (c) RELLENO DE GRIS ───────────────────────────────────────────
         # MEDIDO en la malla (53): el 19.3% de las caras (219.817) quedaban
