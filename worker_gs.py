@@ -1621,6 +1621,29 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 _,_ii=_kd.query(V32,k=1,workers=-1)
                 VCOL=(_np.clip(_vc[_ii],0,1)*255.0).astype(_np.float32)
                 log("BAKE: color de la malla listo para tapar vacios (%d vertices)" % len(V32))
+                # ── PROPAGACION ANTI-GRIS del color de la malla ──────────────
+                # El relleno de vacios (seccion c) tapa las caras que ninguna
+                # foto vio con ESTE VCOL. Pero los vertices que tampoco vio
+                # ninguna foto traen el gris de relleno (|c-128|<=6) del TSDF/
+                # pintor, asi que tapaba gris con gris -> sobrevivian TRIANGULOS
+                # grises. Aqui, antes de usarlo, cada vertice gris hereda el
+                # color del vertice NO gris mas cercano en 3D: el relleno pasa a
+                # usar color REAL de la superficie vista vecina. Apagar con
+                # OMVS_VFILL_PROP=0.
+                if os.environ.get("OMVS_VFILL_PROP","1")=="1":
+                    _gv=(_np.abs(VCOL-128.0).max(1)<=6.0)
+                    _ngr=int(_gv.sum()); _nok=int((~_gv).sum())
+                    if _ngr>0 and _nok>0:
+                        _kdg=_KD(V32[~_gv])
+                        _,_jjg=_kdg.query(V32[_gv],k=1,workers=-1)
+                        VCOL[_gv]=VCOL[~_gv][_jjg]
+                        log("BAKE: propagacion anti-gris -> %d vertices grises (%.1f%%) heredaron el color visto mas cercano" % (_ngr,100.0*_ngr/max(1,len(VCOL))))
+                        del _kdg,_jjg
+                    elif _ngr>0:
+                        log("BAKE: propagacion anti-gris -> los %d vertices salieron grises; sin color valido de donde copiar (falta cobertura de fotos)" % _ngr)
+                    else:
+                        log("BAKE: propagacion anti-gris -> el color de la malla no trae grises de relleno")
+                    del _gv
             else:
                 log("BAKE: la malla no trae color por vertice; no puedo tapar vacios")
             del _mo,_vc
@@ -2562,6 +2585,19 @@ else:
 lin = (accV[painted] / wsumV[painted, None]).astype(np.float32)
 cols[painted] = np.clip(linear_to_srgb(lin), 0, 1)          # (a) color FIEL
 log("pintados %d/%d vertices (%.1f%%) desde las fotos" % (painted.sum(), len(V), 100.0*painted.mean()))
+# ── RELLENO POR VECINO VISTO (respaldo por vertice) ──────────────────────────
+# Los vertices que ninguna foto vio quedaban en gris plano (0.5) o en un color
+# viejo (orig) -> parches grises en el respaldo. Ahora heredan el color del
+# vertice VISTO mas cercano en 3D: ninguna zona queda gris, toma el tono de la
+# superficie vista vecina. PAINT_FILL=nearest (default) propaga; =flat conserva
+# el comportamiento viejo (0.5/orig).
+if os.environ.get("PAINT_FILL", "nearest").lower() == "nearest" and painted.any() and (~painted).any():
+    from scipy.spatial import cKDTree as _KDp
+    _kdp = _KDp(V[painted])
+    _, _jp = _kdp.query(V[~painted], k=1, workers=-1)
+    cols[~painted] = cols[painted][_jp]
+    log("relleno por vecino visto: %d vertices sin foto (%.1f%%) heredaron el color visto mas cercano"
+        % (int((~painted).sum()), 100.0 * float((~painted).mean())))
 _b0 = float(cols.mean())
 # (b) SATURACION alrededor de la luminancia (no cambia el brillo, solo la viveza)
 if abs(_SAT - 1.0) > 1e-3:
