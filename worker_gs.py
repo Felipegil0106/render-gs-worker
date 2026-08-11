@@ -933,6 +933,14 @@ def _patch_unlit_matte(glbpath):
             _pbr = _m.setdefault("pbrMetallicRoughness", {})
             _pbr["metallicFactor"] = 0.0
             _pbr["roughnessFactor"] = 1.0
+            # baseColorFactor a BLANCO. MEDIDO en el glb del job 436315d5:
+            # trimesh exporta [0.4,0.4,0.4,1.0] por defecto, y el visor
+            # MULTIPLICA la textura por ese factor -> el render salia al 40%
+            # de su color (apagado/lavado) aunque el atlas estuviera bien.
+            # Con 1.0 se ve el color real que horneamos.
+            _bcf = _pbr.get("baseColorFactor")
+            _pbr["baseColorFactor"] = [1.0, 1.0, 1.0,
+                                       float(_bcf[3]) if (isinstance(_bcf, list) and len(_bcf) == 4) else 1.0]
             _m.setdefault("extensions", {})["KHR_materials_unlit"] = {}
         _bin = _d[20 + _jlen:]
         _nj = _json.dumps(_g, separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -1839,6 +1847,37 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 _gc.collect()
             except Exception as _ve:
                 log("BAKE: relleno de gris fallo en atlas %d (%s)" % (ti+1,_ve))
+        # ── BARRIDO FINAL ANTI-GRIS (por cercania DENTRO del atlas) ─────────
+        # MEDIDO en el glb del job 436315d5: 195.155 caras (17-20% de la malla)
+        # quedaban ENTERAS en gris 128 (99.2% de las muestras internas), pero el
+        # relleno de arriba solo tapo 15.124. Motivo: ese relleno pinta con el
+        # color de la malla (VCOL), y VCOL solo cubre los vertices SOLDADOS de
+        # OpenMVS (559.880 de 1.229.853): la cara que no encuentra su vertice
+        # se queda gris. Este barrido no depende de VCOL ni de las UV: toma
+        # CADA texel gris que quedo y le copia el color del texel NO gris mas
+        # cercano del mismo atlas (transformada de distancia euclidea). Asi no
+        # sobrevive ningun cuadrito/triangulo gris.
+        # Solo toca texeles grises: lo ya pintado no se modifica. El fondo
+        # vacio del atlas tambien se rellena (es inocuo: no se ve, y evita que
+        # el sangrado de mipmaps arrastre gris a los bordes de los parches).
+        # Apagar con OMVS_VFILL_NEAR=0.
+        if os.environ.get("OMVS_VFILL_NEAR","1")=="1":
+            try:
+                _gm=(_np.abs(base.astype(_np.int16)-128).max(2)<=6)
+                _ng=int(_gm.sum())
+                if _ng and not _gm.all():
+                    from scipy import ndimage as _nd
+                    _,(_iy,_ix)=_nd.distance_transform_edt(_gm,return_indices=True)
+                    base[_gm]=base[_iy[_gm],_ix[_gm]]
+                    log("BAKE: barrido anti-gris -> %.2fM texeles grises (%.1f%% del atlas %d) "
+                        "rellenados con el color valido mas cercano"
+                        % (_ng/1e6,100.0*_ng/float(W2*H2),ti+1))
+                    del _iy,_ix
+                elif _ng:
+                    log("BAKE: barrido anti-gris -> el atlas %d salio todo gris; no hay color de donde copiar" % (ti+1))
+                del _gm; _gc.collect()
+            except Exception as _bg:
+                log("BAKE: barrido anti-gris fallo en atlas %d (%s)" % (ti+1,_bg))
         if tf.lower().endswith((".jpg",".jpeg")):
             Image.fromarray(base).save(tf,quality=BAKE_JQ,subsampling=2)
         else:
