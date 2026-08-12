@@ -2049,8 +2049,12 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _a2=_np.cross(_nrm,_a1)
                     _x=_cen[_ix]@_a1; _y=_cen[_ix]@_a2
                     _P=0.02
-                    _gx=((_x-_x.min())/_P).astype(_np.int64)
-                    _gy=((_y-_y.min())/_P).astype(_np.int64)
+                    # posicion CONTINUA en la rejilla (antes de truncar): la
+                    # necesita la interpolacion bilineal de la ganancia
+                    _gxf=(_x-_x.min())/_P
+                    _gyf=(_y-_y.min())/_P
+                    _gx=_gxf.astype(_np.int64)
+                    _gy=_gyf.astype(_np.int64)
                     _W=int(_gx.max())+1; _H=int(_gy.max())+1
                     if _W*_H>4_000_000 or _W<60 or _H<60:
                         _desc.append("rejilla %dx%d fuera de rango" % (_W,_H)); continue
@@ -2061,6 +2065,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                         continue
                     _ix=_ix[_bue]
                     _gx=_gx[_bue]; _gy=_gy[_bue]
+                    _gxf=_gxf[_bue]; _gyf=_gyf[_bue]
                     _cf=FCOL[_ix]
                     _S=_np.zeros((_H,_W,3)); _Cn=_np.zeros((_H,_W))
                     for _k in range(3): _np.add.at(_S[:,:,_k],(_gy,_gx),_cf[:,_k])
@@ -2078,7 +2083,24 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _g3=_np.clip(_obj[None,None,:]/_np.maximum(_BJ,1.0),
                                  1.0/BAKE_TONO_TOPE,BAKE_TONO_TOPE)
                     _gl=_g3.mean(2)                       # una ganancia por celda
-                    _gf=_gl[_np.clip(_gy,0,_H-1),_np.clip(_gx,0,_W-1)]
+                    # BILINEAL, no vecino-mas-cercano. Con indice ENTERO
+                    # (_gl[_gy,_gx]) TODAS las caras de una misma celda reciben
+                    # exactamente la misma ganancia y en la frontera con la
+                    # celda vecina hay un SALTO BRUSCO: eso dibuja CUADROS y
+                    # TRIANGULOS planos sobre paredes y piso (el sintoma que
+                    # Felipe reporta desde varios renders). Ya se habia
+                    # corregido antes y la correccion SE PERDIO en una
+                    # reescritura; aqui vuelve, y ademas se hace sobre la
+                    # posicion CONTINUA de la cara en la rejilla, asi que la
+                    # ganancia varia suave de cara a cara.
+                    _fx=_np.clip(_gxf,0,_W-1)
+                    _fy=_np.clip(_gyf,0,_H-1)
+                    _x0i=_np.floor(_fx).astype(_np.int64); _y0i=_np.floor(_fy).astype(_np.int64)
+                    _x1i=_np.minimum(_x0i+1,_W-1);         _y1i=_np.minimum(_y0i+1,_H-1)
+                    _tx=(_fx-_x0i); _ty=(_fy-_y0i)
+                    _gf=((_gl[_y0i,_x0i]*(1.0-_tx)+_gl[_y0i,_x1i]*_tx)*(1.0-_ty)
+                         +(_gl[_y1i,_x0i]*(1.0-_tx)+_gl[_y1i,_x1i]*_tx)*_ty)
+                    del _x0i,_y0i,_x1i,_y1i,_tx,_ty,_fx,_fy
                     _gf=1.0+BAKE_TONO_FZA*(_gf-1.0)
                     _gan[_ix]=_gf.astype(_np.float32)
                     _npar+=1
