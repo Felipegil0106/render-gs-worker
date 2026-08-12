@@ -1265,7 +1265,19 @@ def bake_multiview(objf, texfiles, mtl2tex):
         pv=(((1.0-u[:,:,1]) if flip==0 else u[:,:,1])*(H2-1)).astype(_np.float32)
         del u
         area2=_np.abs((pu[:,1]-pu[:,0])*(pv[:,2]-pv[:,0])-(pu[:,2]-pu[:,0])*(pv[:,1]-pv[:,0]))
-        ns=_np.clip((area2*2.0).astype(_np.int64)+3,3,400000)
+        # CUANTAS muestras por cara. MEDIDO (job d760e7ad): con 2 por texel el
+        # 15% de los texeles de CADA cara nunca lo tocaba una muestra (ley del
+        # coleccionista: e^-2 = 13.5%). Ese texel no entraba en LIN, el
+        # horneador NUNCA lo pintaba y se quedaba con el gris crudo de
+        # OpenMVS -- aunque las fotos de esa zona existieran y la cobertura
+        # fuera del 99%. ESE era el origen real de los cuadros y triangulos
+        # grises: no faltaban fotos, faltaba preguntarles.
+        # Con 8 por texel la fraccion sin tocar cae a 0.09% (medido), y el
+        # barrido anti-gris se queda solo como red de seguridad.
+        # Cuesta ~4x mas muestras en la rasterizacion (la memoria NO sube: el
+        # trabajo va por trozos de PRESU). BAKE_SAMP lo ajusta si hace falta.
+        _KSAMP=float(os.environ.get("BAKE_SAMP","8"))
+        ns=_np.clip((area2*_KSAMP).astype(_np.int64)+8,3,2_000_000)
         _NMU+=int(ns.sum()); _bg=ns>10000
         _NBIG+=int(_bg.sum()); _MUBIG+=int(ns[_bg].sum())
         cs=_np.cumsum(ns)
@@ -1863,19 +1875,44 @@ def bake_multiview(objf, texfiles, mtl2tex):
         # Apagar con OMVS_VFILL_NEAR=0.
         if os.environ.get("OMVS_VFILL_NEAR","1")=="1":
             try:
-                _gm=(_np.abs(base.astype(_np.int16)-128).max(2)<=6)
-                _ng=int(_gm.sum())
-                if _ng and not _gm.all():
+                # QUE cuenta como relleno: NO el color, sino "ninguna foto lo
+                # pinto". Arriba (m=(AID==ti)&seen) SOLO los texeles con foto
+                # reciben el color horneado; los demas se quedan con el gris
+                # crudo de OpenMVS. Buscar ese gris POR COLOR fallo (v1): el
+                # atlas pasa por JPEG antes de que el horneador lo lea, asi que
+                # el 128 llega corrido a 120-140 y el umbral +-6 solo limpiaba
+                # una parte (MEDIDO en el job 436315d5: de 207k caras grises
+                # solo se iban 6k). Y ensanchar el umbral a ciegas borraria
+                # PAREDES Y PISO que son gris de verdad.
+                # Aqui: candidato = SIN foto (mascara exacta) Y ademas gris
+                # neutro. Lo que recibio foto NO se toca nunca, aunque sea gris.
+                _sp=_np.zeros((H2,W2),bool)
+                _ms=(AID==ti)&seen
+                if _ms.any():
+                    _lp=LIN[_ms].astype(_np.int64)
+                    _sp[_lp//W2,_lp%W2]=True
+                    del _lp
+                del _ms
+                _b16=base.astype(_np.int16)
+                _lum=(_b16[:,:,0]*77+_b16[:,:,1]*150+_b16[:,:,2]*29)>>8
+                _neu=((_b16.max(2)-_b16.min(2))<=20)&(_lum>=95)&(_lum<=165)
+                del _b16,_lum
+                _fm=_neu&(~_sp)
+                del _neu,_sp
+                _nf2=int(_fm.sum())
+                if _nf2 and not _fm.all():
                     from scipy import ndimage as _nd
-                    _,(_iy,_ix)=_nd.distance_transform_edt(_gm,return_indices=True)
-                    base[_gm]=base[_iy[_gm],_ix[_gm]]
-                    log("BAKE: barrido anti-gris -> %.2fM texeles grises (%.1f%% del atlas %d) "
-                        "rellenados con el color valido mas cercano"
-                        % (_ng/1e6,100.0*_ng/float(W2*H2),ti+1))
+                    _,(_iy,_ix)=_nd.distance_transform_edt(_fm,return_indices=True)
+                    base[_fm]=base[_iy[_fm],_ix[_fm]]
+                    log("BAKE: barrido anti-gris -> %.2fM texeles sin foto (%.1f%% del atlas %d) "
+                        "rellenados con el color real mas cercano (los que SI recibieron foto no se tocan)"
+                        % (_nf2/1e6,100.0*_nf2/float(W2*H2),ti+1))
                     del _iy,_ix
-                elif _ng:
-                    log("BAKE: barrido anti-gris -> el atlas %d salio todo gris; no hay color de donde copiar" % (ti+1))
-                del _gm; _gc.collect()
+                elif _nf2:
+                    log("BAKE: barrido anti-gris -> el atlas %d no tiene color valido de donde copiar" % (ti+1))
+                else:
+                    log("BAKE: barrido anti-gris -> el atlas %d no tiene texeles de relleno" % (ti+1))
+                del _fm; _gc.collect()
             except Exception as _bg:
                 log("BAKE: barrido anti-gris fallo en atlas %d (%s)" % (ti+1,_bg))
         if tf.lower().endswith((".jpg",".jpeg")):
