@@ -447,7 +447,16 @@ IMG_MAX       = int(os.environ.get("OMVS_IMG_MAX", "2000"))      # lado mayor de
 # memoria de video al abrirlo. En celular puede no cargar. Polycam usa 2.
 MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "8192"))      # probado en el (45): 2 atlas
 RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso
-OUTLIER       = os.environ.get("OMVS_OUTLIER", "0.06")           # descarta fotos inconsistentes
+OUTLIER       = os.environ.get("OMVS_OUTLIER", "0")              # 0 = APAGADO. Con 0.06 el chequeo de foto-consistencia descartaba vistas de una cara por diferencias de exposicion/balance de blancos (auto del Android) y especulares; si descarta TODAS, la cara se queda SIN vista valida -> etiqueta 0 -> relleno. Como el horneador re-pinta el color desde las 164 fotos, la foto-consistencia interna de OpenMVS no aporta nada: de OpenMVS solo necesitamos un MAPA UV completo.
+# Color con que OpenMVS pinta las caras que no cubre ninguna imagen.
+# 16711935 = 0x00FF00FF = MAGENTA (255,0,255): no existe en un interior real,
+# asi que el detector de relleno no puede confundirlo con madera/muebles (el
+# naranja por defecto, 0x00FF7F27 = 255,127,39, SI se confundia). Ver la nota
+# larga en CFG1.
+# EN DECIMAL a proposito: OpenMVS lee esta opcion como entero sin signo con
+# boost::program_options, que usa lexical_cast y NO entiende "0xFF00FF" (lo
+# rechazaria o lo dejaria en 0 = negro).
+EMPTYCOL      = os.environ.get("OMVS_EMPTYCOL", "16711935")
 SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "0.02")            # hacia 0 = parches GRANDES (investigacion: la escala va AL REVES; 1=mas fragmentado)
 GLOBAL_SEAM   = os.environ.get("OMVS_GLOBAL_SEAM", "0")          # 0 = apagado: crashea (rc=-6) INCLUSO con malla manifold (probable choque con las caras virtuales). La nivelacion la hacemos nosotros (EXPO abajo)
 LOCAL_SEAM    = os.environ.get("OMVS_LOCAL_SEAM", "0")           # 0 = apagado: sin base global escribe bandas negras (comprobado byte a byte)
@@ -1717,10 +1726,30 @@ def bake_multiview(objf, texfiles, mtl2tex):
             sinh=_np.zeros((H2,W2),bool)
             for _r0 in range(0,H2,512):
                 _r1=min(_r0+512,H2); _b=base[_r0:_r1]
-                _g=((_b[:,:,0]>=125)&(_b[:,:,0]<=131)&(_b[:,:,1]>=125)&(_b[:,:,1]<=131)
-                    &(_b[:,:,2]>=125)&(_b[:,:,2]<=131))
+                # DETECCION DEL GRIS POR NEUTRALIDAD, no por el rango 125-131.
+                # MEDIDO en el atlas real del job 77d58f3d: el atlas viene de
+                # OpenMVS YA pasado por JPEG, asi que el gris de relleno no
+                # llega en 128 exacto sino corrido (medido: RGB [140.6, 141.3,
+                # 139.1], luminancia 90..175). Con el rango 125-131 se escapaban
+                # 0.77M texeles de gris por atlas, que entonces entraban en
+                # 'sinh' y RECIBIAN CORRECCION DE TONO: cada celda de la rejilla
+                # los multiplicaba por una ganancia distinta, dejando el gris
+                # partido en un mosaico de brillos con BORDES RECTOS. Eso es lo
+                # que se ve como CUADROS Y TRIANGULOS grises.
+                # El relleno es NEUTRO (R=G=B); la superficie real de un
+                # interior es CALIDA (R-B=+16). Medido: este criterio captura
+                # 0.0000% de superficie calida, o sea no le quita el nivelado
+                # de tono a nada legitimo.
+                _rbg=_b[:,:,0].astype(_np.int16)-_b[:,:,2].astype(_np.int16)
+                # int32: en int16 esto DESBORDA (131*77+131*150+131*29 = 33536 >
+                # 32767) y la luminancia salia envuelta -> la deteccion fallaba.
+                _lg=(_b[:,:,0].astype(_np.int32)*77+_b[:,:,1].astype(_np.int32)*150
+                     +_b[:,:,2].astype(_np.int32)*29)>>8
+                _g=((_np.abs(_rbg)<=6)
+                    &((_b.max(2).astype(_np.int16)-_b.min(2).astype(_np.int16))<=12)
+                    &(_lg>=90)&(_lg<=175))
                 sinh[_r0:_r1]=(~filled[_r0:_r1])&(~_g)
-                del _g,_b
+                del _g,_b,_rbg,_lg
             nsin=int(sinh.sum())
             if nsin>0 and BAKE_FIX:
                 gok=gcnt>=4          # celdas con muestras suficientes
@@ -1894,7 +1923,9 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     del _lp
                 del _ms
                 _b16=base.astype(_np.int16)
-                _lum=(_b16[:,:,0]*77+_b16[:,:,1]*150+_b16[:,:,2]*29)>>8
+                # int32 en la luminancia: en int16 desborda (ver nota arriba)
+                _lum=(base[:,:,0].astype(_np.int32)*77+base[:,:,1].astype(_np.int32)*150
+                      +base[:,:,2].astype(_np.int32)*29)>>8
                 # El gris de relleno es NEUTRO PURO (R=G=B, medido [128.5,
                 # 128.5, 128.5]); la superficie real de un interior tiene
                 # tinte CALIDO (medido R-B = +16). Separar por calidez, y no
@@ -2372,18 +2403,40 @@ def obj_to_glb(objf, outglb):
                 if os.path.exists(tf):
                     if _curm is not None: mtl2tex[_curm] = len(texfiles)
                     texfiles.append(tf)
-    _norange = 0
+    _norange = 0; _nmag = 0
     for tf in texfiles:
         try:
             a = _np.asarray(Image.open(tf).convert("RGB")).copy()
-            fill = (a[:, :, 0] > 235) & (a[:, :, 1] > 105) & (a[:, :, 1] < 150) & (a[:, :, 2] < 70)
+            _r = a[:, :, 0].astype(_np.int16); _g = a[:, :, 1].astype(_np.int16)
+            _b = a[:, :, 2].astype(_np.int16)
+            # RELLENO = MAGENTA (255,0,255), el color que pedimos con
+            # --empty-color. Tolerancia amplia porque el JPEG corre los bordes,
+            # pero sigue siendo inconfundible: ningun material de un interior
+            # tiene R y B altos con G bajo a la vez.
+            fmag = (_r > 180) & (_g < 90) & (_b > 180)
+            # RESPALDO: naranja EXACTO de OpenMVS (255,127,39), por si el binario
+            # del pod no acepto --empty-color y siguio con el default.
+            # ANTES (el bug): el rango era R>235, G 105..150, B<70. Eso es una
+            # FRANJA ANCHA de naranjas y marrones saturados, o sea MADERA,
+            # terracota y muebles calidos, y todo eso se pintaba de gris plano
+            # (128,128,128) -> los fragmentos grises pequenos repartidos por el
+            # render. El propio analisis v8.8 ya lo habia medido ("el naranja NO
+            # es relleno, es madera real de las fotos") pero el arreglo nunca se
+            # aplico. Ahora la tolerancia es +-14 alrededor del color exacto.
+            fnar = ((_np.abs(_r - 255) <= 14) & (_np.abs(_g - 127) <= 14)
+                    & (_np.abs(_b - 39) <= 14))
+            fill = fmag | fnar
             if fill.any():
-                a[fill] = (128, 128, 128); _norange += int(fill.sum())
+                a[fill] = (128, 128, 128)
+                _nmag += int(fmag.sum()); _norange += int(fnar.sum())
                 Image.fromarray(a).save(tf)
+            del _r, _g, _b, fmag, fnar, fill
         except Exception as _te:
             log("(no pude recolorear %s: %s)" % (os.path.basename(tf), _te))
-    if _norange:
-        log("relleno naranja de OpenMVS -> gris: %d pixeles en %d texturas" % (_norange, len(texfiles)))
+    if _nmag or _norange:
+        log("relleno de OpenMVS -> gris: %d px magenta + %d px naranja-exacto "
+            "en %d texturas (la madera y los tonos calidos YA NO se tocan)"
+            % (_nmag, _norange, len(texfiles)))
     log("glb: %d texturas" % len(texfiles))
     # (a2) NIVELADO DE TONO POR PARCHE (Opcion C) — antes de incrustar las texturas
     if TONE_LEVEL and texfiles and mtl2tex:
@@ -2480,7 +2533,17 @@ CFG1 = ["--virtual-face-images", str(VFACES),
         "--patch-packing-heuristic", PACKH,
         "--local-seam-leveling", str(LOCAL_SEAM),
         "--sharpness-weight", str(SHARP),
-        "--global-seam-leveling", str(GLOBAL_SEAM)]
+        "--global-seam-leveling", str(GLOBAL_SEAM),
+        # COLOR DE RELLENO INEQUIVOCO. Por defecto OpenMVS pinta las caras que
+        # "no cubre ninguna imagen" de NARANJA (255,127,39 = 0x00FF7F27). El
+        # problema: un interior real TIENE naranjas y marrones (madera, muebles)
+        # -> distinguir relleno de superficie por color era imposible y el
+        # detector de abajo terminaba borrando MADERA REAL. Con MAGENTA
+        # (255,0,255) el relleno es un color que no existe en la escena, asi que
+        # la deteccion es exacta y no puede comerse nada legitimo.
+        # CFG2 (respaldo) NO lleva esta bandera: si el binario del pod no la
+        # conoce y cfg1 falla, cfg2 corre igual con el naranja de siempre.
+        "--empty-color", str(EMPTYCOL)]
 CFG2 = ["--virtual-face-images", str(VFACES),
         "--patch-packing-heuristic", PACKH,
         "--local-seam-leveling", "0",
