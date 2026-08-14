@@ -445,7 +445,7 @@ IMG_MAX       = int(os.environ.get("OMVS_IMG_MAX", "2000"))      # lado mayor de
 #     OMVS_MAX_TEX=4096  OMVS_BAKE_SCALE=2  OMVS_BAKE_MAXATL=8
 # Advertencia medida: eso pide ~8 atlas de 8192 -> archivo ~60 MB y ~2 GB de
 # memoria de video al abrirlo. En celular puede no cargar. Polycam usa 2.
-MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "4096"))      # v9.6 NITIDEZ: OpenMVS empaqueta a 4096 y el horneador sube cada atlas a 8192 => 4x texeles
+MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "8192"))      # REVERTIDO tras el job f30c1bfc: con 4096 OpenMVS devolvio 9 atlas, la salvaguarda (tope 8) bloqueo el x2 y quedo en 4096 -> MISMA densidad (51.0M vs 52.4M texeles) y 9 materiales en vez de 2. O sea el cambio no dio nitidez y empeoro el visor
 RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso
 OUTLIER       = os.environ.get("OMVS_OUTLIER", "0")              # 0 = APAGADO. Con 0.06 el chequeo de foto-consistencia descartaba vistas de una cara por diferencias de exposicion/balance de blancos (auto del Android) y especulares; si descarta TODAS, la cara se queda SIN vista valida -> etiqueta 0 -> relleno. Como el horneador re-pinta el color desde las 164 fotos, la foto-consistencia interna de OpenMVS no aporta nada: de OpenMVS solo necesitamos un MAPA UV completo.
 # Color con que OpenMVS pinta las caras que no cubre ninguna imagen.
@@ -476,7 +476,7 @@ EXPO_SAMPLES  = int(os.environ.get("OMVS_EXPO_SAMPLES", "40000"))# puntos de la 
 OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno
 # ── HORNEADOR MULTI-VISTA (v9.1; plan P1 de la investigacion, estilo Polycam) ──
 BAKE          = os.environ.get("OMVS_BAKE", "1") == "1"          # repinta cada texel MEZCLANDO todas las fotos que lo ven
-BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "2"))      # 2 = el horneador sube cada atlas 4096 -> 8192 (4x texeles). MEDIDO en el glb (76): el texel pasa de 1.44 mm a 0.72 mm
+BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "1"))      # 1 = atlas de OpenMVS tal cual. Con MAX_TEX=8192 subirlo a 2 daria atlas de 16384, que muchos visores (y casi todo movil) NO soportan. La nitidez pide MAS TEXELES TOTALES: ver nota de densidad arriba
 BAKE_MAXATL   = int(os.environ.get("OMVS_BAKE_MAXATL", "8"))     # 8 = permite el x2 con la superficie medida (105.6 m2 pidieron ~8 atlas de 4096). Si OpenMVS produce mas, el horneador NO escala y cae solo a x1 (salvaguarda)
 BAKE_DS       = int(os.environ.get("OMVS_BAKE_DS", "8"))         # banda baja = foto reducida /8 y devuelta (multiBandDownscale de AliceVision)
 BAKE_COSK     = float(os.environ.get("OMVS_BAKE_COSK", "2"))     # peso angular cos^k (k=2 recomendado por la investigacion)
@@ -1641,6 +1641,23 @@ def bake_multiview(objf, texfiles, mtl2tex):
     #   - donde hay fotos: queda el horneado exacto
     #   - donde no: queda el crudo con el MISMO tono de sus vecinos, y
     #     conserva su detalle fino. No sobrevive ninguna isla de tono ajeno.
+    # CRITERIO UNICO DE "GRIS DE RELLENO" para todo el horneador.
+    # ANTES el relleno por cara usaba |c-128|<=6 (estricto) mientras el barrido
+    # final usaba neutralidad. MEDIDO en el glb del job 23e40b1d: quedaban 25.253
+    # caras grises pero el relleno por cara solo detectaba 13.746 -> a la mitad se
+    # le escapaba, porque el atlas viene de OpenMVS pasado por JPEG y el 128 llega
+    # corrido (medido hasta [140.6,141.3,139.1]). Con el mismo criterio en los dos
+    # sitios ya no se escapa ninguna.
+    # El relleno es NEUTRO (R=G=B); la superficie real de un interior es CALIDA
+    # (R-B=+16), asi que esto no toca paredes ni piso grises legitimos.
+    def _es_gris(c):
+        c=c.astype(_np.int32)
+        lum=(c[...,0]*77+c[...,1]*150+c[...,2]*29)>>8
+        # umbral 10 y no 6: el gris de los cuadros medido en la captura real de
+        # Felipe da R-B = 7 (RGB 131,134,124) y con 6 se escapaba justo. Con 10
+        # entra, y la pared calida real (R-B = 21) sigue fuera.
+        return ((_np.abs(c[...,0]-c[...,2])<=10)
+                &((c.max(-1)-c.min(-1))<=12)&(lum>=90)&(lum<=175))
     _nfix=0; _nvac=0; _nvpx=0; _ndeg=0
     # color por vertice de la malla original (viene de las fotos): se mapea a
     # los vertices del OBJ de OpenMVS por posicion (el OBJ los renumera).
@@ -1840,7 +1857,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                         for _ox in range(-R,R+1):
                             yy=_np.clip(cyd+_oy,0,H2-1); xx=_np.clip(cxd+_ox,0,W2-1)
                             _cur=base[yy,xx].astype(_np.int16)
-                            gz=(_np.abs(_cur-128).max(1)<=6)
+                            gz=_es_gris(_cur)
                             if gz.any():
                                 base[yy[gz],xx[gz]]=_np.clip(colf[gz],0,255).astype(_np.uint8)
                                 _nvpx+=int(gz.sum()); _hit|=gz
@@ -1882,7 +1899,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                                 iyp=_np.broadcast_to(Y,(n,K,K))[ok]
                                 fid=_np.broadcast_to(_np.arange(n)[:,None,None],(n,K,K))[ok]
                                 _cur=base[iyp,ixp].astype(_np.int16)
-                                gz=(_np.abs(_cur-128).max(1)<=6)
+                                gz=_es_gris(_cur)
                                 if gz.any():
                                     base[iyp[gz],ixp[gz]]=_np.clip(colf[ii][fid[gz]],0,255).astype(_np.uint8)
                                     _nvpx+=int(gz.sum())
@@ -1937,7 +1954,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 # tinte CALIDO (medido R-B = +16). Separar por calidez, y no
                 # solo por saturacion, evita comerse paredes/piso grises.
                 _rb=_b16[:,:,0].astype(_np.int16)-_b16[:,:,2].astype(_np.int16)
-                _gris=(_np.abs(_rb)<=6)&((_b16.max(2)-_b16.min(2))<=12)&(_lum>=90)&(_lum<=175)
+                _gris=(_np.abs(_rb)<=10)&((_b16.max(2)-_b16.min(2))<=12)&(_lum>=90)&(_lum<=175)
                 del _b16,_lum,_rb
                 _fm=_gris&(~_sp)
                 del _sp
