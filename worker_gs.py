@@ -445,18 +445,9 @@ IMG_MAX       = int(os.environ.get("OMVS_IMG_MAX", "2000"))      # lado mayor de
 #     OMVS_MAX_TEX=4096  OMVS_BAKE_SCALE=2  OMVS_BAKE_MAXATL=8
 # Advertencia medida: eso pide ~8 atlas de 8192 -> archivo ~60 MB y ~2 GB de
 # memoria de video al abrirlo. En celular puede no cargar. Polycam usa 2.
-MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "8192"))      # REVERTIDO tras el job f30c1bfc: con 4096 OpenMVS devolvio 9 atlas, la salvaguarda (tope 8) bloqueo el x2 y quedo en 4096 -> MISMA densidad (51.0M vs 52.4M texeles) y 9 materiales en vez de 2. O sea el cambio no dio nitidez y empeoro el visor
+MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "8192"))      # probado en el (45): 2 atlas
 RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso
-OUTLIER       = os.environ.get("OMVS_OUTLIER", "0")              # 0 = APAGADO. Con 0.06 el chequeo de foto-consistencia descartaba vistas de una cara por diferencias de exposicion/balance de blancos (auto del Android) y especulares; si descarta TODAS, la cara se queda SIN vista valida -> etiqueta 0 -> relleno. Como el horneador re-pinta el color desde las 164 fotos, la foto-consistencia interna de OpenMVS no aporta nada: de OpenMVS solo necesitamos un MAPA UV completo.
-# Color con que OpenMVS pinta las caras que no cubre ninguna imagen.
-# 16711935 = 0x00FF00FF = MAGENTA (255,0,255): no existe en un interior real,
-# asi que el detector de relleno no puede confundirlo con madera/muebles (el
-# naranja por defecto, 0x00FF7F27 = 255,127,39, SI se confundia). Ver la nota
-# larga en CFG1.
-# EN DECIMAL a proposito: OpenMVS lee esta opcion como entero sin signo con
-# boost::program_options, que usa lexical_cast y NO entiende "0xFF00FF" (lo
-# rechazaria o lo dejaria en 0 = negro).
-EMPTYCOL      = os.environ.get("OMVS_EMPTYCOL", "16711935")
+OUTLIER       = os.environ.get("OMVS_OUTLIER", "0.06")           # descarta fotos inconsistentes
 SMOOTH_RATIO  = os.environ.get("OMVS_SMOOTH", "0.02")            # hacia 0 = parches GRANDES (investigacion: la escala va AL REVES; 1=mas fragmentado)
 GLOBAL_SEAM   = os.environ.get("OMVS_GLOBAL_SEAM", "0")          # 0 = apagado: crashea (rc=-6) INCLUSO con malla manifold (probable choque con las caras virtuales). La nivelacion la hacemos nosotros (EXPO abajo)
 LOCAL_SEAM    = os.environ.get("OMVS_LOCAL_SEAM", "0")           # 0 = apagado: sin base global escribe bandas negras (comprobado byte a byte)
@@ -476,8 +467,8 @@ EXPO_SAMPLES  = int(os.environ.get("OMVS_EXPO_SAMPLES", "40000"))# puntos de la 
 OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno
 # ── HORNEADOR MULTI-VISTA (v9.1; plan P1 de la investigacion, estilo Polycam) ──
 BAKE          = os.environ.get("OMVS_BAKE", "1") == "1"          # repinta cada texel MEZCLANDO todas las fotos que lo ven
-BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "1"))      # 1 = atlas de OpenMVS tal cual. Con MAX_TEX=8192 subirlo a 2 daria atlas de 16384, que muchos visores (y casi todo movil) NO soportan. La nitidez pide MAS TEXELES TOTALES: ver nota de densidad arriba
-BAKE_MAXATL   = int(os.environ.get("OMVS_BAKE_MAXATL", "8"))     # 8 = permite el x2 con la superficie medida (105.6 m2 pidieron ~8 atlas de 4096). Si OpenMVS produce mas, el horneador NO escala y cae solo a x1 (salvaguarda)
+BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "1"))      # 1 = el atlas de OpenMVS tal cual (probado). Con MAX_TEX=4096 sube esto a 2 para el doble de fino
+BAKE_MAXATL   = int(os.environ.get("OMVS_BAKE_MAXATL", "5"))     # tope de atlas para permitir el x2 (5 atlas 8192 ~ 45-55 MB)
 BAKE_DS       = int(os.environ.get("OMVS_BAKE_DS", "8"))         # banda baja = foto reducida /8 y devuelta (multiBandDownscale de AliceVision)
 BAKE_COSK     = float(os.environ.get("OMVS_BAKE_COSK", "2"))     # peso angular cos^k (k=2 recomendado por la investigacion)
 BAKE_TOL      = float(os.environ.get("OMVS_BAKE_TOL", "0.010"))  # tolerancia de visibilidad = 1% de la profundidad (0.6% rechazaba camaras buenas donde la malla erra 1-2 cm -> cobertura 70% y parches leves)
@@ -942,14 +933,6 @@ def _patch_unlit_matte(glbpath):
             _pbr = _m.setdefault("pbrMetallicRoughness", {})
             _pbr["metallicFactor"] = 0.0
             _pbr["roughnessFactor"] = 1.0
-            # baseColorFactor a BLANCO. MEDIDO en el glb del job 436315d5:
-            # trimesh exporta [0.4,0.4,0.4,1.0] por defecto, y el visor
-            # MULTIPLICA la textura por ese factor -> el render salia al 40%
-            # de su color (apagado/lavado) aunque el atlas estuviera bien.
-            # Con 1.0 se ve el color real que horneamos.
-            _bcf = _pbr.get("baseColorFactor")
-            _pbr["baseColorFactor"] = [1.0, 1.0, 1.0,
-                                       float(_bcf[3]) if (isinstance(_bcf, list) and len(_bcf) == 4) else 1.0]
             _m.setdefault("extensions", {})["KHR_materials_unlit"] = {}
         _bin = _d[20 + _jlen:]
         _nj = _json.dumps(_g, separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -1274,25 +1257,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
         pv=(((1.0-u[:,:,1]) if flip==0 else u[:,:,1])*(H2-1)).astype(_np.float32)
         del u
         area2=_np.abs((pu[:,1]-pu[:,0])*(pv[:,2]-pv[:,0])-(pu[:,2]-pu[:,0])*(pv[:,1]-pv[:,0]))
-        # CUANTAS muestras por cara. MEDIDO (job d760e7ad): con 2 por texel el
-        # 15% de los texeles de CADA cara nunca lo tocaba una muestra (ley del
-        # coleccionista: e^-2 = 13.5%). Ese texel no entraba en LIN, el
-        # horneador NUNCA lo pintaba y se quedaba con el gris crudo de
-        # OpenMVS -- aunque las fotos de esa zona existieran y la cobertura
-        # fuera del 99%. ESE era el origen real de los cuadros y triangulos
-        # grises: no faltaban fotos, faltaba preguntarles.
-        # Con 8 por texel la fraccion sin tocar cae a 0.09% (medido), y el
-        # barrido anti-gris se queda solo como red de seguridad.
-        # BAJADO A 6 tras el job 7d73d696: alli el horneado se paso del limite
-        # de tiempo (35.9 min solo la mezcla) y el render subio el RESPALDO por
-        # vertice, que se ve borroso porque tiene 1 color por vertice en vez de
-        # ~50M texeles. Motivo del sobrecosto: al poner --outlier-threshold 0
-        # muchas mas caras reciben isla UV REAL en vez de caer al parche vacio,
-        # o sea hay mas superficie de verdad que hornear (que es lo que
-        # queremos). Con 6 la fraccion sin tocar sube solo a 0.93% (medido) y
-        # se ahorra ~25% del trabajo. BAKE_SAMP lo ajusta si hace falta.
-        _KSAMP=float(os.environ.get("BAKE_SAMP","6"))
-        ns=_np.clip((area2*_KSAMP).astype(_np.int64)+8,3,2_000_000)
+        ns=_np.clip((area2*2.0).astype(_np.int64)+3,3,400000)
         _NMU+=int(ns.sum()); _bg=ns>10000
         _NBIG+=int(_bg.sum()); _MUBIG+=int(ns[_bg].sum())
         cs=_np.cumsum(ns)
@@ -1641,23 +1606,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
     #   - donde hay fotos: queda el horneado exacto
     #   - donde no: queda el crudo con el MISMO tono de sus vecinos, y
     #     conserva su detalle fino. No sobrevive ninguna isla de tono ajeno.
-    # CRITERIO UNICO DE "GRIS DE RELLENO" para todo el horneador.
-    # ANTES el relleno por cara usaba |c-128|<=6 (estricto) mientras el barrido
-    # final usaba neutralidad. MEDIDO en el glb del job 23e40b1d: quedaban 25.253
-    # caras grises pero el relleno por cara solo detectaba 13.746 -> a la mitad se
-    # le escapaba, porque el atlas viene de OpenMVS pasado por JPEG y el 128 llega
-    # corrido (medido hasta [140.6,141.3,139.1]). Con el mismo criterio en los dos
-    # sitios ya no se escapa ninguna.
-    # El relleno es NEUTRO (R=G=B); la superficie real de un interior es CALIDA
-    # (R-B=+16), asi que esto no toca paredes ni piso grises legitimos.
-    def _es_gris(c):
-        c=c.astype(_np.int32)
-        lum=(c[...,0]*77+c[...,1]*150+c[...,2]*29)>>8
-        # umbral 10 y no 6: el gris de los cuadros medido en la captura real de
-        # Felipe da R-B = 7 (RGB 131,134,124) y con 6 se escapaba justo. Con 10
-        # entra, y la pared calida real (R-B = 21) sigue fuera.
-        return ((_np.abs(c[...,0]-c[...,2])<=10)
-                &((c.max(-1)-c.min(-1))<=12)&(lum>=90)&(lum<=175))
     _nfix=0; _nvac=0; _nvpx=0; _ndeg=0
     # color por vertice de la malla original (viene de las fotos): se mapea a
     # los vertices del OBJ de OpenMVS por posicion (el OBJ los renumera).
@@ -1673,29 +1621,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 _,_ii=_kd.query(V32,k=1,workers=-1)
                 VCOL=(_np.clip(_vc[_ii],0,1)*255.0).astype(_np.float32)
                 log("BAKE: color de la malla listo para tapar vacios (%d vertices)" % len(V32))
-                # ── PROPAGACION ANTI-GRIS del color de la malla ──────────────
-                # El relleno de vacios (seccion c) tapa las caras que ninguna
-                # foto vio con ESTE VCOL. Pero los vertices que tampoco vio
-                # ninguna foto traen el gris de relleno (|c-128|<=6) del TSDF/
-                # pintor, asi que tapaba gris con gris -> sobrevivian TRIANGULOS
-                # grises. Aqui, antes de usarlo, cada vertice gris hereda el
-                # color del vertice NO gris mas cercano en 3D: el relleno pasa a
-                # usar color REAL de la superficie vista vecina. Apagar con
-                # OMVS_VFILL_PROP=0.
-                if os.environ.get("OMVS_VFILL_PROP","1")=="1":
-                    _gv=(_np.abs(VCOL-128.0).max(1)<=6.0)
-                    _ngr=int(_gv.sum()); _nok=int((~_gv).sum())
-                    if _ngr>0 and _nok>0:
-                        _kdg=_KD(V32[~_gv])
-                        _,_jjg=_kdg.query(V32[_gv],k=1,workers=-1)
-                        VCOL[_gv]=VCOL[~_gv][_jjg]
-                        log("BAKE: propagacion anti-gris -> %d vertices grises (%.1f%%) heredaron el color visto mas cercano" % (_ngr,100.0*_ngr/max(1,len(VCOL))))
-                        del _kdg,_jjg
-                    elif _ngr>0:
-                        log("BAKE: propagacion anti-gris -> los %d vertices salieron grises; sin color valido de donde copiar (falta cobertura de fotos)" % _ngr)
-                    else:
-                        log("BAKE: propagacion anti-gris -> el color de la malla no trae grises de relleno")
-                    del _gv
             else:
                 log("BAKE: la malla no trae color por vertice; no puedo tapar vacios")
             del _mo,_vc
@@ -1749,30 +1674,10 @@ def bake_multiview(objf, texfiles, mtl2tex):
             sinh=_np.zeros((H2,W2),bool)
             for _r0 in range(0,H2,512):
                 _r1=min(_r0+512,H2); _b=base[_r0:_r1]
-                # DETECCION DEL GRIS POR NEUTRALIDAD, no por el rango 125-131.
-                # MEDIDO en el atlas real del job 77d58f3d: el atlas viene de
-                # OpenMVS YA pasado por JPEG, asi que el gris de relleno no
-                # llega en 128 exacto sino corrido (medido: RGB [140.6, 141.3,
-                # 139.1], luminancia 90..175). Con el rango 125-131 se escapaban
-                # 0.77M texeles de gris por atlas, que entonces entraban en
-                # 'sinh' y RECIBIAN CORRECCION DE TONO: cada celda de la rejilla
-                # los multiplicaba por una ganancia distinta, dejando el gris
-                # partido en un mosaico de brillos con BORDES RECTOS. Eso es lo
-                # que se ve como CUADROS Y TRIANGULOS grises.
-                # El relleno es NEUTRO (R=G=B); la superficie real de un
-                # interior es CALIDA (R-B=+16). Medido: este criterio captura
-                # 0.0000% de superficie calida, o sea no le quita el nivelado
-                # de tono a nada legitimo.
-                _rbg=_b[:,:,0].astype(_np.int16)-_b[:,:,2].astype(_np.int16)
-                # int32: en int16 esto DESBORDA (131*77+131*150+131*29 = 33536 >
-                # 32767) y la luminancia salia envuelta -> la deteccion fallaba.
-                _lg=(_b[:,:,0].astype(_np.int32)*77+_b[:,:,1].astype(_np.int32)*150
-                     +_b[:,:,2].astype(_np.int32)*29)>>8
-                _g=((_np.abs(_rbg)<=6)
-                    &((_b.max(2).astype(_np.int16)-_b.min(2).astype(_np.int16))<=12)
-                    &(_lg>=90)&(_lg<=175))
+                _g=((_b[:,:,0]>=125)&(_b[:,:,0]<=131)&(_b[:,:,1]>=125)&(_b[:,:,1]<=131)
+                    &(_b[:,:,2]>=125)&(_b[:,:,2]<=131))
                 sinh[_r0:_r1]=(~filled[_r0:_r1])&(~_g)
-                del _g,_b,_rbg,_lg
+                del _g,_b
             nsin=int(sinh.sum())
             if nsin>0 and BAKE_FIX:
                 gok=gcnt>=4          # celdas con muestras suficientes
@@ -1857,7 +1762,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                         for _ox in range(-R,R+1):
                             yy=_np.clip(cyd+_oy,0,H2-1); xx=_np.clip(cxd+_ox,0,W2-1)
                             _cur=base[yy,xx].astype(_np.int16)
-                            gz=_es_gris(_cur)
+                            gz=(_np.abs(_cur-128).max(1)<=6)
                             if gz.any():
                                 base[yy[gz],xx[gz]]=_np.clip(colf[gz],0,255).astype(_np.uint8)
                                 _nvpx+=int(gz.sum()); _hit|=gz
@@ -1899,7 +1804,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                                 iyp=_np.broadcast_to(Y,(n,K,K))[ok]
                                 fid=_np.broadcast_to(_np.arange(n)[:,None,None],(n,K,K))[ok]
                                 _cur=base[iyp,ixp].astype(_np.int16)
-                                gz=_es_gris(_cur)
+                                gz=(_np.abs(_cur-128).max(1)<=6)
                                 if gz.any():
                                     base[iyp[gz],ixp[gz]]=_np.clip(colf[ii][fid[gz]],0,255).astype(_np.uint8)
                                     _nvpx+=int(gz.sum())
@@ -1911,78 +1816,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 _gc.collect()
             except Exception as _ve:
                 log("BAKE: relleno de gris fallo en atlas %d (%s)" % (ti+1,_ve))
-        # ── BARRIDO FINAL ANTI-GRIS (por cercania DENTRO del atlas) ─────────
-        # MEDIDO en el glb del job 436315d5: 195.155 caras (17-20% de la malla)
-        # quedaban ENTERAS en gris 128 (99.2% de las muestras internas), pero el
-        # relleno de arriba solo tapo 15.124. Motivo: ese relleno pinta con el
-        # color de la malla (VCOL), y VCOL solo cubre los vertices SOLDADOS de
-        # OpenMVS (559.880 de 1.229.853): la cara que no encuentra su vertice
-        # se queda gris. Este barrido no depende de VCOL ni de las UV: toma
-        # CADA texel gris que quedo y le copia el color del texel NO gris mas
-        # cercano del mismo atlas (transformada de distancia euclidea). Asi no
-        # sobrevive ningun cuadrito/triangulo gris.
-        # Solo toca texeles grises: lo ya pintado no se modifica. El fondo
-        # vacio del atlas tambien se rellena (es inocuo: no se ve, y evita que
-        # el sangrado de mipmaps arrastre gris a los bordes de los parches).
-        # Apagar con OMVS_VFILL_NEAR=0.
-        if os.environ.get("OMVS_VFILL_NEAR","1")=="1":
-            try:
-                # QUE cuenta como relleno: NO el color, sino "ninguna foto lo
-                # pinto". Arriba (m=(AID==ti)&seen) SOLO los texeles con foto
-                # reciben el color horneado; los demas se quedan con el gris
-                # crudo de OpenMVS. Buscar ese gris POR COLOR fallo (v1): el
-                # atlas pasa por JPEG antes de que el horneador lo lea, asi que
-                # el 128 llega corrido a 120-140 y el umbral +-6 solo limpiaba
-                # una parte (MEDIDO en el job 436315d5: de 207k caras grises
-                # solo se iban 6k). Y ensanchar el umbral a ciegas borraria
-                # PAREDES Y PISO que son gris de verdad.
-                # Aqui: candidato = SIN foto (mascara exacta) Y ademas gris
-                # neutro. Lo que recibio foto NO se toca nunca, aunque sea gris.
-                _sp=_np.zeros((H2,W2),bool)
-                _ms=(AID==ti)&seen
-                if _ms.any():
-                    _lp=LIN[_ms].astype(_np.int64)
-                    _sp[_lp//W2,_lp%W2]=True
-                    del _lp
-                del _ms
-                _b16=base.astype(_np.int16)
-                # int32 en la luminancia: en int16 desborda (ver nota arriba)
-                _lum=(base[:,:,0].astype(_np.int32)*77+base[:,:,1].astype(_np.int32)*150
-                      +base[:,:,2].astype(_np.int32)*29)>>8
-                # El gris de relleno es NEUTRO PURO (R=G=B, medido [128.5,
-                # 128.5, 128.5]); la superficie real de un interior tiene
-                # tinte CALIDO (medido R-B = +16). Separar por calidez, y no
-                # solo por saturacion, evita comerse paredes/piso grises.
-                _rb=_b16[:,:,0].astype(_np.int16)-_b16[:,:,2].astype(_np.int16)
-                _gris=(_np.abs(_rb)<=10)&((_b16.max(2)-_b16.min(2))<=12)&(_lum>=90)&(_lum<=175)
-                del _b16,_lum,_rb
-                _fm=_gris&(~_sp)
-                del _sp
-                _nf2=int(_fm.sum())
-                # FUENTE de color: todo lo que NO sea gris de relleno. Antes se
-                # usaba ~_fm, que dejaba como fuente valida el gris del FONDO
-                # vacio del atlas (91% del gris, medido en el job 77d58f3d): el
-                # vecino mas cercano de una manchita pegada al fondo era otro
-                # texel gris, y el relleno copiaba GRIS SOBRE GRIS. Por eso
-                # sobrevivian ~4.300 cuadritos. Ahora el fondo no puede ser
-                # fuente: el color viene si o si de superficie pintada.
-                _fuente=~_gris
-                del _gris
-                if _nf2 and _fuente.any():
-                    from scipy import ndimage as _nd
-                    _,(_iy,_ix)=_nd.distance_transform_edt(~_fuente,return_indices=True)
-                    base[_fm]=base[_iy[_fm],_ix[_fm]]
-                    log("BAKE: barrido anti-gris -> %.2fM texeles de relleno (%.1f%% del atlas %d) "
-                        "rellenados con SUPERFICIE PINTADA mas cercana (el fondo gris ya no sirve de fuente)"
-                        % (_nf2/1e6,100.0*_nf2/float(W2*H2),ti+1))
-                    del _iy,_ix
-                elif _nf2:
-                    log("BAKE: barrido anti-gris -> el atlas %d no tiene superficie pintada de donde copiar" % (ti+1))
-                else:
-                    log("BAKE: barrido anti-gris -> el atlas %d no tiene texeles de relleno" % (ti+1))
-                del _fm,_fuente; _gc.collect()
-            except Exception as _bg:
-                log("BAKE: barrido anti-gris fallo en atlas %d (%s)" % (ti+1,_bg))
         if tf.lower().endswith((".jpg",".jpeg")):
             Image.fromarray(base).save(tf,quality=BAKE_JQ,subsampling=2)
         else:
@@ -2103,12 +1936,8 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _a2=_np.cross(_nrm,_a1)
                     _x=_cen[_ix]@_a1; _y=_cen[_ix]@_a2
                     _P=0.02
-                    # posicion CONTINUA en la rejilla (antes de truncar): la
-                    # necesita la interpolacion bilineal de la ganancia
-                    _gxf=(_x-_x.min())/_P
-                    _gyf=(_y-_y.min())/_P
-                    _gx=_gxf.astype(_np.int64)
-                    _gy=_gyf.astype(_np.int64)
+                    _gx=((_x-_x.min())/_P).astype(_np.int64)
+                    _gy=((_y-_y.min())/_P).astype(_np.int64)
                     _W=int(_gx.max())+1; _H=int(_gy.max())+1
                     if _W*_H>4_000_000 or _W<60 or _H<60:
                         _desc.append("rejilla %dx%d fuera de rango" % (_W,_H)); continue
@@ -2119,7 +1948,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
                         continue
                     _ix=_ix[_bue]
                     _gx=_gx[_bue]; _gy=_gy[_bue]
-                    _gxf=_gxf[_bue]; _gyf=_gyf[_bue]
                     _cf=FCOL[_ix]
                     _S=_np.zeros((_H,_W,3)); _Cn=_np.zeros((_H,_W))
                     for _k in range(3): _np.add.at(_S[:,:,_k],(_gy,_gx),_cf[:,_k])
@@ -2137,24 +1965,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _g3=_np.clip(_obj[None,None,:]/_np.maximum(_BJ,1.0),
                                  1.0/BAKE_TONO_TOPE,BAKE_TONO_TOPE)
                     _gl=_g3.mean(2)                       # una ganancia por celda
-                    # BILINEAL, no vecino-mas-cercano. Con indice ENTERO
-                    # (_gl[_gy,_gx]) TODAS las caras de una misma celda reciben
-                    # exactamente la misma ganancia y en la frontera con la
-                    # celda vecina hay un SALTO BRUSCO: eso dibuja CUADROS y
-                    # TRIANGULOS planos sobre paredes y piso (el sintoma que
-                    # Felipe reporta desde varios renders). Ya se habia
-                    # corregido antes y la correccion SE PERDIO en una
-                    # reescritura; aqui vuelve, y ademas se hace sobre la
-                    # posicion CONTINUA de la cara en la rejilla, asi que la
-                    # ganancia varia suave de cara a cara.
-                    _fx=_np.clip(_gxf,0,_W-1)
-                    _fy=_np.clip(_gyf,0,_H-1)
-                    _x0i=_np.floor(_fx).astype(_np.int64); _y0i=_np.floor(_fy).astype(_np.int64)
-                    _x1i=_np.minimum(_x0i+1,_W-1);         _y1i=_np.minimum(_y0i+1,_H-1)
-                    _tx=(_fx-_x0i); _ty=(_fy-_y0i)
-                    _gf=((_gl[_y0i,_x0i]*(1.0-_tx)+_gl[_y0i,_x1i]*_tx)*(1.0-_ty)
-                         +(_gl[_y1i,_x0i]*(1.0-_tx)+_gl[_y1i,_x1i]*_tx)*_ty)
-                    del _x0i,_y0i,_x1i,_y1i,_tx,_ty,_fx,_fy
+                    _gf=_gl[_np.clip(_gy,0,_H-1),_np.clip(_gx,0,_W-1)]
                     _gf=1.0+BAKE_TONO_FZA*(_gf-1.0)
                     _gan[_ix]=_gf.astype(_np.float32)
                     _npar+=1
@@ -2426,40 +2237,18 @@ def obj_to_glb(objf, outglb):
                 if os.path.exists(tf):
                     if _curm is not None: mtl2tex[_curm] = len(texfiles)
                     texfiles.append(tf)
-    _norange = 0; _nmag = 0
+    _norange = 0
     for tf in texfiles:
         try:
             a = _np.asarray(Image.open(tf).convert("RGB")).copy()
-            _r = a[:, :, 0].astype(_np.int16); _g = a[:, :, 1].astype(_np.int16)
-            _b = a[:, :, 2].astype(_np.int16)
-            # RELLENO = MAGENTA (255,0,255), el color que pedimos con
-            # --empty-color. Tolerancia amplia porque el JPEG corre los bordes,
-            # pero sigue siendo inconfundible: ningun material de un interior
-            # tiene R y B altos con G bajo a la vez.
-            fmag = (_r > 180) & (_g < 90) & (_b > 180)
-            # RESPALDO: naranja EXACTO de OpenMVS (255,127,39), por si el binario
-            # del pod no acepto --empty-color y siguio con el default.
-            # ANTES (el bug): el rango era R>235, G 105..150, B<70. Eso es una
-            # FRANJA ANCHA de naranjas y marrones saturados, o sea MADERA,
-            # terracota y muebles calidos, y todo eso se pintaba de gris plano
-            # (128,128,128) -> los fragmentos grises pequenos repartidos por el
-            # render. El propio analisis v8.8 ya lo habia medido ("el naranja NO
-            # es relleno, es madera real de las fotos") pero el arreglo nunca se
-            # aplico. Ahora la tolerancia es +-14 alrededor del color exacto.
-            fnar = ((_np.abs(_r - 255) <= 14) & (_np.abs(_g - 127) <= 14)
-                    & (_np.abs(_b - 39) <= 14))
-            fill = fmag | fnar
+            fill = (a[:, :, 0] > 235) & (a[:, :, 1] > 105) & (a[:, :, 1] < 150) & (a[:, :, 2] < 70)
             if fill.any():
-                a[fill] = (128, 128, 128)
-                _nmag += int(fmag.sum()); _norange += int(fnar.sum())
+                a[fill] = (128, 128, 128); _norange += int(fill.sum())
                 Image.fromarray(a).save(tf)
-            del _r, _g, _b, fmag, fnar, fill
         except Exception as _te:
             log("(no pude recolorear %s: %s)" % (os.path.basename(tf), _te))
-    if _nmag or _norange:
-        log("relleno de OpenMVS -> gris: %d px magenta + %d px naranja-exacto "
-            "en %d texturas (la madera y los tonos calidos YA NO se tocan)"
-            % (_nmag, _norange, len(texfiles)))
+    if _norange:
+        log("relleno naranja de OpenMVS -> gris: %d pixeles en %d texturas" % (_norange, len(texfiles)))
     log("glb: %d texturas" % len(texfiles))
     # (a2) NIVELADO DE TONO POR PARCHE (Opcion C) — antes de incrustar las texturas
     if TONE_LEVEL and texfiles and mtl2tex:
@@ -2556,17 +2345,7 @@ CFG1 = ["--virtual-face-images", str(VFACES),
         "--patch-packing-heuristic", PACKH,
         "--local-seam-leveling", str(LOCAL_SEAM),
         "--sharpness-weight", str(SHARP),
-        "--global-seam-leveling", str(GLOBAL_SEAM),
-        # COLOR DE RELLENO INEQUIVOCO. Por defecto OpenMVS pinta las caras que
-        # "no cubre ninguna imagen" de NARANJA (255,127,39 = 0x00FF7F27). El
-        # problema: un interior real TIENE naranjas y marrones (madera, muebles)
-        # -> distinguir relleno de superficie por color era imposible y el
-        # detector de abajo terminaba borrando MADERA REAL. Con MAGENTA
-        # (255,0,255) el relleno es un color que no existe en la escena, asi que
-        # la deteccion es exacta y no puede comerse nada legitimo.
-        # CFG2 (respaldo) NO lleva esta bandera: si el binario del pod no la
-        # conoce y cfg1 falla, cfg2 corre igual con el naranja de siempre.
-        "--empty-color", str(EMPTYCOL)]
+        "--global-seam-leveling", str(GLOBAL_SEAM)]
 CFG2 = ["--virtual-face-images", str(VFACES),
         "--patch-packing-heuristic", PACKH,
         "--local-seam-leveling", "0",
@@ -2783,19 +2562,6 @@ else:
 lin = (accV[painted] / wsumV[painted, None]).astype(np.float32)
 cols[painted] = np.clip(linear_to_srgb(lin), 0, 1)          # (a) color FIEL
 log("pintados %d/%d vertices (%.1f%%) desde las fotos" % (painted.sum(), len(V), 100.0*painted.mean()))
-# ── RELLENO POR VECINO VISTO (respaldo por vertice) ──────────────────────────
-# Los vertices que ninguna foto vio quedaban en gris plano (0.5) o en un color
-# viejo (orig) -> parches grises en el respaldo. Ahora heredan el color del
-# vertice VISTO mas cercano en 3D: ninguna zona queda gris, toma el tono de la
-# superficie vista vecina. PAINT_FILL=nearest (default) propaga; =flat conserva
-# el comportamiento viejo (0.5/orig).
-if os.environ.get("PAINT_FILL", "nearest").lower() == "nearest" and painted.any() and (~painted).any():
-    from scipy.spatial import cKDTree as _KDp
-    _kdp = _KDp(V[painted])
-    _, _jp = _kdp.query(V[~painted], k=1, workers=-1)
-    cols[~painted] = cols[painted][_jp]
-    log("relleno por vecino visto: %d vertices sin foto (%.1f%%) heredaron el color visto mas cercano"
-        % (int((~painted).sum()), 100.0 * float((~painted).mean())))
 _b0 = float(cols.mean())
 # (b) SATURACION alrededor de la luminancia (no cambia el brillo, solo la viveza)
 if abs(_SAT - 1.0) > 1e-3:
@@ -4792,7 +4558,7 @@ def main():
                      str(dataset / "sparse" / "0"), str(glb_uv),
                      str(WORK / "ao.npy")],
                     fase_label="PASO 4d/5 - Texturizando con OpenMVS",
-                    check=False, env=_paint_env, timeout=5400)  # 90 min max y corta (4x texeles = horneado ~4x mas largo)
+                    check=False, env=_paint_env, timeout=2400)  # 40 min max y corta
                 if glb_uv.exists() and glb_uv.stat().st_size > 200000:
                     log(f"   OK textura OpenMVS: {glb_uv.stat().st_size/1e6:.1f} MB - se sube ESTA (sin costuras)")
                 else:
