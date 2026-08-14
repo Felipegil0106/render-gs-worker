@@ -1283,9 +1283,15 @@ def bake_multiview(objf, texfiles, mtl2tex):
         # grises: no faltaban fotos, faltaba preguntarles.
         # Con 8 por texel la fraccion sin tocar cae a 0.09% (medido), y el
         # barrido anti-gris se queda solo como red de seguridad.
-        # Cuesta ~4x mas muestras en la rasterizacion (la memoria NO sube: el
-        # trabajo va por trozos de PRESU). BAKE_SAMP lo ajusta si hace falta.
-        _KSAMP=float(os.environ.get("BAKE_SAMP","8"))
+        # BAJADO A 6 tras el job 7d73d696: alli el horneado se paso del limite
+        # de tiempo (35.9 min solo la mezcla) y el render subio el RESPALDO por
+        # vertice, que se ve borroso porque tiene 1 color por vertice en vez de
+        # ~50M texeles. Motivo del sobrecosto: al poner --outlier-threshold 0
+        # muchas mas caras reciben isla UV REAL en vez de caer al parche vacio,
+        # o sea hay mas superficie de verdad que hornear (que es lo que
+        # queremos). Con 6 la fraccion sin tocar sube solo a 0.93% (medido) y
+        # se ahorra ~25% del trabajo. BAKE_SAMP lo ajusta si hace falta.
+        _KSAMP=float(os.environ.get("BAKE_SAMP","6"))
         ns=_np.clip((area2*_KSAMP).astype(_np.int64)+8,3,2_000_000)
         _NMU+=int(ns.sum()); _bg=ns>10000
         _NBIG+=int(_bg.sum()); _MUBIG+=int(ns[_bg].sum())
@@ -4769,7 +4775,7 @@ def main():
                      str(dataset / "sparse" / "0"), str(glb_uv),
                      str(WORK / "ao.npy")],
                     fase_label="PASO 4d/5 - Texturizando con OpenMVS",
-                    check=False, env=_paint_env, timeout=2400)  # 40 min max y corta
+                    check=False, env=_paint_env, timeout=4200)  # 70 min max y corta
                 if glb_uv.exists() and glb_uv.stat().st_size > 200000:
                     log(f"   OK textura OpenMVS: {glb_uv.stat().st_size/1e6:.1f} MB - se sube ESTA (sin costuras)")
                 else:
