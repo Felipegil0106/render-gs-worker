@@ -445,7 +445,7 @@ IMG_MAX       = int(os.environ.get("OMVS_IMG_MAX", "2000"))      # lado mayor de
 #     OMVS_MAX_TEX=4096  OMVS_BAKE_SCALE=2  OMVS_BAKE_MAXATL=8
 # Advertencia medida: eso pide ~8 atlas de 8192 -> archivo ~60 MB y ~2 GB de
 # memoria de video al abrirlo. En celular puede no cargar. Polycam usa 2.
-MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "8192"))      # probado en el (45): 2 atlas
+MAX_TEX       = int(os.environ.get("OMVS_MAX_TEX", "4096"))      # v9.6 NITIDEZ: OpenMVS empaqueta a 4096 y el horneador sube cada atlas a 8192 => 4x texeles
 RES_LEVEL     = int(os.environ.get("OMVS_RES_LEVEL", "0"))       # 0 = usa las fotos tal cual se las paso
 OUTLIER       = os.environ.get("OMVS_OUTLIER", "0")              # 0 = APAGADO. Con 0.06 el chequeo de foto-consistencia descartaba vistas de una cara por diferencias de exposicion/balance de blancos (auto del Android) y especulares; si descarta TODAS, la cara se queda SIN vista valida -> etiqueta 0 -> relleno. Como el horneador re-pinta el color desde las 164 fotos, la foto-consistencia interna de OpenMVS no aporta nada: de OpenMVS solo necesitamos un MAPA UV completo.
 # Color con que OpenMVS pinta las caras que no cubre ninguna imagen.
@@ -476,8 +476,8 @@ EXPO_SAMPLES  = int(os.environ.get("OMVS_EXPO_SAMPLES", "40000"))# puntos de la 
 OMP_HI        = os.environ.get("OMVS_OMP", "6")                  # hilos del intento bueno
 # ── HORNEADOR MULTI-VISTA (v9.1; plan P1 de la investigacion, estilo Polycam) ──
 BAKE          = os.environ.get("OMVS_BAKE", "1") == "1"          # repinta cada texel MEZCLANDO todas las fotos que lo ven
-BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "1"))      # 1 = el atlas de OpenMVS tal cual (probado). Con MAX_TEX=4096 sube esto a 2 para el doble de fino
-BAKE_MAXATL   = int(os.environ.get("OMVS_BAKE_MAXATL", "5"))     # tope de atlas para permitir el x2 (5 atlas 8192 ~ 45-55 MB)
+BAKE_SCALE    = int(os.environ.get("OMVS_BAKE_SCALE", "2"))      # 2 = el horneador sube cada atlas 4096 -> 8192 (4x texeles). MEDIDO en el glb (76): el texel pasa de 1.44 mm a 0.72 mm
+BAKE_MAXATL   = int(os.environ.get("OMVS_BAKE_MAXATL", "8"))     # 8 = permite el x2 con la superficie medida (105.6 m2 pidieron ~8 atlas de 4096). Si OpenMVS produce mas, el horneador NO escala y cae solo a x1 (salvaguarda)
 BAKE_DS       = int(os.environ.get("OMVS_BAKE_DS", "8"))         # banda baja = foto reducida /8 y devuelta (multiBandDownscale de AliceVision)
 BAKE_COSK     = float(os.environ.get("OMVS_BAKE_COSK", "2"))     # peso angular cos^k (k=2 recomendado por la investigacion)
 BAKE_TOL      = float(os.environ.get("OMVS_BAKE_TOL", "0.010"))  # tolerancia de visibilidad = 1% de la profundidad (0.6% rechazaba camaras buenas donde la malla erra 1-2 cm -> cobertura 70% y parches leves)
@@ -4775,7 +4775,7 @@ def main():
                      str(dataset / "sparse" / "0"), str(glb_uv),
                      str(WORK / "ao.npy")],
                     fase_label="PASO 4d/5 - Texturizando con OpenMVS",
-                    check=False, env=_paint_env, timeout=4200)  # 70 min max y corta
+                    check=False, env=_paint_env, timeout=5400)  # 90 min max y corta (4x texeles = horneado ~4x mas largo)
                 if glb_uv.exists() and glb_uv.stat().st_size > 200000:
                     log(f"   OK textura OpenMVS: {glb_uv.stat().st_size/1e6:.1f} MB - se sube ESTA (sin costuras)")
                 else:
