@@ -13,11 +13,9 @@
 # Manda "progress" cada poco (heartbeat) para que el watchdog NO lo mate.
 # Si algo falla, manda "error" con el log para poder revisarlo en la página.
 # ════════════════════════════════════════════════════════════════════════
-
 import os, sys, zipfile, subprocess, shutil, time, json, hmac, hashlib, threading, struct
 from pathlib import Path
 import urllib.request
-
 # ── Variables que manda el backend (NO credenciales: URLs ya firmadas) ──
 TOUR_ID         = os.environ.get("TOUR_ID", "test")
 INPUT_URL       = os.environ.get("INPUT_URL", "")          # descarga del ZIP
@@ -34,7 +32,6 @@ QUALITY         = os.environ.get("QUALITY", "fast")
 POD_ID = (os.environ.get("RUNPOD_POD_ID")
           or os.environ.get("RUNPOD_POD_HOSTNAME", "").split("-")[0]
           or "")
-
 # Iteraciones de 2DGS según calidad.
 # 2DGS aplica el regularizador de "normales" (une superficies) a partir de la
 # iteración 7000, y el de "distorsión" (aplana paredes) a partir de la 3000. La
@@ -45,6 +42,8 @@ POD_ID = (os.environ.get("RUNPOD_POD_ID")
 # las superficies se cierran y se aplanan. Duplica el tiempo (~60 min) pero
 # es necesario para que el cuarto no salga a medias.
 ITERS = {"fast": 30000, "balanced": 30000, "quality": 30000}.get(QUALITY, 30000)
+WORK = Path("/workspace/job")
+WORK.mkdir(parents=True, exist_ok=True)
 # ════════════════════════════════════════════════════════════════════════
 # DEDUPLICACION DE FOTOS REDUNDANTES (v10) — aportado por Felipe
 # ------------------------------------------------------------------------
@@ -71,9 +70,6 @@ PREFILTER_TIME_S = float(os.environ.get("PREFILTER_TIME_S", "20"))
 # duda NO se borra. 0 = desactivar el seguro.
 DEDUP_TIME_GUARD_S = float(os.environ.get("DEDUP_TIME_GUARD_S", "120"))
 
-WORK = Path("/workspace/job")
-WORK.mkdir(parents=True, exist_ok=True)
-
 # ════════════════════════════════════════════════════════════════════════
 # Script que corre MASt3R-SfM y escribe las poses en formato COLMAP (texto)
 # que 2DGS lee. Se escribe a disco y se ejecuta como proceso aparte para
@@ -88,7 +84,6 @@ import numpy as np
 import torch
 from PIL import Image
 from scipy.spatial.transform import Rotation
-
 # Semilla fija → resultados reproducibles entre corridas (misma entrada = misma salida).
 # Antes, dos corridas con las MISMAS fotos podían dar geometrías distintas (a veces
 # buena, a veces dañada) por la aleatoriedad interna. Esto lo elimina en gran parte.
@@ -98,11 +93,9 @@ try:
     torch.cuda.manual_seed_all(42)
 except Exception:
     pass
-
 IMAGES_DIR = sys.argv[1]
 OUT_DIR = sys.argv[2]
 STAMPS_JSON = sys.argv[3] if len(sys.argv) > 3 else ""
-
 from mast3r.model import AsymmetricMASt3R
 from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
 from mast3r.image_pairs import make_pairs
@@ -110,21 +103,16 @@ from mast3r.retrieval.processor import Retriever
 import mast3r.utils.path_to_dust3r  # noqa
 from dust3r.utils.image import load_images
 from dust3r.utils.device import to_numpy
-
 CKPT = "/opt/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
 RETR = "/opt/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth"
 device = "cuda"
-
 exts = (".jpg", ".jpeg", ".png")
 filelist = sorted([os.path.join(IMAGES_DIR, f) for f in os.listdir(IMAGES_DIR)
                    if os.path.splitext(f)[1].lower() in exts])
 print("MAST3R: %d fotos" % len(filelist), flush=True)
-
 model = AsymmetricMASt3R.from_pretrained(CKPT).to(device)
 print("MAST3R: modelo cargado", flush=True)
-
 imgs = load_images(filelist, size=512, verbose=False)
-
 # retrieval -> matriz de similitud para elegir que pares de fotos comparar
 retriever = Retriever(RETR, backbone=model, device=device)
 with torch.no_grad():
@@ -132,12 +120,10 @@ with torch.no_grad():
 del retriever
 torch.cuda.empty_cache()
 print("MAST3R: retrieval OK", flush=True)
-
 # retrieval-Na-k : Na anclas (FPS) + k vecinos mas similares por foto
 pairs = make_pairs(imgs, scene_graph="retrieval-20-10", prefilter=None,
                    symmetrize=True, sim_mat=sim_matrix)
 print("MAST3R: %d pares" % len(pairs), flush=True)
-
 cache_dir = os.path.join(OUT_DIR, "mast3r_cache")
 os.makedirs(cache_dir, exist_ok=True)
 scene = sparse_global_alignment(filelist, pairs, cache_dir, model,
@@ -145,7 +131,6 @@ scene = sparse_global_alignment(filelist, pairs, cache_dir, model,
                                 device=device, opt_depth=True,
                                 shared_intrinsics=True, matching_conf_thr=5.0)
 print("MAST3R: alineamiento global OK", flush=True)
-
 cams2world = to_numpy(scene.get_im_poses())
 intrinsics = [to_numpy(K) for K in scene.intrinsics]
 rgbimgs = scene.imgs
@@ -252,9 +237,10 @@ else:
 
 img_out = os.path.join(OUT_DIR, "images")
 sparse_out = os.path.join(OUT_DIR, "sparse", "0")
+img_out = os.path.join(OUT_DIR, "images")
+sparse_out = os.path.join(OUT_DIR, "sparse", "0")
 os.makedirs(img_out, exist_ok=True)
 os.makedirs(sparse_out, exist_ok=True)
-
 fcam = open(os.path.join(sparse_out, "cameras.txt"), "w")
 fimg = open(os.path.join(sparse_out, "images.txt"), "w")
 fcam.write("# Camera list\n")
@@ -275,9 +261,6 @@ TRAIN_RES = 1000   # lado mayor de las imágenes de entrenamiento. 1600px result
 #                    real es la captura (poses a 512px, celular sin LiDAR), no la resolución.
 print("ENTRENAMIENTO a %dpx (alta resolucion; poses a 512px)" % TRAIN_RES, flush=True)
 _n_hi = 0
-# IMPORTANTE: se recorre `keep`, no range(N), y se RENUMERA con out_idx: los IDs
-# de camara y los nombres tienen que quedar consecutivos porque algunos lectores
-# de 2DGS asumen que no hay huecos.
 for out_idx, i in enumerate(keep):
     im = rgbimgs[i]
     H, W = im.shape[:2]              # tamaño a 512px (referencia de aspecto/encuadre)
@@ -321,15 +304,11 @@ for out_idx, i in enumerate(keep):
                (cam_id, float(q[3]), float(q[0]), float(q[1]), float(q[2]),
                 float(t[0]), float(t[1]), float(t[2]), cam_id, name))
     fimg.write("\n")   # linea de puntos 2D (vacia)
-print("ENTRENAMIENTO: %d/%d imagenes guardadas en alta resolucion"
-      % (_n_hi, len(keep)), flush=True)
+print("ENTRENAMIENTO: %d/%d imagenes guardadas en alta resolucion" % (_n_hi, len(keep)), flush=True)
 fcam.close()
 fimg.close()
 print("MAST3R: poses escritas", flush=True)
-
 # nube de puntos densa con color, para inicializar 2DGS
-# OJO: esto usa las N vistas A PROPOSITO, no solo las de `keep`. La dedup es
-# solo para el ENTRENAMIENTO; la geometria se beneficia de TODAS las fotos.
 pts3d, _, confs = scene.get_dense_pts3d(clean_depth=True)
 pts3d = to_numpy(pts3d)
 confs = to_numpy(confs)
@@ -343,7 +322,6 @@ if len(pts) > 200000:
     idx = np.random.choice(len(pts), 200000, replace=False)
     pts = pts[idx]; col = col[idx]
 print("MAST3R: %d puntos 3D para init" % len(pts), flush=True)
-
 fp = open(os.path.join(sparse_out, "points3D.txt"), "w")
 fp.write("# 3D point list\n")
 for j in range(len(pts)):
@@ -353,8 +331,6 @@ for j in range(len(pts)):
 fp.close()
 print("MAST3R: points3D.txt escrito. LISTO.", flush=True)
 '''
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # SCRIPT DE TEXTURIZADO CON OpenMVS (corre en el pod como subproceso).
 # ----------------------------------------------------------------------------
@@ -368,9 +344,7 @@ print("MAST3R: points3D.txt escrito. LISTO.", flush=True)
 OPENMVS_TEXTURE_SCRIPT = r'''
 import os, sys, time, shutil, subprocess, glob
 import numpy as np
-
 def log(s): print("   [omvs] " + s, flush=True)
-
 # Texturiza la malla con OpenMVS (metodo Polycam: mejor-vista por cara con
 # graph-cut + nivelado de costuras). Reemplaza al horneado propio.
 #
@@ -428,7 +402,6 @@ MESH   = sys.argv[1]
 ORIGD  = sys.argv[2]
 SPARSE = sys.argv[3]
 OUTGLB = sys.argv[4]
-
 # Perillas (defaults probados en produccion):
 TEX_MESH_TRIS = int(os.environ.get("TEX_MESH_TRIS", "1100000"))  # caras del glb final
 IMG_MAX       = int(os.environ.get("OMVS_IMG_MAX", "2000"))      # lado mayor de las fotos que ve OpenMVS
@@ -479,14 +452,7 @@ BAKE_EXPO     = os.environ.get("OMVS_BAKE_EXPO", "1") == "1"     # normaliza la 
 BAKE_FIX      = os.environ.get("OMVS_BAKE_FIX", "1") == "1"      # a los texeles que ninguna foto ve les copia el TONO de sus vecinos horneados (mata las islas poligonales de tono ajeno)
 BAKE_FIXBLUR  = int(os.environ.get("OMVS_BAKE_FIXBLUR", "9"))    # suavizado del campo de correccion (celdas de la rejilla gruesa)
 BAKE_TONO     = os.environ.get("OMVS_BAKE_TONO", "1") == "1"   # APAGADO: fallo con V; se prueba aparte
-# MEDIDO en la malla (61), tras el primer nivelado: la banda de 1-3 m bajo de
-# 22.3 a 15.9 (-29%), PERO la que manda ahora es la de 5-30 cm, con 16.8. Con la
-# escala en 1 metro ese rango quedaba fuera a proposito, para no borrar textura
-# fina. Fue un error de diseno: 5-30 cm NO es textura fina, son PARCHES del
-# tamano de una mano. Bajando a 0.30 m el filtro los agarra y deja intacto lo de
-# menos de 5 cm (11.5), que si es el grano real de la pared.
-# Si aplana de mas y la pared queda artificial: OMVS_TONO_ESC=0.50
-BAKE_TONO_ESC = float(os.environ.get("OMVS_TONO_ESC", "0.30"))
+BAKE_TONO_ESC = float(os.environ.get("OMVS_TONO_ESC", "1.0"))  # se aplana lo que varie a mas de N metros
 BAKE_TONO_FZA = float(os.environ.get("OMVS_TONO_FZA", "1.0"))  # 1.0 = correccion completa
 BAKE_TONO_TOPE= float(os.environ.get("OMVS_TONO_TOPE","1.6"))  # tope de la ganancia
 # APAGADO por defecto. El intento del job d87eae06 EMPEORO el render: la
@@ -505,21 +471,6 @@ BAKE_SEAM_TOPE= float(os.environ.get("OMVS_SEAM_TOPE","10"))    # tope del offse
 # mas oscuras se les queda diferencia SIN corregir, y como cada zona de la
 # pared se hornea desde fotos distintas, esa diferencia aparece como parches
 # de tono. Se abre el rango y ahora el log dice CUANTAS fotos tocan el limite.
-# CORRECCION FOTOMETRICA (investigacion, prioridad 1)
-# MEDIDO: las "figuras difusas de distinto tono" NO vienen de la geometria
-# (correlacion brillo-vs-relieve r=+0.02..+0.10, o sea cero). Quedan dos causas
-# fotometricas que la exposicion NO corrige, porque la exposicion es UNA ganancia
-# escalar por foto:
-#   1) BALANCE DE BLANCOS: el auto-WB del celular cambia foto a foto y deja
-#      tintes distintos. Al mezclar 185 fotos por texel, esos tintes aparecen
-#      como manchas suaves del mismo color pero distinto tono.
-#   2) VINETEADO: el lente oscurece los bordes del cuadro. Cada zona de pared se
-#      hornea desde fotos distintas y cae en zonas distintas del cuadro -> parches.
-# Se corrigen aqui, ANTES de mezclar. Ninguna toca la geometria.
-BAKE_WB       = os.environ.get("OMVS_BAKE_WB", "1") == "1"      # igualar el color entre fotos
-BAKE_WB_TOPE  = float(os.environ.get("OMVS_WB_TOPE", "1.30"))   # tope de la correccion por canal
-BAKE_VIG      = os.environ.get("OMVS_BAKE_VIG", "1") == "1"     # corregir el vineteado del lente
-BAKE_VIG_TOPE = float(os.environ.get("OMVS_VIG_TOPE", "1.60"))  # tope de la correccion de borde
 _EXPLO        = float(os.environ.get("OMVS_EXPO_MIN", "0.45"))
 _EXPHI        = float(os.environ.get("OMVS_EXPO_MAX", "2.20"))
 BAKE_VDOT     = int(os.environ.get("OMVS_BAKE_VDOT", "2"))       # radio del puntito para las caras de area cero (texeles)
@@ -528,7 +479,6 @@ BAKE_FIXDS    = int(os.environ.get("OMVS_BAKE_FIXDS", "16"))     # la correccion
 POSE_OPT      = os.environ.get("OMVS_POSEOPT", "0") == "1"       # Zhou-Koltun rigido (P2): OFF hasta medir su costo en el pod
 POSE_ITERS    = int(os.environ.get("OMVS_POSE_ITERS", "60"))     # iteraciones si se enciende
 POSE_VERTS    = int(os.environ.get("OMVS_POSE_VERTS", "400000")) # malla reducida para el optimizador (CPU)
-
 t0 = time.time()
 WORK = os.path.dirname(os.path.abspath(OUTGLB))
 MVS  = os.path.join(WORK, "mvs")
@@ -538,10 +488,8 @@ if os.path.isdir(MVS):
     shutil.rmtree(MVS, ignore_errors=True)
 for d in (MVS, IMGD, SPD):
     os.makedirs(d, exist_ok=True)
-
 from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
-
 def find_photo(dirpath, name):
     p = os.path.join(dirpath, name)
     if os.path.exists(p): return p
@@ -550,14 +498,12 @@ def find_photo(dirpath, name):
         q = os.path.join(dirpath, stem + ext)
         if os.path.exists(q): return q
     return None
-
 # ── 1) cameras.txt (a 1000px) ──────────────────────────────────────────────
 cams = {}
 for line in open(os.path.join(SPARSE, "cameras.txt")):
     if line.startswith("#") or not line.strip(): continue
     e = line.split()
     cams[int(e[0])] = [int(e[2]), int(e[3]), float(e[4]), float(e[5]), float(e[6]), float(e[7])]
-
 # ── 2) sparse a las fotos (recorte al aspecto + bajado a IMG_MAX; escala exacta) ─
 fcam = open(os.path.join(SPD, "cameras.txt"), "w"); fcam.write("# Camera list\n")
 fimg = open(os.path.join(SPD, "images.txt"), "w"); fimg.write("# Image list\n")
@@ -614,7 +560,6 @@ log("sparse listo: %d camaras a %s px (%d fotos no encontradas)"
     % (n_ok, ("%dx%d" % _res_ej if _res_ej else "?"), n_miss))
 if n_ok == 0:
     log("ERROR: 0 camaras utilizables; no puedo texturizar"); sys.exit(3)
-
 # ── 3) decimar la malla + REPARARLA A MANIFOLD ─────────────────────────────
 #   (Stage 0 de la investigacion: el crash del nivelado global y parte del dano
 #   en los parches vienen de aristas/vertices NO-manifold, tipicos de una malla
@@ -663,7 +608,6 @@ MFT = os.path.join(WORK, "mesh_for_tex.ply")
 m2 = o3d.geometry.TriangleMesh(m.vertices, m.triangles)
 o3d.io.write_triangle_mesh(MFT, m2)
 log("malla para textura: %d -> %d caras" % (nt0, len(m2.triangles)))
-
 # ── 3b) NIVELACION DE EXPOSICION entre las fotos (Plan B1 de la investigacion) ──
 #   El nivelador de OpenMVS crashea (rc=-6), asi que nivelamos NOSOTROS antes de
 #   texturizar: puntos de la malla visibles en varias fotos -> una GANANCIA por
@@ -781,7 +725,6 @@ if EXPOCOMP:
     log("EXPO: nivelacion fallo (%s); sigo con las fotos originales" % _ee)
 else:
     log("EXPO: nivelacion de exposicion APAGADA (OMVS_EXPOCOMP=0)")
-
 # ── 4) binarios de OpenMVS ─────────────────────────────────────────────────
 def which(nm):
     p = shutil.which(nm)
@@ -792,7 +735,6 @@ def which(nm):
 IFACE = which("InterfaceCOLMAP"); TEXM = which("TextureMesh")
 if not IFACE or not TEXM:
     log("ERROR: no encuentro InterfaceCOLMAP/TextureMesh en la imagen"); sys.exit(4)
-
 def run(cmd, tag, env=None):
     log("$ " + " ".join([os.path.basename(cmd[0])] + [str(a) for a in cmd[1:]]))
     t = time.time()
@@ -801,7 +743,6 @@ def run(cmd, tag, env=None):
         log("  | " + ln[:170])
     log("%s en %.1f min (rc=%d)" % (tag, (time.time()-t)/60.0, r.returncode))
     return r.returncode
-
 # 4a) COLMAP -> .mvs
 SCENE = os.path.join(MVS, "scene.mvs")
 def _leer_sparse(spd):
@@ -825,7 +766,6 @@ def _leer_sparse(spd):
             [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)]], _np.float64)
         vistas.append([nom, cid, R, t])
     return cams2, vistas
-
 def _pose_opt_zhou():
     """P2 (Zhou-Koltun rigido, Open3D color_map): afina las poses ANTES de
     texturizar para enderezar las juntas onduladas. Reescribe images.txt con
@@ -890,7 +830,6 @@ def _pose_opt_zhou():
     open(os.path.join(SPD, "images.txt"), "w").writelines(lineas)
     log("POSE-OPT Zhou-Koltun: %d vistas refinadas en %.1f min (iters=%d)"
         % (len(vistas), (time.time()-t0)/60.0, POSE_ITERS))
-
 if POSE_OPT:
     try:
         _pose_opt_zhou()
@@ -898,11 +837,9 @@ if POSE_OPT:
         log("POSE-OPT fallo (%s): sigo con las poses de MASt3R" % _po)
 else:
     log("POSE-OPT apagado (OMVS_POSEOPT=0): poses de MASt3R tal cual")
-
 rc = run([IFACE, "-i", MVS, "-o", SCENE, "--image-folder", IMGD], "InterfaceCOLMAP")
 if rc != 0 or not os.path.exists(SCENE):
     log("ERROR: InterfaceCOLMAP no produjo scene.mvs"); sys.exit(5)
-
 # 4b) TextureMesh -> OBJ (el glb propio de OpenMVS sale roto). OBJ = malla+mtl+
 #     imagenes, que trimesh convierte a un glb limpio con texturas incrustadas.
 BASE = os.path.join(MVS, "textured")
@@ -914,7 +851,6 @@ def texcmd(max_tex, extra):
          "--outlier-threshold", str(OUTLIER),
          "--cost-smoothness-ratio", str(SMOOTH_RATIO)]
     return c + list(extra)
-
 def _patch_unlit_matte(glbpath):
     """Parcha TODOS los materiales del glb a MATE + UNLIT: metallicFactor=0,
     roughnessFactor=1 y KHR_materials_unlit. Sin esto, glTF asume metal=1.0 y el
@@ -946,16 +882,12 @@ def _patch_unlit_matte(glbpath):
         return True
     except Exception as e:
         log("(no pude parchar material a unlit: %s)" % e); return False
-
-
 def tone_level(objf, texfiles, mtl2tex):
     """NIVELADO DE TONO POR PARCHE (Opcion C) — v8.9.
-
     v8.8 FALLO: identificaba los parches por pixeles conectados del atlas, pero
     OpenMVS los empaca PEGADOS -> 69.319 parches se fundian en 8.300 manchones y
     solo aparecian 189 costuras (de decenas de miles). El nivelado tocaba casi
     nada y la metrica del log, medida solo sobre esas 189, enganaba.
-
     v8.9: los parches se identifican por su GEOMETRIA UV (exacto): dos caras son
     del mismo parche si comparten un indice de UV. Un vertice no puede estar en
     dos parches (tendria dos UV), asi que la conectividad UV ES el parche.
@@ -975,7 +907,6 @@ def tone_level(objf, texfiles, mtl2tex):
     from scipy.sparse.csgraph import connected_components as _cc
     from scipy.spatial import cKDTree as _KDT
     _t = time.time()
-
     def _s2l(c): return _np.where(c <= 0.04045, c/12.92, ((c+0.055)/1.055)**2.4)
     def _l2s(c):
         c = _np.clip(c, 0.0, 1.0)
@@ -986,7 +917,6 @@ def tone_level(objf, texfiles, mtl2tex):
         return (_np.abs(a[:, :, 0].astype(_np.int16) - 128) < 6) & \
                (_np.abs(a[:, :, 1].astype(_np.int16) - 128) < 6) & \
                (_np.abs(a[:, :, 2].astype(_np.int16) - 128) < 6)
-
     # ── leer el OBJ ──
     Vn = []; Tn = []; F = []; FT = []; FM = []; cur = -1
     with open(objf) as fh:
@@ -1011,7 +941,6 @@ def tone_level(objf, texfiles, mtl2tex):
     NF = len(F)
     if NF < 1000 or len(Tn) == 0 or (FT < 0).any() or (FM < 0).any():
         log("TONO: el OBJ no trae UVs/materiales utilizables; textura sin tocar"); return False
-
     # ── 1) PARCHES = caras unidas por (MISMO vertice 3D + MISMA coordenada UV) ──
     #   v8.9 fallo: uni por INDICE de UV, pero OpenMVS repite las UV por cara
     #   (cada cara trae su propio vt) -> cada cara salia como un parche y 0
@@ -1032,7 +961,6 @@ def tone_level(objf, texfiles, mtl2tex):
     NISL, isl = _cc(_sp.coo_matrix((_np.ones(len(pos), _np.int8), (cf_s[pos], cf_s[pos-1])),
                                    shape=(NF, NF)), directed=False)
     isl = isl.astype(_np.int64)
-
     # ── 2) color de cada cara en el atlas (una textura a la vez) ──
     cuv = Tn[FT].mean(axis=1)
     col = _np.zeros((NF, 3), _np.float64); okf = _np.zeros(NF, bool)
@@ -1061,7 +989,6 @@ def tone_level(objf, texfiles, mtl2tex):
     okf &= col.min(1) > 0.002
     if okf.sum() < 1000:
         log("TONO: no pude leer el color de las caras; textura sin tocar"); return False
-
     # ── 3) costuras: vertices 3D donde se tocan DOS parches (vectorizado) ──
     g = okf[cf]
     cvg = cv[g]; cpg = isl[cf[g]]; cfg = cf[g]
@@ -1107,7 +1034,6 @@ def tone_level(objf, texfiles, mtl2tex):
         % (NISL, NP, cover))
     if NP < 500 or cover < 20.0:
         log("TONO: cobertura insuficiente -> NO nivelo (textura sin tocar)"); return False
-
     # ── 4) una ganancia por canal por parche ──
     ri = _np.repeat(_np.arange(NP), 2)
     ci = _np.empty(NP * 2, _np.int64); dv = _np.empty(NP * 2, _np.float64)
@@ -1125,7 +1051,6 @@ def tone_level(objf, texfiles, mtl2tex):
     lgG = _np.log(G).mean(1)
     d0 = _np.abs(PD.mean(1)); d1 = _np.abs(PD.mean(1) - (lgG[PA] - lgG[PB]))
     red = 100.0 * (1.0 - d1.mean() / max(d0.mean(), 1e-9))
-
     # ── 5) pintar: cada pixel toma la ganancia de su cara mas cercana ──
     for ti, tf in enumerate(texfiles):
         m = _np.flatnonzero(FM == ti)
@@ -1149,15 +1074,11 @@ def tone_level(objf, texfiles, mtl2tex):
     log("TONO: escalon medio en costuras BAJO %.0f%% | ganancias %.2f-%.2f (%d en tope) "
         "en %.1f min" % (red, float(G.min()), float(G.max()), nclamp, (time.time()-_t)/60.0))
     return True
-
-
 def bake_multiview(objf, texfiles, mtl2tex):
     """HORNEADOR MULTI-VISTA v9.2 (P1 de la investigacion; el metodo Polycam).
-
     salida = BAJA (promedio ponderado de TODAS las fotos borrosas: tono parejo
              por construccion) + ALTA (mejor foto nitida - su borrosa: detalle
              sin fantasmas). Fotos 12MP, atlas x2 -> ~0.075 cm/texel.
-
     v9.1 MURIO EN EL POD sin decir nada tras rasterizar 120M texeles: el
     sistema mato el proceso (memoria). v9.2 = misma matematica (validada en
     sintetico: escalon de tono 1.8 niveles vs 20-36 del mejor-vista), pero:
@@ -1172,7 +1093,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
     import numpy as _np, gc as _gc
     from scipy import ndimage as _ndi
     _t0 = time.time()
-
     def _rss():
         try:
             for _l in open("/proc/self/status"):
@@ -1185,7 +1105,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
         return _np.where(c <= 0.0031308, c*12.92, 1.055*(c**(1.0/2.4)) - 0.055)
     def _absxp(a, gpu):
         return a.abs() if gpu else _np.abs(a)
-
     # ── 1) leer el OBJ ──
     Vn=[]; Tn=[]; F=[]; FT=[]; FM=[]; cur=-1
     with open(objf) as fh:
@@ -1214,12 +1133,10 @@ def bake_multiview(objf, texfiles, mtl2tex):
     e1=V32[F[:,1]]-V32[F[:,0]]; e2=V32[F[:,2]]-V32[F[:,0]]
     FN=_np.cross(e1,e2); FN/= (_np.linalg.norm(FN,axis=1,keepdims=True)+1e-12)
     FN16=FN.astype(_np.float16); del e1,e2,FN; _gc.collect()
-
     # ── 2) camaras del sparse reescalado ──
     cams2, vistas = _leer_sparse(SPD)
     if not vistas:
         log("BAKE: sin camaras en el sparse; no horneo"); return False
-
     # ── 3) voto de orientacion V contra el relleno gris ──
     votes=[0,0]; cuv=Tn[FT].mean(1)
     for ti in range(len(texfiles)):
@@ -1237,7 +1154,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
     flip=0 if votes[0]>=votes[1] else 1
     del cuv; _gc.collect()
     log("BAKE: arranque (v9.4 loop unificado) | RAM %.1f GB" % _rss())
-
     # ── 4) tabla de texeles por splat (trozos por PRESUPUESTO de muestras) ──
     SC=max(1,BAKE_SCALE)
     if SC>1 and len(texfiles)>BAKE_MAXATL:
@@ -1245,7 +1161,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
             "para no producir un archivo gigante" % (len(texfiles),BAKE_MAXATL,SC))
         SC=1
     at_lin=[]; at_pos=[]; at_nrm=[]; at_id=[]; at_dims=[]
-    _NMU=0; _NBIG=0; _MUBIG=0
     PRESU=25_000_000
     for ti in range(len(texfiles)):
         with Image.open(texfiles[ti]) as _im0: W0,H0=_im0.size
@@ -1258,8 +1173,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
         del u
         area2=_np.abs((pu[:,1]-pu[:,0])*(pv[:,2]-pv[:,0])-(pu[:,2]-pu[:,0])*(pv[:,1]-pv[:,0]))
         ns=_np.clip((area2*2.0).astype(_np.int64)+3,3,400000)
-        _NMU+=int(ns.sum()); _bg=ns>10000
-        _NBIG+=int(_bg.sum()); _MUBIG+=int(ns[_bg].sum())
         cs=_np.cumsum(ns)
         f0=0
         while f0 < len(m):
@@ -1296,15 +1209,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
     NT=len(LIN)
     log("BAKE: %d texeles rasterizados (con duplicados raros de borde, inofensivos) "
         "| RAM %.1f GB | %.1f min" % (NT,_rss(),(time.time()-_t0)/60.0))
-    # DIAGNOSTICO DE LENTITUD (medido en la (61): 198M muestras para 50M texeles;
-    # 1.822 caras de un millon pedian el 47% del trabajo. Eran ASTILLAS, la forma
-    # que deja el cosido de huecos. Si esta linea vuelve a dispararse, el culpable
-    # es HOLE_MAX otra vez.)
-    if _NMU:
-        log("BAKE: %.0fM muestras pedidas | %d caras piden >10k cada una (%.0f%% del "
-            "trabajo). Sano: <5%%; si sube mucho, baja HOLE_MAX"
-            % (_NMU/1e6,_NBIG,100*_MUBIG/max(_NMU,1)))
-
     # ── 5) mapas de profundidad (media resolucion, f16) ──
     import open3d as _o3
     scn=_o3.t.geometry.RaycastingScene()
@@ -1328,7 +1232,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
     del scn,_mm,V; _gc.collect()
     log("BAKE: profundidades de %d camaras listas | RAM %.1f GB | %.1f min"
         % (len(vistas),_rss(),(time.time()-_t0)/60.0))
-
     # ── 6) acumulacion UNIFICADA (un solo cuerpo; adaptador GPU/CPU) ──
     # Una sola implementacion corre en GPU (torch) o CPU (numpy) via un
     # adaptador minimo. El test local en CPU ejercita EXACTAMENTE estas
@@ -1340,7 +1243,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
         usa_gpu=_th.cuda.is_available() and os.environ.get("OMVS_BAKE_CPU","0")!="1"
     except Exception:
         _th=None
-
     class _XPnp:                      # adaptador NumPy (CPU)
         name="CPU"
         def zeros(self,shp,f16=False): return _np.zeros(shp,_np.float16 if f16 else _np.float32)
@@ -1356,7 +1258,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
         def norm1(self,v): return _np.linalg.norm(v,axis=1,keepdims=True)
         def u8add(self,c,m): return _np.minimum(c.astype(_np.int32)+m,250).astype(_np.uint8)
         def f16(self,a): return a.astype(_np.float16)
-
     class _XPth:                      # adaptador Torch (GPU)
         name="GPU"
         def __init__(self,dev): self.d=dev
@@ -1373,7 +1274,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
         def norm1(self,v): return _th.clamp(v.norm(dim=1,keepdim=True),min=1e-9)
         def u8add(self,c,m): return c+(m.to(_th.uint8)*(c<250).to(_th.uint8))
         def f16(self,a): return a.half()
-
     xp = _XPth("cuda") if usa_gpu else _XPnp()
     sumL=xp.zeros((NT,3)); sumW=xp.zeros(NT); bestW=xp.zeros(NT)
     bestS=xp.zeros((NT,3),f16=True); bestL=xp.zeros((NT,3),f16=True); cnt=xp.zc(NT)
@@ -1381,17 +1281,13 @@ def bake_multiview(objf, texfiles, mtl2tex):
     if usa_gpu: del POS,NRM; _gc.collect()
     CH=[20_000_000 if usa_gpu else 4_000_000]
     log("BAKE: mezclando %d camaras en %s | RAM %.1f GB" % (len(vistas),xp.name,_rss()))
-
     # ── NORMALIZACION DE EXPOSICION por foto (BAKE_EXPO): el Xiaomi cambia la
     #    auto-exposicion foto a foto (medido: hasta 4x en este set). Antes de
     #    mezclar, se lleva cada foto a la MEDIANA global de luminancia lineal.
     #    Ataca "no hay armonia / distintos tonos" en la RAIZ, no solo tapa. ──
-    _gain={}; _wb={}; _VIGC={}
-    _vig_on=BAKE_VIG        # local: NO reasignar el global (bug del V)
-    if BAKE_EXPO or BAKE_WB or _vig_on:
-        _ms=[]; _rgb=[]
-        _NR=24                      # bins radiales del perfil de vineteado
-        _vsum=_np.zeros(_NR); _vcnt=_np.zeros(_NR)
+    _gain={}
+    if BAKE_EXPO:
+        _ms=[]
         for nom,cid,_Rc,_tc in vistas:
             cr=CROPS.get(nom)
             try:
@@ -1402,24 +1298,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _q=Image.open(os.path.join(IMGD,nom)).convert("RGB").resize((160,213),Image.BILINEAR)
             except Exception:
                 _q=Image.open(os.path.join(IMGD,nom)).convert("RGB").resize((160,213),Image.BILINEAR)
-            _a=_s2l(_np.asarray(_q,_np.float32)/255.0)      # luz LINEAL
-            _ms.append((nom,float(_np.median(_a))))
-            # (1) color medio por canal -> para igualar el BALANCE DE BLANCOS
-            _rgb.append((nom,_a.reshape(-1,3).mean(0)))
-            # (2) perfil radial: brillo normalizado por el de la propia foto.
-            #     Promediado sobre 185 fotos, el contenido de la escena se
-            #     cancela y queda la caida del LENTE (flat-field retrospectivo).
-            if _vig_on:
-                _hq,_wq=_a.shape[:2]
-                _yy,_xx=_np.mgrid[0:_hq,0:_wq]
-                _rr=_np.sqrt(((_xx-(_wq-1)/2.0)/((_wq-1)/2.0))**2
-                             +((_yy-(_hq-1)/2.0)/((_hq-1)/2.0))**2)
-                _rr=_np.clip(_rr/_np.sqrt(2.0),0,0.999999)
-                _lum=_a.mean(2); _mn=float(_lum.mean())
-                if _mn>1e-6:
-                    _bi=(_rr*_NR).astype(_np.int64)
-                    _np.add.at(_vsum,_bi.ravel(),(_lum/_mn).ravel())
-                    _np.add.at(_vcnt,_bi.ravel(),1.0)
+            _ms.append((nom,float(_np.median(_s2l(_np.asarray(_q,_np.float32)/255.0)))))
         _med=_np.median([x[1] for x in _ms])
         for nom,mi in _ms:
             _gain[nom]=float(_np.clip(_med/max(mi,1e-4),_EXPLO,_EXPHI))
@@ -1428,53 +1307,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
         log("BAKE: exposicion normalizada | ganancias %.2f-%.2f (rango %.2f-%.2f) | "
             "%d de %d fotos TOCAN el limite"
             % (_sp.min(),_sp.max(),_EXPLO,_EXPHI,_nsat,len(_sp)))
-        # ── BALANCE DE BLANCOS: llevar TODAS las fotos al color de la MEDIANA ──
-        # No se fuerza "gris" (gray-world puro), que le cambiaria el color al
-        # cuarto entero: se igualan entre si. Es lo que hace falta, porque el
-        # defecto es que las fotos NO COINCIDEN, no que esten mal en absoluto.
-        if BAKE_WB and _rgb:
-            _M=_np.array([v for _,v in _rgb],_np.float64)      # (N,3)
-            _M=_np.maximum(_M,1e-6)
-            _rg=_M[:,0]/_M[:,1]; _bg=_M[:,2]/_M[:,1]           # razones al verde
-            _rgm=float(_np.median(_rg)); _bgm=float(_np.median(_bg))
-            _lo,_hi=1.0/BAKE_WB_TOPE,BAKE_WB_TOPE
-            _nw=0
-            for _i,(nom,_) in enumerate(_rgb):
-                _gr=float(_np.clip(_rgm/max(_rg[_i],1e-6),_lo,_hi))
-                _gb=float(_np.clip(_bgm/max(_bg[_i],1e-6),_lo,_hi))
-                _wb[nom]=_np.array([_gr,1.0,_gb],_np.float32)
-                if abs(_gr-1)>0.02 or abs(_gb-1)>0.02: _nw+=1
-            _dr=float(_np.percentile(_rg,90)-_np.percentile(_rg,10))
-            _db=float(_np.percentile(_bg,90)-_np.percentile(_bg,10))
-            log("BAKE WB: %d de %d fotos con tinte distinto; dispersion R/G %.3f, B/G %.3f "
-                "-> igualadas a la mediana" % (_nw,len(_rgb),_dr,_db))
-        # ── VINETEADO: invertir el perfil radial medido ──
-        if _vig_on and _vcnt.sum()>0:
-            _ok=_vcnt>0
-            _prof=_np.ones(_NR)
-            _prof[_ok]=_vsum[_ok]/_vcnt[_ok]
-            # OJO (bug cazado en la prueba sintetica): hay que suavizar ANTES de
-            # normalizar, y rellenando el borde con el propio valor. Al reves,
-            # convolve rellena con CEROS y hunde el bin del centro: el perfil
-            # salia 0.67 en el centro cuando debe ser 1.00, y minimum.accumulate
-            # congelaba ese error -> la correccion habria quedado invertida.
-            _prof=_np.convolve(_np.pad(_prof,1,mode="edge"),
-                               _np.ones(3)/3.0,mode="same")[1:-1]
-            _prof=_prof/max(_prof[0],1e-6)                     # normalizar al centro
-            _prof=_np.minimum.accumulate(_np.clip(_prof,0.2,1.0))
-            _caida=float(1.0-_prof[-1])
-            if _caida<0.02:
-                _vig_on=False
-                log("BAKE VIG: la caida al borde es solo %.1f%% -> no hace falta corregir" % (100*_caida))
-            else:
-                _corr=_np.clip(1.0/_np.maximum(_prof,1e-6),1.0,BAKE_VIG_TOPE)
-                _VIGC["prof"]=_corr
-                log("BAKE VIG: el borde del cuadro llega %.0f%% mas oscuro que el centro "
-                    "-> corregido (esto pintaba parches segun donde caia cada foto)"
-                    % (100*_caida))
-        else:
-            _vig_on=False
-
     for ki,(nom,cid,Rc,tc) in enumerate(vistas):
         if ki % 16 == 0 and ki:
             log("BAKE: camara %d/%d | RAM %.1f GB | %.1f min"
@@ -1492,28 +1324,8 @@ def bake_multiview(objf, texfiles, mtl2tex):
         W12,H12=im.size; s12=W12/float(w14)
         low_im=im.resize((max(1,W12//BAKE_DS),max(1,H12//BAKE_DS)),Image.LANCZOS).resize((W12,H12),Image.BILINEAR)
         g_i=_gain.get(nom,1.0)
-        # exposicion (escalar) x balance de blancos (por canal)
-        _gv=_np.float32([g_i,g_i,g_i])
-        if BAKE_WB and nom in _wb: _gv=_gv*_wb[nom]
-        sharp=_s2l(_np.asarray(im,_np.float32)/255.0)*_gv[None,None,:]; del im
-        low=_s2l(_np.asarray(low_im,_np.float32)/255.0)*_gv[None,None,:]; del low_im
-        # vineteado: mapa radial, calculado UNA vez por tamano de foto y cacheado
-        if _vig_on and "prof" in _VIGC:
-            _k=(sharp.shape[1],sharp.shape[0])
-            if _k not in _VIGC:
-                _wv,_hv=_k
-                _yv,_xv=_np.mgrid[0:_hv,0:_wv]
-                _rv=_np.sqrt(((_xv-(_wv-1)/2.0)/((_wv-1)/2.0))**2
-                             +((_yv-(_hv-1)/2.0)/((_hv-1)/2.0))**2)
-                _rv=_np.clip(_rv/_np.sqrt(2.0),0,0.999999)
-                _pr=_VIGC["prof"]
-                _fi=_rv*(len(_pr)-1)
-                _i0=_np.floor(_fi).astype(_np.int32); _i1=_np.minimum(_i0+1,len(_pr)-1)
-                _fr=(_fi-_i0).astype(_np.float32)
-                _VIGC[_k]=(_pr[_i0]*(1-_fr)+_pr[_i1]*_fr).astype(_np.float32)
-                del _yv,_xv,_rv,_fi,_i0,_i1,_fr
-            _vm=_VIGC[_k][:,:,None]
-            sharp=sharp*_vm; low=low*_vm
+        sharp=_s2l(_np.asarray(im,_np.float32)/255.0)*g_i; del im
+        low=_s2l(_np.asarray(low_im,_np.float32)/255.0)*g_i; del low_im
         dep=deps[nom].astype(_np.float32); hD,wD=dep.shape; sD=wD/float(w14)
         Cc=(-Rc.T@tc).astype(_np.float32)
         # subir esta camara al backend
@@ -1573,7 +1385,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
         del POSg,NRMg
         _th.cuda.empty_cache()
     log("BAKE: mezcla terminada | RAM %.1f GB | %.1f min" % (_rss(),(time.time()-_t0)/60.0))
-
     seen=(cnt>=1)&(sumW>1e-9)
     cov1=100.0*seen.mean(); cov3=100.0*(cnt>=3).mean()
     if cov1<30.0:
@@ -1589,7 +1400,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
         outs[sl]=(_np.clip(_l2s(ol),0,1)*255.0+0.5).astype(_np.uint8)
     del sumL,sumW,bestW,bestS,bestL; _gc.collect()
     log("BAKE: composicion lista | RAM %.1f GB" % _rss())
-
     # ── 7) escribir atlas: horneado donde hay fotos + CORRECCION DE TONO donde no ──
     #
     # PROBLEMA QUE ARREGLA (visto en el render 45): el horneador solo repinta
@@ -1690,47 +1500,21 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     gan=gan[gi[0],gi[1]]
                     # suavizar: un degradado de ganancia, no calcos con borde
                     gan=_ndi.uniform_filter(gan,size=(BAKE_FIXBLUR,BAKE_FIXBLUR,1))
-                    # MEDIDO en la (61): hasta aqui todo bien, pero mas abajo la
-                    # ganancia se ampliaba de la rejilla (1/16) al atlas por
-                    # VECINO MAS CERCANO -> cada celda de 16x16 texeles quedaba
-                    # con un tono plano distinto del vecino. En el atlas real eso
-                    # deja un escalon EXTRA en los limites de 16, por encima del
-                    # bloqueo de JPEG: 6.017 vs 5.709 (atlas 1) y 2.827 vs 2.534
-                    # (atlas 2), igual en horizontal y vertical. Son LOS
-                    # CUADRADITOS, sobre 41.9M de texeles (31% del atlas).
-                    # Aqui se prepara la version SUAVE: coordenadas fraccionarias
-                    # para interpolar bilinealmente al aplicar.
                     # aplicar SOLO donde ninguna foto vio (el horneado no se toca),
                     # por FRANJAS: sacar las coordenadas de 20M de texeles de
                     # golpe pedia 0.35 GB y mataba el proceso.
-                    # BILINEAL: el centro de la celda g cae en el texel
-                    # g*DS + DS/2, asi que la coordenada de rejilla de un texel x
-                    # es (x + 0.5)/DS - 0.5. Se interpola entre las dos celdas
-                    # vecinas en vez de copiar la mas cercana -> la ganancia queda
-                    # como un degradado continuo y desaparece el escalon de 16.
-                    _fx=_np.clip((_np.arange(W2)+0.5)/DS-0.5,0,GW-1)
-                    _x0g=_np.floor(_fx).astype(_np.int64)
-                    _x1g=_np.minimum(_x0g+1,GW-1)
-                    _tx=(_fx-_x0g).astype(_np.float32)[None,:,None]
+                    _cx=_np.minimum(_np.arange(W2)//DS,GW-1)
                     for _r0 in range(0,H2,512):
                         _r1=min(_r0+512,H2)
                         _m2=sinh[_r0:_r1]
                         if not _m2.any(): continue
-                        _fy=_np.clip((_np.arange(_r0,_r1)+0.5)/DS-0.5,0,GH-1)
-                        _y0g=_np.floor(_fy).astype(_np.int64)
-                        _y1g=_np.minimum(_y0g+1,GH-1)
-                        _ty=(_fy-_y0g).astype(_np.float32)[:,None,None]
-                        _g00=gan[_y0g[:,None],_x0g[None,:]]
-                        _g01=gan[_y0g[:,None],_x1g[None,:]]
-                        _g10=gan[_y1g[:,None],_x0g[None,:]]
-                        _g11=gan[_y1g[:,None],_x1g[None,:]]
-                        _gg=((_g00*(1-_tx)+_g01*_tx)*(1-_ty)
-                             +(_g10*(1-_tx)+_g11*_tx)*_ty)
+                        _cy=_np.minimum(_np.arange(_r0,_r1)//DS,GH-1)
+                        _gg=gan[_cy[:,None],_cx[None,:]]
                         _blk=_np.clip(base[_r0:_r1].astype(_np.float32)*_gg,0,255).astype(_np.uint8)
                         base[_r0:_r1]=_np.where(_m2[:,:,None],_blk,base[_r0:_r1])
-                        del _gg,_blk,_m2,_fy,_y0g,_y1g,_ty,_g00,_g01,_g10,_g11
+                        del _gg,_blk,_m2,_cy
                     _nfix+=nsin
-                    del gan,gi,_num,_den,_fx,_x0g,_x1g,_tx
+                    del gan,gi,_num,_den,_cx
             del ghor,gcru,gcnt,filled,sinh
         # ── (c) RELLENO DE GRIS ───────────────────────────────────────────
         # MEDIDO en la malla (53): el 19.3% de las caras (219.817) quedaban
@@ -1880,28 +1664,9 @@ def bake_multiview(objf, texfiles, mtl2tex):
             _ln=_np.linalg.norm(_fn,axis=1); _ok=_ln>1e-12
             _fn[_ok]/=_ln[_ok][:,None]
             _CG=_Vkeep.mean(0)
-            # --- planos: PRIMERO los que ya encontro el script de malla ---
-            # Esos ya pasaron los tres candados (tamano >=1.2 m, periferia por
-            # percentil, normales alineadas). Recalcularlos aqui era duplicar el
-            # trabajo con peor informacion: en el job e13efea4 la busqueda de aqui
-            # devolvio CERO planos y el nivelado no corrio, mientras el script de
-            # malla habia encontrado 6 sin problema.
+            # --- planos dominantes por RANSAC (submuestreado) ---
             _planos=[]
-            try:
-                _pf=os.environ.get("PLANOS_NPY","/workspace/job/planos.npy")
-                if os.path.exists(_pf):
-                    _pa=_np.load(_pf)
-                    for _row in _pa:
-                        _nn=_np.asarray(_row[:3],_np.float64)
-                        _L=_np.linalg.norm(_nn)
-                        if _L>1e-9: _planos.append((_nn/_L,float(_row[3])/_L))
-                    log("BAKE TONO: %d planos leidos del paso de malla (ya filtrados)"
-                        % len(_planos))
-                else:
-                    log("BAKE TONO: no hay planos guardados; los busco yo (respaldo)")
-            except Exception as _pe:
-                log("BAKE TONO: no pude leer los planos guardados (%s); los busco yo" % _pe)
-            if not _planos and _o3 is not None:
+            if _o3 is not None:
                 _Vs=_Vkeep[::4].astype(_np.float64)
                 _rest=_np.arange(len(_Vs))
                 for _r in range(8):
@@ -1922,14 +1687,12 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 log("BAKE TONO: no encontre planos grandes; lo salto")
             else:
                 _gan=_np.ones(len(F),_np.float32)
-                _npar=0; _desc=[]
+                _npar=0
                 for _nrm,_dd in _planos:
                     _lado=_np.sign(float(_np.dot(_CG,_nrm))+_dd) or 1.0
                     _dist=(_cen@_nrm+_dd)*_lado
                     _sel=(_np.abs(_fn@_nrm)>0.90)&(_np.abs(_dist)<0.06)
-                    if int(_sel.sum())<8000:
-                        _desc.append("plano con solo %d caras (<8000)" % int(_sel.sum()))
-                        continue
+                    if int(_sel.sum())<8000: continue
                     _ix=_np.flatnonzero(_sel)
                     _u=_np.array([1.0,0,0]) if abs(_nrm[0])<0.9 else _np.array([0,1.0,0])
                     _a1=_np.cross(_nrm,_u); _a1/=_np.linalg.norm(_a1)
@@ -1939,13 +1702,10 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _gx=((_x-_x.min())/_P).astype(_np.int64)
                     _gy=((_y-_y.min())/_P).astype(_np.int64)
                     _W=int(_gx.max())+1; _H=int(_gy.max())+1
-                    if _W*_H>4_000_000 or _W<60 or _H<60:
-                        _desc.append("rejilla %dx%d fuera de rango" % (_W,_H)); continue
+                    if _W*_H>4_000_000 or _W<60 or _H<60: continue
                     # color medio por cara (basta: se busca la escala de METROS)
                     _bue=~_np.isnan(FCOL[_ix]).any(1)
-                    if _bue.sum()<4000:
-                        _desc.append("solo %d caras con color leible (<4000)" % int(_bue.sum()))
-                        continue
+                    if _bue.sum()<4000: continue
                     _ix=_ix[_bue]
                     _gx=_gx[_bue]; _gy=_gy[_bue]
                     _cf=FCOL[_ix]
@@ -1953,9 +1713,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     for _k in range(3): _np.add.at(_S[:,:,_k],(_gy,_gx),_cf[:,_k])
                     _np.add.at(_Cn,(_gy,_gx),1.0)
                     _mk=_Cn>0
-                    if _mk.mean()<0.05:
-                        _desc.append("rejilla casi vacia (%.1f%% llena)" % (100*_mk.mean()))
-                        continue
+                    if _mk.mean()<0.05: continue
                     _G=_np.where(_mk[:,:,None],_S/_np.maximum(_Cn,1.0)[:,:,None],0.0)
                     _ii=_ndi.distance_transform_edt(~_mk,return_distances=False,return_indices=True)
                     _G=_G[_ii[0],_ii[1]]
@@ -1970,8 +1728,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     _gan[_ix]=_gf.astype(_np.float32)
                     _npar+=1
                 if _npar==0:
-                    log("BAKE TONO: ningun plano cumplio el minimo de %d. Motivos: %s"
-                        % (len(_planos), " | ".join(_desc[:6]) if _desc else "sin detalle"))
+                    log("BAKE TONO: ningun plano cumplio el minimo; lo salto")
                 else:
                     _apl=_np.flatnonzero(_np.abs(_gan-1.0)>0.01)
                     log("BAKE TONO: %d superficies, %d caras a corregir (escala %.1f m, fuerza %.2f)"
@@ -2208,8 +1965,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
         "atlas x%d en %.1f min"
         % (NT/1e6,cov1,cov3,"GPU" if usa_gpu else "CPU",SC,(time.time()-_t0)/60.0))
     return True
-
-
 def obj_to_glb(objf, outglb):
     """OBJ texturizado de OpenMVS -> glb. (a) Recolorea el NARANJA de relleno de
     OpenMVS (255,127,39; caras que ninguna foto vio) a gris DIRECTO en los archivos
@@ -2327,8 +2082,6 @@ def obj_to_glb(objf, outglb):
     # (c) material MATE + UNLIT
     _patch_unlit_matte(outglb)
     return os.path.exists(outglb) and os.path.getsize(outglb) > 200000
-
-
 # AUTO-SANADOR (2 configs):
 #  cfg1 = la de la INVESTIGACION: caras virtuales coplanares (mata la
 #         fragmentacion usando las paredes/piso ya aplanados) + nivelado local
@@ -2371,16 +2124,12 @@ for ci, (mt, extra, omp) in enumerate(CONFIGS):
             log("conversion OBJ->glb fallo: %s" % ce)
     log("config %d no sirvio (rc=%d); %s"
         % (ci+1, rc, "reintento mas liviano" if ci+1 < len(CONFIGS) else "sin mas intentos"))
-
 if final is None:
     log("ERROR: OpenMVS no produjo una textura utilizable (todas las configs)"); sys.exit(6)
-
 log("TEXTURA OpenMVS lista: %.1f MB en %.1f min"
     % (os.path.getsize(OUTGLB)/1e6, (time.time()-t0)/60.0))
 sys.exit(0)
 '''
-
-
 # ═════════════════════════════════════════════════════════════════════════
 # BA_SCRIPT — PASO 2b: afinar poses con Bundle Adjustment (pycolmap).
 # Las poses de MASt3R traen ~0.1° de error angular; ese error emborrona la
@@ -2402,21 +2151,17 @@ import numpy as np
 from PIL import Image
 import open3d as o3d
 import trimesh
-
 MESH_PLY   = sys.argv[1]
 IMAGES_DIR = sys.argv[2]
 SPARSE_DIR = sys.argv[3]
 OUT_GLB    = sys.argv[4]
 AO_PATH    = sys.argv[5] if len(sys.argv) > 5 else ""   # ambient occlusion por vertice
-
 def log(s): print("   [paint] " + s, flush=True)
-
 def srgb_to_linear(c):
     return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 def linear_to_srgb(c):
     c = np.maximum(c, 0.0)
     return np.clip(np.where(c <= 0.0031308, c * 12.92, 1.055 * (c ** (1 / 2.4)) - 0.055), 0, 1)
-
 # 1) malla (conserva el color TSDF como respaldo para vertices sin foto)
 m = o3d.io.read_triangle_mesh(MESH_PLY)
 V = np.asarray(m.vertices); F = np.asarray(m.triangles)
@@ -2424,19 +2169,16 @@ if len(V) == 0 or len(F) == 0:
     log("malla vacia, abortando"); sys.exit(1)
 orig = np.asarray(m.vertex_colors) if len(m.vertex_colors) == len(V) else None
 log("malla %d vert %d caras" % (len(V), len(F)))
-
 # 2) escena de raycasting (visibilidad/oclusion, igual que la textura)
 scene = o3d.t.geometry.RaycastingScene()
 scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(m))
 INVALID = scene.INVALID_ID
-
 # 3) intrinsecos + poses (parseo identico al validado)
 cams = {}
 for line in open(os.path.join(SPARSE_DIR, "cameras.txt")):
     if line.startswith("#") or not line.strip(): continue
     e = line.split()
     cams[int(e[0])] = (int(e[2]), int(e[3]), float(e[4]), float(e[5]), float(e[6]), float(e[7]))
-
 def q2R(qw, qx, qy, qz):
     n = (qw*qw + qx*qx + qy*qy + qz*qz) ** 0.5
     qw, qx, qy, qz = qw/n, qx/n, qy/n, qz/n
@@ -2444,7 +2186,6 @@ def q2R(qw, qx, qy, qz):
         [1-2*(qy*qy+qz*qz), 2*(qx*qy-qw*qz),   2*(qx*qz+qw*qy)],
         [2*(qx*qy+qw*qz),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx)],
         [2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx),   1-2*(qx*qx+qy*qy)]])
-
 views = []
 for line in open(os.path.join(SPARSE_DIR, "images.txt")):
     if line.startswith("#") or not line.strip(): continue
@@ -2455,7 +2196,6 @@ for line in open(os.path.join(SPARSE_DIR, "images.txt")):
         E = np.eye(4); E[:3, :3] = R; E[:3, 3] = t
         views.append((int(e[8]), e[9], E, R, t))
 log("poses: %d camaras" % len(views))
-
 # 4) PINTAR: por cada foto, raycast y reparto del pixel a los 3 vertices del
 #    triangulo golpeado (peso = baricentrica x cos^4 de la mejor vista)
 accV  = np.zeros((len(V), 3), np.float64)
@@ -2527,7 +2267,6 @@ for cid, name, E, R, t in views:
 log("proyectadas %d/%d camaras" % (nuse, len(views)))
 if nuse == 0:
     log("ninguna camara proyectada, abortando"); sys.exit(1)
-
 # 5) COLOR FINAL — cadena arreglada (el render salia "blanco"/lavado):
 #    (a) color FIEL desde las fotos (promedio en LINEAL -> sRGB). El gamma 0.8 que
 #        habia aqui INFLABA el brillo ~15% y empujaba todo hacia el blanco.
@@ -2588,12 +2327,10 @@ cols = np.clip(cols, 0, 1) ** _GAM
 cols = np.nan_to_num(cols, nan=0.5, posinf=1.0, neginf=0.0)
 cols = np.clip(cols, 0, 1).astype(np.float32)
 log("color: brillo %.3f -> %.3f (sat %.2f, AO %.2f, gamma %.2f)" % (_b0, float(cols.mean()), _SAT, _AOSTR, _GAM))
-
 # Guardamos el color COMO SE VE (sRGB, lo que muestra un visor fiel) para la
 # auditoría automática de más abajo. La conversión a lineal es solo para el
 # archivo; lo que Felipe ve en F3D --unlit es esta versión sRGB.
 _cols_display = cols.copy()
-
 # ESPACIO DE SALIDA: la spec de glTF exige COLOR_0 en LINEAL. Todo el ajuste
 # (saturación, AO, gamma) se hizo en sRGB porque es perceptual; ahora, si
 # PAINT_STORE=linear (default), convertimos a lineal para guardarlo como manda
@@ -2605,7 +2342,6 @@ if _STORE == "linear":
         "gltf-viewer.donmccurdy.com [Tone Mapping=Linear] o F3D --unlit")
 else:
     log("COLOR_0 guardado en sRGB (modo compatible viejo)")
-
 # 6) exportar .glb: color por vertice + normales suaves + mate + unlit
 rgba = np.concatenate([(cols*255).astype(np.uint8),
                        np.full((len(V), 1), 255, np.uint8)], 1)
@@ -2703,20 +2439,16 @@ except Exception as e:
 #             entrenamiento, que solo mide las gaussianas, no la malla+color).
 # Felipe pega el log y así yo "veo" objetivamente qué tan derretido está.
 # (auditoria del log retirada en v8 a pedido de Felipe)
-
 log("color por vertice desde FOTOS exportado a .glb")
 sys.exit(0)
 '''
-
 # ═════════════════════════════════════════════════════════════════════════
 BA_SCRIPT = r'''
 import sys, os, shutil, time, subprocess, traceback
 def log(s): print("   [ba] " + s, flush=True)
-
 IMAGES = sys.argv[1]   # dataset/images (fotos de entrenamiento)
 SPARSE = sys.argv[2]   # dataset/sparse/0 (modelo COLMAP texto de MASt3R)
 WORKD  = sys.argv[3]   # carpeta de trabajo
-
 # Usamos el binario colmap CLASICO que ya viene en la imagen (/usr/bin/colmap):
 # es pre-"rigs", asi que entiende el modelo texto de MASt3R sin los chequeos
 # internos nuevos de pycolmap 4.x que fallaron en el pod (RigId mismatch).
@@ -2729,7 +2461,6 @@ try:
     import pycolmap
 except Exception as e:
     log("pycolmap no disponible (%s): dejo poses MASt3R" % e); sys.exit(2)
-
 def cli(args):
     r = subprocess.run([COLMAP] + args, capture_output=True, text=True)
     if r.returncode != 0:
@@ -2737,7 +2468,6 @@ def cli(args):
         clave = [l for l in lineas if ("Check failed" in l or "ERROR" in l)][-3:]
         cola = clave + lineas[-4:]
         raise RuntimeError("colmap %s rc=%d :: %s" % (args[0], r.returncode, " | ".join(cola)))
-
 os.makedirs(WORKD, exist_ok=True)
 db = os.path.join(WORKD, "ba.db")
 if os.path.exists(db): os.remove(db)
@@ -2746,14 +2476,11 @@ try:
     rec_in = pycolmap.Reconstruction(SPARSE)
     n_in = rec_in.num_reg_images()
     log("modelo MASt3R: %d camaras, %d puntos" % (n_in, rec_in.num_points3D()))
-
-
     # 1) puntos SIFT (CPU, mismo binario que hara todo lo demas)
     cli(["feature_extractor", "--database_path", db, "--image_path", IMAGES,
          "--ImageReader.single_camera", "1", "--ImageReader.camera_model", "PINHOLE",
          "--SiftExtraction.max_num_features", "4096", "--SiftExtraction.use_gpu", "0"])
     log("SIFT extraido (%.0fs)" % (time.time() - t0))
-
     # Modelo SOLO-POSES renumerado a los IDs de la BASE DE DATOS. Dos razones,
     # ambas fallos REALES del pod: (a) el colmap clasico aborta si el modelo trae
     # los 200k puntos de MASt3R; (b) tambien aborta si model.image_id no coincide
@@ -2780,19 +2507,16 @@ try:
     if _falt:
         log("VALIDACION FALLO: %d imagenes del modelo no estan en la BD -> dejo poses MASt3R" % _falt)
         sys.exit(2)
-
     # 2) matching secuencial (video: frames vecinos se solapan)
     cli(["sequential_matcher", "--database_path", db,
          "--SequentialMatching.overlap", "20",
          "--SequentialMatching.loop_detection", "0",
          "--SiftMatching.use_gpu", "0"])
     log("matching secuencial OK (%.0fs)" % (time.time() - t0))
-
     # 3) triangular con poses MASt3R FIJAS
     tri = os.path.join(WORKD, "tri"); os.makedirs(tri, exist_ok=True)
     cli(["point_triangulator", "--database_path", db, "--image_path", IMAGES,
          "--input_path", po, "--output_path", tri])
-
     # 4) Bundle Adjustment (afina poses + focal; centro optico FIJO)
     ba = os.path.join(WORKD, "ba_out"); os.makedirs(ba, exist_ok=True)
     # CLAVE DEL ARREGLO: refine_extrinsics=0 CONGELA las poses de MASt3R.
@@ -2806,7 +2530,6 @@ try:
     txt = os.path.join(WORKD, "ba_txt"); os.makedirs(txt, exist_ok=True)
     cli(["model_converter", "--input_path", ba, "--output_path", txt,
          "--output_type", "TXT"])
-
     # 5) VALIDAR antes de tocar nada
     rec = pycolmap.Reconstruction(txt)
     err = rec.compute_mean_reprojection_error()
@@ -2838,7 +2561,6 @@ try:
         raise
     except Exception as _se:
         log("(guardian de escala no pudo medir: %s; sigo)" % _se)
-
     # 6) respaldo y escritura del modelo refinado (SOLO los 3 .txt clasicos,
     #    para que 2DGS y el script de priors lo lean igual que el de MASt3R)
     bak = os.path.join(os.path.dirname(SPARSE), "0_mast3r")
@@ -2855,8 +2577,6 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(2)
 '''
-
-
 # ═════════════════════════════════════════════════════════════════════════
 # PRIORS_SCRIPT — PASO 2c: priors monoculares por foto.
 # PROFUNDIDAD: Depth Anything V2 Metric-Indoor (vitb) → metros.
@@ -2872,19 +2592,16 @@ PRIORS_SCRIPT = r'''
 import sys, os, gc, traceback
 import numpy as np
 def log(s): print("   [priors] " + s, flush=True)
-
 IMAGES = sys.argv[1]; SPARSE = sys.argv[2]; OUT = sys.argv[3]
 DAV2_DIR   = os.environ.get("DAV2_DIR", "/opt/depth_anything_v2")
 DSINE_DIR  = os.environ.get("DSINE_DIR", "/opt/dsine")
 MODELS_DIR = os.environ.get("MODELS_DIR", "/opt/models")
 INSZ       = int(os.environ.get("PRIORS_INPUT_SIZE", "518"))
 os.makedirs(OUT, exist_ok=True)
-
 import torch
 import cv2
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 log("dispositivo: %s" % DEV)
-
 # ---- leer camaras e imagenes del modelo COLMAP (texto) ----
 cams = {}
 with open(os.path.join(SPARSE, "cameras.txt")) as f:
@@ -2909,7 +2626,6 @@ while i < len(raw):
 if not imgs:
     log("no hay imagenes en images.txt"); sys.exit(1)
 log("%d imagenes en el modelo" % len(imgs))
-
 # ============ FASE 1: PROFUNDIDAD (Depth Anything V2 Metric-Indoor) ============
 ck_d = os.path.join(MODELS_DIR, "depth_anything_v2_metric_hypersim_vitb.pth")
 if not os.path.exists(ck_d):
@@ -2937,7 +2653,6 @@ _d0 = depths[next(iter(depths))].astype(np.float32)
 log("profundidad img0: %.2f..%.2f m" % (float(_d0.min()), float(_d0.max())))
 del md; gc.collect()
 if DEV == "cuda": torch.cuda.empty_cache()
-
 # ============ FASE 2: NORMALES (DSINE; fallback desde profundidad) ============
 def normal_desde_profundidad(d32, fx, fy, cx, cy):
     H, W = d32.shape
@@ -2953,7 +2668,6 @@ def normal_desde_profundidad(d32, fx, fy, cx, cy):
     flip = (n * P).sum(0) > 0                         # que apunte HACIA la camara
     n[:, flip] = -n[:, flip]
     return n.astype(np.float16)
-
 dsine = None
 ck_n = os.path.join(MODELS_DIR, "dsine.pt")
 if os.path.exists(ck_n):
@@ -2985,7 +2699,6 @@ if os.path.exists(ck_n):
         dsine = None
 else:
     log("dsine.pt no esta en la imagen: usare normales-desde-profundidad")
-
 nok = 0
 with torch.no_grad():
     for k, (name, cid) in enumerate(imgs):
@@ -3023,8 +2736,6 @@ with torch.no_grad():
 log("LISTO: %d priors guardados" % nok)
 sys.exit(0 if nok > 0 else 1)
 '''
-
-
 # ═════════════════════════════════════════════════════════════════════════
 # Parche de PRIORS al train.py de 2DGS (validado con test matemático local):
 # PRIOR_UTILS se inyecta tras "import uuid"; PRIOR_LOSS reemplaza la línea del
@@ -3035,7 +2746,6 @@ sys.exit(0 if nok > 0 else 1)
 # (0.2), MONO_LAMBDA_NORMAL (0.1), MONO_FROM_ITER (100).
 # ═════════════════════════════════════════════════════════════════════════
 TRAIN_ANCHOR = "        total_loss = loss + dist_loss + normal_loss\n"
-
 PRIOR_UTILS = r'''
 # ======= PRIORS MONOCULARES (inyectado por el worker; DN-Splatter style) =======
 import numpy as _np
@@ -3075,7 +2785,6 @@ def _get_prior(name):
     except Exception:
         _prior_cache[name] = None
     return _prior_cache[name]
-
 def _mono_losses(viewpoint_cam, render_pkg):
     pr = _get_prior(viewpoint_cam.image_name)
     if pr is None:
@@ -3128,7 +2837,6 @@ def _mono_losses(viewpoint_cam, render_pkg):
     return L_d, L_n
 # ======= fin priors =======
 '''
-
 PRIOR_LOSS = r'''        mono_loss = 0.0
         if _PRIORS_DIR and iteration >= _P_FROM:
             _ml = _mono_losses(viewpoint_cam, render_pkg)
@@ -3136,18 +2844,14 @@ PRIOR_LOSS = r'''        mono_loss = 0.0
                 mono_loss = _L_DEPTH * _ml[0] + _L_NORM * _ml[1]
         total_loss = loss + dist_loss + normal_loss + mono_loss
 '''
-
-
 # Buffer del log completo (se manda al backend en cada heartbeat y al final).
 _LOG = []
 def log(msg):
     linea = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(linea, flush=True)
     _LOG.append(linea)
-
 def _firmar(body: bytes) -> str:
     return hmac.new(CALLBACK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-
 def callback(tipo, **datos):
     """Manda un callback firmado al backend (progress/completed/error).
     SIEMPRE incluye pod_id: es lo único que permite al backend apagar este pod
@@ -3165,13 +2869,11 @@ def callback(tipo, **datos):
         urllib.request.urlopen(req, timeout=20).read()
     except Exception as e:
         print(f"[callback] error enviando {tipo}: {e}", flush=True)
-
 def progreso(p, msg):
     """Reporta avance + el log hasta ahora (heartbeat para el watchdog)."""
     # Enviamos solo las últimas 150 líneas para que el payload no crezca de más
     # ahora que transmitimos el progreso en vivo.
     callback("progress", progress=p, message=msg, log="\n".join(_LOG[-150:]))
-
 # ── Heartbeat en hilo aparte: late aunque COLMAP/2DGS bloqueen el proceso ──
 _estado = {"p": 0.0, "msg": "iniciando", "vivo": True}
 def _latido():
@@ -3181,7 +2883,6 @@ def _latido():
 def fase(p, msg):
     _estado["p"] = p; _estado["msg"] = msg
     log(msg)
-
 def run(cmd, cwd=None, env=None, fase_label=None, check=True, timeout=None):
     """Ejecuta un comando enviando su salida a un ARCHIVO (no a un pipe).
     Esto evita el deadlock que colgaba el proceso (con la GPU en 0%) cuando la
@@ -3231,8 +2932,6 @@ def run(cmd, cwd=None, env=None, fase_label=None, check=True, timeout=None):
         raise RuntimeError(f"Falló (código {proc.returncode}): {cmd[0]} "
                            f"{cmd[1] if len(cmd) > 1 else ''}")
     return proc.returncode, salida
-
-
 def main():
     t0 = time.time()
     hb = threading.Thread(target=_latido, daemon=True); hb.start()
@@ -3284,9 +2983,8 @@ def main():
         _bn_au = "audit" if os.environ.get("AUDIT","1")=="1" else "noaudit"
         _bn_uv = "uv" if os.environ.get("UV_TEXTURE","1")=="1" else "noUV"
         log(f"═══ render-gs-worker 2DGS · v9-{_bn_pr}-{_bn_sm}-{_bn_sn}-{_bn_tr}k-{_bn_st}-"
-            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b-bilin' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
+            f"{os.environ.get('MESH_ENGINE','2dgs').lower() + '-bake99-snap2b' if os.environ.get('UV_TEXTURE','1')=='1' else 'vertexB'}"
             f" · imagen {_img_tag} · job {TOUR_ID} · calidad {QUALITY} ({ITERS} iter) ═══")
-
         # ── PASO 1: descargar y descomprimir fotos ──
         fase(0.05, "PASO 1/5 — Descargando fotos")
         zip_local = WORK / "input.zip"
@@ -3437,7 +3135,6 @@ def main():
             log(f"   {len(_stamps)} timestamps guardados (seguro anti-textura-repetida activo)")
         n_fotos = len(imgs)
         log(f"   {n_fotos} fotos listas")
-
         # ── PASO 2: POSES CON MASt3R (reemplaza COLMAP+SIFT+GLOMAP) ──
         # MASt3R es un modelo de IA feed-forward que estima la geometria de cada
         # foto SIN detectar "features" (puntos tipo SIFT). Por eso registra casi
@@ -3460,8 +3157,7 @@ def main():
         mast3r_py.write_text(MAST3R_SCRIPT)
         env_mast3r = dict(os.environ)
         env_mast3r["PYTHONPATH"] = "/opt/mast3r:/opt/mast3r/dust3r:/opt/2dgs"
-        run(["python", str(mast3r_py), str(images_dir), str(dataset),
-             str(WORK / "timestamps.json")],
+        run(["python", str(mast3r_py), str(images_dir), str(dataset), str(WORK / "timestamps.json")],
             cwd="/opt/mast3r",
             env=env_mast3r,
             fase_label="PASO 2/5 — MASt3R calculando poses")
@@ -3482,7 +3178,6 @@ def main():
         except Exception as e:
             log(f"   (no se pudo contar cámaras: {e})")
         log("   MASt3R OK (cámaras PINHOLE, sin necesidad de undistort)")
-
         # ── PASO 2b: afinar poses con Bundle Adjustment (pycolmap) ──
         # MASt3R deja un error de pose pequeño (~0.1°) que emborrona la textura
         # al promediar vistas. Re-triangulamos puntos SIFT manteniendo las poses
@@ -3509,7 +3204,6 @@ def main():
                 log(f"   BA no aplicado (rc={_rc_ba}): sigo con las poses MASt3R")
         else:
             log("   PASO 2b saltado (POSE_BA=0)")
-
         # ── PASO 2c: priors monoculares — APAGADOS (2 experimentos fallidos) ──
         # INTENTO 2 (fase 0, job 47349919): se probo el prior de NORMALES SOLO,
         # con la profundidad en 0, pensando que el culpable era la profundidad.
@@ -3556,7 +3250,6 @@ def main():
                     "entreno sin priors como hasta ahora")
         else:
             log("   PASO 2c saltado (MONO_PRIORS=0)")   # apagable con MONO_PRIORS=0
-
         # ── PARCHE matplotlib en 2DGS ──
         # 2DGS usa fig.canvas.tostring_rgb() en su función colormap(), pero
         # matplotlib 3.8+ ELIMINÓ ese método (ahora es buffer_rgba). Esa función
@@ -3577,7 +3270,6 @@ def main():
                 log("   parche matplotlib aplicado a 2DGS (tostring_rgb→buffer_rgba)")
         except Exception as e:
             log(f"   (no se pudo parchear general_utils: {e})")
-
         # ── PARCHE de SEMILLA en 2DGS (reproducibilidad) ──
         # Fijamos la semilla aleatoria al inicio de train.py para que el entrenamiento
         # sea reproducible (misma entrada → misma malla). Esto, junto con bajar
@@ -3601,7 +3293,6 @@ def main():
                 log("   semilla fija inyectada en train.py (reproducibilidad)")
         except Exception as e:
             log(f"   (no se pudo inyectar semilla en train.py: {e})")
-
         # ── PARCHE de PRIORS MONOCULARES en train.py de 2DGS ──
         # Inyecta (1) las utilidades que cargan los .npz del PASO 2c y (2) las dos
         # pérdidas nuevas (profundidad alineada por escala + normales) justo donde
@@ -3626,7 +3317,6 @@ def main():
                 log("   AVISO: no encontré las anclas en train.py — entreno SIN priors")
         except Exception as e:
             log(f"   (no se pudo parchear priors en train.py: {e})")
-
         # ── PASO 3: entrenar 2DGS ──
         fase(0.45, f"PASO 3/5 — Entrenando superficie ({ITERS} iter)")
         dgs_out = WORK / "output"; dgs_out.mkdir(exist_ok=True)
@@ -3757,7 +3447,6 @@ def main():
                         f"puede salir dañada/incompleta. RECOMIENDO RE-CORRER el render.")
         except Exception as e:
             log(f"   (no se pudo leer el PSNR: {e})")
-
         # ── PASO 4: extraer malla por TSDF (OPTIMIZADO) ──
         fase(0.80, "PASO 4/5 — Extrayendo malla (TSDF)")
         # GANANCIA GRANDE de velocidad: el TSDF de Open3D corre en CPU y, en pods
@@ -3766,7 +3455,6 @@ def main():
         # ~2-3 min sin cambiar el algoritmo.
         env_mesh = dict(os.environ)
         env_mesh["OMP_NUM_THREADS"] = "8"
-
         # ── ESCALA DE LA ESCENA (robusta a la escala de MASt3R) ──
         # Medimos el tamaño real del cuarto desde la nube de puntos de MASt3R y
         # derivamos los parámetros del TSDF en proporción. Así funcionan igual
@@ -3810,7 +3498,6 @@ def main():
         depth_trunc = _diag * float(os.environ.get("TSDF_DEPTH_K", "1.3"))        # cubre el cuarto + margen; corta agujas lejanas
         log(f"   escala medida: cuarto≈{_ext[0]:.2f}×{_ext[1]:.2f}×{_ext[2]:.2f}, "
             f"voxel={voxel:.4f}, sdf_trunc={sdf_trunc:.4f}, depth_trunc={depth_trunc:.2f}")
-
         # ── EXTRACCIÓN EN MODO BOUNDED (CORRECTO para un cuarto cerrado) ──
         # CAMBIOS (2ª investigación) para COMPLETITUD sin perder la malla única:
         #   - --depth_ratio 0 (profundidad MEDIA, no mediana): la mediana descartaba
@@ -3920,7 +3607,6 @@ def main():
                     log(f"   ⚠ LÁMINAS: {_nc} pedazos sueltos — SIGUE LAMINADO (ref: 18k sano / 117k laminado)")
         except Exception as _e:
             log(f"   (no pude medir las láminas: {_e})")
-
         # ── Limpiar + SUAVIZAR + simplificar la malla ──
         # 3 mejoras (investigación) sobre la malla cruda:
         #  1. FILTRO POR TAMAÑO: conserva pedazos grandes (techo, muebles) y quita
@@ -4137,22 +3823,6 @@ def main():
             "              % _nplanos, flush=True)\n"
             "    else:\n"
             "        print('SNAP: no encontre planos grandes que aplanar', flush=True)\n"
-            "    # GUARDAR LOS PLANOS PARA EL HORNEADOR.\n"
-            "    # FALLO REAL (job e13efea4): el horneador volvia a buscar los planos por\n"
-            "    # su cuenta con RANSAC sobre la malla de OpenMVS, y fallo: escribio\n"
-            "    # 'BAKE TONO: no encontre planos grandes' y el nivelado NO corrio, aunque\n"
-            "    # AQUI se habian encontrado 6 planos sin problema. Era una busqueda\n"
-            "    # duplicada, peor y sin diagnostico. Ahora se guardan los de aqui, que ya\n"
-            "    # pasaron los tres candados (tamano, periferia, normales), y el horneador\n"
-            "    # los lee. Si el archivo no existe, el horneador cae a su metodo de antes.\n"
-            "    try:\n"
-            "        if _planos:\n"
-            "            _pa = np.array([[float(n[0]), float(n[1]), float(n[2]), float(d)]\n"
-            "                            for n, d in _planos], dtype=np.float64)\n"
-            "            np.save('/workspace/job/planos.npy', _pa)\n"
-            "            print('PLANOS guardados para el horneador: %d' % len(_pa), flush=True)\n"
-            "    except Exception as _pe:\n"
-            "        print('PLANOS (no pude guardarlos, el horneador buscara solo):', _pe, flush=True)\n"
             "    # ---- TAPAR HUECOS DE LA MALLA ----\n"
             "    # MEDIDO en la malla (58), soldando por POSICION (no por UV, que es lo que\n"
             "    # hace el .glb y confunde toda costura con un borde): la malla tiene 64.718\n"
@@ -4163,16 +3833,6 @@ def main():
             "    # deliberado: un hueco pequeno o mediano es un defecto y se cierra; un hueco\n"
             "    # enorme suele ser una PUERTA o una VENTANA de verdad y NO se debe tapar.\n"
             "    try:\n"
-            "        # MEDIDO en la (61): con 300 el cosido metio 23.571 caras nuevas en\n"
-            "        # forma de ASTILLA (la mas larga, 1.402 veces mas larga que ancha).\n"
-            "        # Esas astillas piden una huella enorme en el atlas: 198M muestras\n"
-            "        # para 50M texeles, y el horneado paso de 0.7 a 17.6 minutos.\n"
-            "        # Con 60 se tapan igual los huecos pequenos (la gran mayoria de los\n"
-            "        # 4.627 medidos, incluido el que se veia en la pared) SIN astillas.\n"
-            "        # REVERTIDO A 300. Bajarlo a 60 fue un error mio: culpe al cosido\n"
-            "        # de huecos de las caras gigantes, y el log lo desmintio (195M\n"
-            "        # muestras con 60 vs 198M con 300 = igual). A cambio, con 60\n"
-            "        # REAPARECIO el hueco de la pared que con 300 ya no salia.\n"
             "        HOLE_MAX = int(os.environ.get('HOLE_MAX', '300'))\n"
             "        if HOLE_MAX > 0:\n"
             "            import pymeshlab as _pml\n"
@@ -4382,7 +4042,6 @@ def main():
             ply_mb = nuevo_mb
         else:
             log("   (no se pudo simplificar; subo la malla original)")
-
         # ══════════════════════════════════════════════════════════════════════
         # PASO 4b: exportar la malla (color por vértice + AO) a .glb
         # ══════════════════════════════════════════════════════════════════════
@@ -4424,7 +4083,6 @@ def main():
             log(f"   .glb (color por vértice + AO): {glb_final.stat().st_size/1e6:.1f} MB")
         except Exception as e:
             log(f"   ⚠ no se pudo exportar .glb ({e}); subo el .ply")
-
         # ── SANEADOR ANTI-NaN de la vista previa (mismo escudo que el pintor):
         # exportadores viejos de trimesh pueden meter NaN literal al JSON del .glb
         # y eso revienta el JSON.parse del visor ("Unexpected token N"). Se repara
@@ -4476,7 +4134,6 @@ def main():
                     log(f"   saneados {_rep} valores NaN en la vista previa")
         except Exception as _se:
             log(f"   (saneador de vista previa falló: {_se}; sigo)")
-
         # Subida ANTICIPADA: el .glb de color por vértice se sube YA, a la misma
         # URL final. Si la textura (xatlas, 25-90 min) se cancela o el pod muere,
         # igual queda un modelo visible para evaluar geometría (huecos/techo).
@@ -4489,7 +4146,6 @@ def main():
                 log("   ⬆ VISTA PREVIA subida (color por vértice): ya se puede abrir el modelo; ahora empieza la textura")
         except Exception as _pe:
             log(f"   (vista previa no subida: {_pe}; sigo)")
-
         # ══════════════════════════════════════════════════════════════════════
         # ──────────────────────────────────────────────────────────────────
         # PASO 4c: PINTAR VERTICES desde las fotos (SIEMPRE: es el respaldo
@@ -4536,7 +4192,6 @@ def main():
                 log("   ⚠ el pintado no produjo archivo; uso color por vértice del entrenamiento")
         except Exception as e:
             log(f"   ⚠ pintado falló ({e}); uso color por vértice del entrenamiento")
-
         # ── PASO 4d: TEXTURA UV + HORNEADOR v9.1 (plan P1 de la investigacion) ──
         #   OpenMVS solo pone el MAPA UV; luego el horneador repinta cada texel
         #   MEZCLANDO todas las fotos 12MP que lo ven (oclusion + peso angular),
@@ -4567,7 +4222,6 @@ def main():
                 log(f"   textura OpenMVS fallo ({e}); subo el color por vertice (respaldo)")
         else:
             log("   PASO 4d saltado (OPCION B, UV_TEXTURE=0): se entrega el COLOR POR VERTICE (tono uniforme, sin costuras)")
-
         # Archivo a subir (orden de preferencia):
         #   1º TEXTURA UV (nítida)   2º vértices pintados   3º color del
         #   entrenamiento   4º .ply crudo
@@ -4582,7 +4236,6 @@ def main():
             ply_mb = glb_final.stat().st_size / 1e6
         else:
             archivo_subir = malla
-
         # ── PASO 5: subir la malla ──
         fase(0.95, "PASO 5/5 — Subiendo malla")
         with open(archivo_subir, "rb") as f:
@@ -4590,7 +4243,6 @@ def main():
                                          method="PUT")
             urllib.request.urlopen(req, timeout=300).read()
         log(f"   malla subida ({archivo_subir.name})")
-
         # ── Listo ──
         _estado["vivo"] = False
         seconds = time.time() - t0
@@ -4612,7 +4264,6 @@ def main():
             log(f"   backend avisado (pod {POD_ID}); debería apagarse solo")
         else:
             log("   ⚠ no sé mi pod_id: si no se apaga solo, apágalo en runpod.io")
-
     except Exception as e:
         _estado["vivo"] = False
         log(f"✗ ERROR: {e}")
@@ -4624,7 +4275,5 @@ def main():
             pass
         callback("error", error_message=str(e), log="\n".join(_LOG))
         sys.exit(1)
-
-
 if __name__ == "__main__":
     main()
