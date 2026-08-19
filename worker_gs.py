@@ -516,9 +516,9 @@ BAKE_SEAM_TOPE= float(os.environ.get("OMVS_SEAM_TOPE","10"))    # tope del offse
 #   2) VINETEADO: el lente oscurece los bordes del cuadro. Cada zona de pared se
 #      hornea desde fotos distintas y cae en zonas distintas del cuadro -> parches.
 # Se corrigen aqui, ANTES de mezclar. Ninguna toca la geometria.
-BAKE_WB       = os.environ.get("OMVS_BAKE_WB", "0") == "1"      # igualar el color entre fotos
+BAKE_WB       = os.environ.get("OMVS_BAKE_WB", "1") == "1"      # igualar el color entre fotos
 BAKE_WB_TOPE  = float(os.environ.get("OMVS_WB_TOPE", "1.30"))   # tope de la correccion por canal
-BAKE_VIG      = os.environ.get("OMVS_BAKE_VIG", "0") == "1"     # corregir el vineteado del lente
+BAKE_VIG      = os.environ.get("OMVS_BAKE_VIG", "1") == "1"     # corregir el vineteado del lente
 BAKE_VIG_TOPE = float(os.environ.get("OMVS_VIG_TOPE", "1.60"))  # tope de la correccion de borde
 _EXPLO        = float(os.environ.get("OMVS_EXPO_MIN", "0.45"))
 _EXPHI        = float(os.environ.get("OMVS_EXPO_MAX", "2.20"))
@@ -1776,23 +1776,7 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     exp=_np.zeros(len(idc),_np.int32); _l=lado.copy()
                     while (_l>1).any():
                         exp+=(_l>1); _l=(_l+1)//2
-                    # TOPE DE LADO POR CARA.
-                    # ANTES estaba en 6 (64 px). Una cara cuyo lado pasa de 64
-                    # texeles se procesaba SOLO en un cuadro de 64x64 de su
-                    # esquina y el resto se quedaba con el color crudo de
-                    # OpenMVS -> ese resto es el gris/mancha que se ve.
-                    # MEDIDO sobre el .glb real (job 23e40b1d): solo 13.375
-                    # caras de 1.099.123 pasan de 64 px (el 1.22%), PERO son
-                    # las GRANDES, y entre ellas se llevan el 62.2% del area:
-                    # con tope 64 solo se corregia el 37.8% de la superficie.
-                    # Por eso las manchas sobreviven justo en PAREDES y
-                    # CORTINAS (caras grandes) y no en el piso (caras chicas).
-                    # El lado maximo real medido es 894 texeles -> con 10
-                    # (1024 px) se cubre el 100%.
-                    # La MEMORIA no sube: el lote es 3.000.000/(K*K), o sea se
-                    # achica solo cuando K crece (con K=1024 son 2 caras por
-                    # lote). Solo cuesta un poco mas de tiempo, y son pocas caras.
-                    exp=_np.minimum(exp,int(os.environ.get("BAKE_MAXEXP","10")))
+                    exp=_np.minimum(exp,6)          # tope 64 px de lado
                     for e in range(int(exp.max())+1 if len(exp) else 0):
                         sel=_np.flatnonzero(exp==e)
                         if len(sel)==0: continue
@@ -1832,44 +1816,6 @@ def bake_multiview(objf, texfiles, mtl2tex):
                 _gc.collect()
             except Exception as _ve:
                 log("BAKE: relleno de gris fallo en atlas %d (%s)" % (ti+1,_ve))
-        # ── REALCE FINAL DEL ATLAS (nitidez + color) ─────────────────────────
-        # (1) BORROSO: el promedio de ~160 fotos, con errores de pose de fracciones
-        #     de pixel, equivale a un desenfoque (Waechter et al. ECCV 2014: las
-        #     vistas lejanas borran el detalle de las cercanas). Se compensa con
-        #     MASCARA DE ENFOQUE: amount 0.6, radio 0.8 px, UMBRAL 2 -> realza
-        #     bordes reales y NO amplifica el ruido de una pared lisa.
-        # (2) DESLAVADO: ya estaba escrito en este mismo worker que "promediar
-        #     ~127 vistas LAVA el color". El pintor por vertice lo compensa con
-        #     PAINT_SAT=1.15; el ATLAS no tenia esa compensacion. Se le da la
-        #     misma, alrededor de la luminancia (sube viveza, no brillo).
-        # MEDIDO sobre el atlas real del render: nitidez (varianza del Laplaciano)
-        # 527.8 -> 1150.9 (+118%), saturacion 0.2006 -> 0.2317 (+16%), brillo
-        # practicamente igual (106.9 -> 106.2). Apagar: OMVS_SHARP=0 / OMVS_SAT=1.0
-        try:
-            _amt=float(os.environ.get("OMVS_SHARP","0.6"))
-            _sat=float(os.environ.get("OMVS_SAT","1.15"))
-            if _amt>0 or abs(_sat-1.0)>1e-3:
-                _f=base.astype(_np.float32)
-                if _amt>0:
-                    _k=_np.array([0.05,0.25,0.40,0.25,0.05],_np.float32); _bl=_f
-                    for _ax in (0,1):
-                        _pad=[(0,0)]*3; _pad[_ax]=(2,2)
-                        _t=_np.pad(_bl,_pad,mode="edge"); _ac=_np.zeros_like(_bl)
-                        for _j in range(5):
-                            _sl=[slice(None)]*3; _sl[_ax]=slice(_j,_j+_bl.shape[_ax])
-                            _ac+=_k[_j]*_t[tuple(_sl)]
-                        _bl=_ac
-                    _d=_f-_bl; _d*=(_np.abs(_d)>2.0); _f=_f+_amt*_d
-                    del _bl,_d,_t,_ac
-                if abs(_sat-1.0)>1e-3:
-                    _lm=(_f[:,:,0]*0.299+_f[:,:,1]*0.587+_f[:,:,2]*0.114)[:,:,None]
-                    _f=_lm+(_f-_lm)*_sat; del _lm
-                base=_np.clip(_f,0,255).astype(_np.uint8); del _f
-                log("BAKE: realce final atlas %d -> nitidez x%.2f (umbral 2) + saturacion x%.2f"
-                    % (ti+1,_amt,_sat))
-                _gc.collect()
-        except Exception as _re:
-            log("BAKE: realce final fallo en atlas %d (%s); sigo sin el" % (ti+1,_re))
         if tf.lower().endswith((".jpg",".jpeg")):
             Image.fromarray(base).save(tf,quality=BAKE_JQ,subsampling=2)
         else:
