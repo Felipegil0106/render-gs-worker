@@ -1776,7 +1776,23 @@ def bake_multiview(objf, texfiles, mtl2tex):
                     exp=_np.zeros(len(idc),_np.int32); _l=lado.copy()
                     while (_l>1).any():
                         exp+=(_l>1); _l=(_l+1)//2
-                    exp=_np.minimum(exp,6)          # tope 64 px de lado
+                    # TOPE DE LADO POR CARA.
+                    # ANTES estaba en 6 (64 px). Una cara cuyo lado pasa de 64
+                    # texeles se procesaba SOLO en un cuadro de 64x64 de su
+                    # esquina y el resto se quedaba con el color crudo de
+                    # OpenMVS -> ese resto es el gris/mancha que se ve.
+                    # MEDIDO sobre el .glb real (job 23e40b1d): solo 13.375
+                    # caras de 1.099.123 pasan de 64 px (el 1.22%), PERO son
+                    # las GRANDES, y entre ellas se llevan el 62.2% del area:
+                    # con tope 64 solo se corregia el 37.8% de la superficie.
+                    # Por eso las manchas sobreviven justo en PAREDES y
+                    # CORTINAS (caras grandes) y no en el piso (caras chicas).
+                    # El lado maximo real medido es 894 texeles -> con 10
+                    # (1024 px) se cubre el 100%.
+                    # La MEMORIA no sube: el lote es 3.000.000/(K*K), o sea se
+                    # achica solo cuando K crece (con K=1024 son 2 caras por
+                    # lote). Solo cuesta un poco mas de tiempo, y son pocas caras.
+                    exp=_np.minimum(exp,int(os.environ.get("BAKE_MAXEXP","10")))
                     for e in range(int(exp.max())+1 if len(exp) else 0):
                         sel=_np.flatnonzero(exp==e)
                         if len(sel)==0: continue
